@@ -9,6 +9,8 @@ parser.add_argument("corpus", type=str,
     help="Path to input corpus text file.")
 parser.add_argument("save_file", type=str,
     help="Output filename prefix for saving the trained vectors.")
+parser.add_argument("glove_dir", type=str, 
+    help="Dir for GloVe Model [%(default)s].")
 parser.add_argument("--vc", type=int, default=2,
     help="Minimum word frequency to include in vocabulary [%(default)s].")
 parser.add_argument("--vs", type=int, default=100,
@@ -27,13 +29,9 @@ parser.add_argument("--bn", type=int, default=2, choices=[0, 1, 2],
     help="Save output in binary format (0=text, 1=binary, 2=both) [%(default)s].")
 parser.add_argument("--vb", type=int, default=2, choices=[0, 1, 2],
     help="Verbosity level [%(default)s].")
-parser.add_argument("--dr", type=str, default="build",
-    help="Dir for GloVe Model [%(default)s].")
-parser.add_argument("--clean", action="store_true",
-    help="Clean or not")
+
 
 args = parser.parse_args()
-    
 
 vocab_file              = "vocab.txt"
 cooccurrence_file       = "cooccurrence.bin"
@@ -43,7 +41,7 @@ cooccurrence_shuf_file  = "cooccurrence.shuf.bin"
 util.build_vocab(
     corpus_path=    args.corpus,
     vocab_file=     vocab_file,
-    glove_dir=      args.dr,
+    glove_dir=      args.glove_dir,
     min_count=      args.vc,
     verbose=        args.vb
 )
@@ -53,7 +51,7 @@ util.build_cooccurrence(
     corpus_path=    args.corpus,
     vocab_file=     vocab_file,
     cooccur_file=   cooccurrence_file,
-    glove_dir=      args.dr,
+    glove_dir=      args.glove_dir,
     memory=         args.m,
     window_size=    args.ws,
     verbose=        args.vb
@@ -63,7 +61,7 @@ util.build_cooccurrence(
 util.shuffle_cooccurrence(
     cooccur_file=       cooccurrence_file,
     cooccur_shuf_file=  cooccurrence_shuf_file,
-    glove_dir=          args.dr,
+    glove_dir=          args.glove_dir,
     memory=             args.m,
     verbose=            args.vb
 )
@@ -73,7 +71,7 @@ util.train_glove(
     cooccur_shuf_file=  cooccurrence_shuf_file,
     vocab_file=         vocab_file,
     save_file=          args.save_file,
-    glove_dir=          args.dr,
+    glove_dir=          args.glove_dir,
     vector_size=        args.vs,
     max_iter=           args.mi,
     num_threads=        args.nt,
@@ -82,6 +80,5 @@ util.train_glove(
     verbose=            args.vb
 )
 
-# Cleanup
-if args.clean:
-    util.cleanup(vocab_file, cooccurrence_file, cooccurrence_shuf_file)
+# clean up
+util.cleanup(vocab_file, cooccurrence_file, cooccurrence_shuf_file)

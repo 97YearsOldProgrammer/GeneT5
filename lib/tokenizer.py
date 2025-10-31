@@ -5,6 +5,7 @@ import sys
 import os
 import re
 import typing as tp
+import torch
 
 from pathlib        import Path
 from contextlib     import closing
@@ -20,6 +21,7 @@ def anti(seq):
 #####################
 ## UTILITY SECTION ##
 #####################
+
 
 def getfp(filename):
     
@@ -227,10 +229,12 @@ def tokenize_transcripts(transcripts, tokenizer):
         tokenized[parent_id] = token_ids
 
     return tokenized
-            
+
+
 ######################
 #### Tokenisation ####
 ######################
+
 
 BASE_PAIR   = ("A", "C", "G", "T")
 BASE2IDX    = {base: idx for idx, base in enumerate(BASE_PAIR)}
@@ -277,13 +281,59 @@ class KmerTokenizer:
             tokens.append(self.token2id.get(self.unk_token, 0))
         return tokens
 
+
 ################
 #### Output ####
 ################
 
+
 def write_tokenized_corpus(output_path, tokenized):
-    
+
     with open(output_path, "w", encoding="utf-8") as fp:
         for parent_id in sorted(tokenized):
             token_line = " ".join(str(token_id) for token_id in tokenized[parent_id])
             fp.write(token_line + "\n")
+
+
+###################
+#### Embedding ####
+###################
+
+
+def parse_glove_matrix(vectors):
+
+    embeddings = {}
+    
+    with open(vectors, 'r') as fp:
+        for line in fp:
+            parts = line.strip().split()
+            if not parts:
+                continue
+            
+            idx     = int(parts[0])
+            vector  = torch.tensor([float(x) for x in parts[1:]], dtype=torch.float32)
+            embeddings[idx] = vector
+    
+    return embeddings
+
+def embed_sentence(line, embeddings):
+
+    idxs = [int(x) for x in line.strip().split()]
+    
+    if not idxs:
+        return torch.tensor([])
+
+    embeddings = [embeddings[token_id] for token_id in idxs]
+    # stack all embedding vectors
+    return torch.stack(embeddings, dim=0)
+
+def embed_whole_corpus(corpus, embeddings):
+
+    with open(corpus, 'r') as fp:
+        for line in fp:
+            line = line.strip()
+            if not line:
+                continue
+
+            embedded = embed_sentence(line, embeddings)
+            yield embedded
