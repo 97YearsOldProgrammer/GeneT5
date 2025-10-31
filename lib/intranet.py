@@ -8,11 +8,12 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from dataclasses import dataclass
+from typing import List
 
 
-###################
-####### CNN #######
-###################
+###########################
+####### IntraNet NN #######
+###########################
 
 
 class IntraNet(nn.Module):
@@ -46,30 +47,34 @@ class IntraNet(nn.Module):
 
     def __init__(
         self,
-        embedding_dim: int,
-        num_classes: int,
-        conv_channels: List[int] = [64, 128, 256],
-        kernel_sizes: List[tuple] = [(3, 3), (3, 3), (3, 3)],
-        pool_sizes: List[tuple] = [(2, 2), (2, 2), (2, 2)],
-        lstm_hidden: int = 128,
-        lstm_layers: int = 1,
-        dropout: float = 0.5,
+        embedding_dim:          int,
+        num_classes:            int,
+        conv_channels:          List[int]   = [64, 128, 256],
+        kernel_sizes:           List[tuple] = [(3, 3), (3, 3), (3, 3)],
+        pool_sizes:             List[tuple] = [(2, 2), (2, 2), (2, 2)],
+        lstm_hidden:            int = 128,
+        lstm_layers:            int = 1,
+        dropout:                float = 0.5,
     ):
+        
         super().__init__()
-        assert len(conv_channels) == len(kernel_sizes) == len(pool_sizes), \
-            "conv_channels, kernel_sizes, pool_sizes must have same length"
+        assert len(conv_channels) == len(kernel_sizes) == len(pool_sizes)
 
         self.embedding_dim = embedding_dim
         self.pool_sizes = pool_sizes  # keep to rescale lengths along L axis
 
-        # --- Convolutional trunk ---
+        # Convolutional Layer
         self.convs = nn.ModuleList()
         self.bns   = nn.ModuleList()
         self.pools = nn.ModuleList()
 
-        in_ch = 1  # treat (L, E) grid as single-channel "image"
+        # 2D DNA picture have 1 channel
+        in_ch = 1
+
         for out_ch, ksz, psz in zip(conv_channels, kernel_sizes, pool_sizes):
             pad = self._same_pad(ksz)  # (pad_h, pad_w) for stride=1
+
+            # if BatchNorm2D bias=False
             self.convs.append(nn.Conv2d(in_ch, out_ch, kernel_size=ksz, padding=pad, bias=False))
             self.bns.append(nn.BatchNorm2d(out_ch))
             self.pools.append(nn.MaxPool2d(kernel_size=psz))
@@ -77,22 +82,29 @@ class IntraNet(nn.Module):
 
         c_last = conv_channels[-1]
 
-        # --- BLSTM over the (downsampled) sequence axis ---
+        # BLSTM Layer
         self.blstm = nn.LSTM(
-            input_size=c_last,
-            hidden_size=lstm_hidden,
-            num_layers=lstm_layers,
-            batch_first=True,
-            bidirectional=True,
-            dropout=dropout if lstm_layers > 1 else 0.0,
+            input_size=     c_last,
+            hidden_size=    lstm_hidden,
+            num_layers=     lstm_layers,
+            batch_first=    True,
+            bidirectional=  True,
+
+            # delete all previous layer
+            dropout=        dropout if lstm_layers > 1 else 0.0,
         )
 
-        # --- Classifier head ---
-        # Temporal pooling uses mean+max over time and concatenates → 4*lstm_hidden
-        head_in = 4 * lstm_hidden
-        self.dropout = nn.Dropout(dropout)
-        self.fc = nn.Sequential(
+        # Classifier Head
+        # 2 (fw and bw) * 2 (max and mean)
+        head_in         = 4 * lstm_hidden
+
+        # avoid overfitting mechanism
+        self.dropout    = nn.Dropout(dropout)
+        self.fc         = nn.Sequential(
             nn.Linear(head_in, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 256),
+            nn.Dropout(dropout),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
             nn.Linear(256, num_classes),
@@ -115,11 +127,12 @@ class IntraNet(nn.Module):
         L = torch.clamp(L, min=1)
         return L
 
-    def forward(self, x: torch.Tensor, lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x, lengths):
         """
         x: (B, L, E), lengths optional (B,)
         returns logits: (B, num_classes)
         """
+        
         B = x.size(0)
 
         # Add channel → (B, 1, L, E)
