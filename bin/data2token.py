@@ -1,7 +1,7 @@
 
 import argparse
 import sys
-from lib import tokenizer as tk
+from lib import intranet as tk
 
 parser = argparse.ArgumentParser(
     description="Tokenise FASTA/GFF annotations into a corpus for GloVe.")
