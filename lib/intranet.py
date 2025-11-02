@@ -198,7 +198,7 @@ def build_line(features, seqid, strand, seq):
         word = seq[feature.beg-1 : feature.end]
         if strand == "-":
             word = anti(word)
-        line.append(word)
+        line.append((word, feature.typ))
 
     return line
 
@@ -223,17 +223,27 @@ def build_transcript(grouped, sequences):
 
     return transcripts
 
-def tokenize_transcripts(transcripts, tokenizer):
+def tokenize_transcripts(transcripts, tokenizer, feature_label_map, default_label=-1):
 
     tokenized = {}
-    
+    labels = {}
+
     for parent_id, segments in transcripts.items():
         token_ids = []
-        for segment in segments:
-            token_ids.extend(tokenizer(segment))
-        tokenized[parent_id] = token_ids
+        label_ids = []
 
-    return tokenized
+        for segment, feature_type in segments:
+            segment_token_ids = tokenizer(segment)
+            token_ids.extend(segment_token_ids)
+
+            # mapping token one-to-one labels
+            label_value = feature_label_map.get(feature_type, default_label)
+            label_ids.extend([label_value] * len(segment_token_ids))
+
+        tokenized[parent_id]    = token_ids
+        labels[parent_id]       = label_ids
+
+    return tokenized, labels
 
 
 ######################
@@ -243,6 +253,13 @@ def tokenize_transcripts(transcripts, tokenizer):
 
 BASE_PAIR   = ("A", "C", "G", "T")
 BASE2IDX    = {base: idx for idx, base in enumerate(BASE_PAIR)}
+
+DEFAULT_FEATURE_LABELS = {
+    "exon": 0,
+    "intron": 1,
+    "five_prime_utr": 2,
+    "three_prime_utr": 3,
+}
 
 def apkmer(k: int):
 
@@ -274,7 +291,7 @@ class KmerTokenizer:
             self.token2id[self.unk_token] = len(self.token2id)
 
     def __call__(self, seq):
-        
+
         seq     = seq.upper()
         tokens  = []
 
@@ -298,6 +315,13 @@ def write_tokenized_corpus(output_path, tokenized):
         for parent_id in sorted(tokenized):
             token_line = " ".join(str(token_id) for token_id in tokenized[parent_id])
             fp.write(token_line + "\n")
+
+def write_label_sequences(output_path, labels):
+
+    with open(output_path, "w", encoding="utf-8") as fp:
+        for parent_id in sorted(labels):
+            label_line = " ".join(str(label_id) for label_id in labels[parent_id])
+            fp.write(label_line + "\n")
 
 
 ###################
@@ -562,3 +586,79 @@ class IntraNet(nn.Module):
         # Head
         logits = self.fc(self.dropout(feats))      # (B, num_classes)
         return logits
+
+
+###################
+#### Trainning ####
+###################
+
+
+def prepare_dataloaders(dataset, batch_size, test_split, num_workers, seed):
+    if not 0 <= test_split < 1:
+        raise ValueError("test_split must be within [0, 1).")
+
+    dataset_size = len(dataset)
+    if dataset_size == 0:
+        raise ValueError("Dataset is empty. Ensure corpus and labels are non-empty.")
+
+    test_size = int(math.floor(dataset_size * test_split))
+    train_size = dataset_size - test_size
+
+    if train_size == 0:
+        raise ValueError("test_split too large: no samples left for training.")
+
+    generator = torch.Generator().manual_seed(seed)
+    if test_size > 0:
+        train_dataset, test_dataset = random_split(
+            dataset,
+            [train_size, test_size],
+            generator=generator,
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=collate_batch,
+        )
+    else:
+        train_dataset = dataset
+        test_loader = None
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=collate_batch,
+    )
+
+    return train_loader, test_loader
+
+
+def evaluate(model, dataloader, device, loss_fn):
+    if dataloader is None:
+        return float("nan"), float("nan")
+
+    model.eval()
+    total_loss = 0.0
+    total_correct = 0
+    total_examples = 0
+
+    with torch.no_grad():
+        for inputs, targets, lengths in dataloader:
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            lengths = lengths.to(device)
+
+            logits = model(inputs, lengths)
+            loss = loss_fn(logits, targets)
+
+            total_loss += loss.item() * targets.size(0)
+            predictions = torch.argmax(logits, dim=1)
+            total_correct += (predictions == targets).sum().item()
+            total_examples += targets.size(0)
+
+    avg_loss = total_loss / total_examples if total_examples else float("nan")
+    accuracy = total_correct / total_examples if total_examples else float("nan")
+    return avg_loss, accuracy

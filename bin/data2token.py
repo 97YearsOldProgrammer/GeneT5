@@ -7,8 +7,10 @@ parser = argparse.ArgumentParser(
     description="Tokenise FASTA/GFF annotations into a corpus for GloVe.")
 parser.add_argument("input", type=str,
     help="Path to directory containing FASTA/GFF files.")
-parser.add_argument("output", type=str,
+parser.add_argument("tk_op", type=str,
     help="Destination file for the generated corpus (plain text).")
+parser.add_argument("labels_op", type=str,
+    help="Optional destination file for the generated label sequences.")
 parser.add_argument("--kmer", type=int, default=8,
     help="Size of the sliding k-mer window used for tokenisation [%(default)i].")
 parser.add_argument("--stride", type=int, default=3,
@@ -18,13 +20,27 @@ parser.add_argument("--unk", default="<UNK>", type=str,
 parser.add_argument("--utr", action="store_true",
     help="Include UTR regions (5' and 3' UTRs) in transcripts.")
 
+
 arg = parser.parse_args()
 
 # Determine which feature types to include
-if arg.utr:
+if arg.utr:  
     feature_filter = {"exon", "intron", "three_prime_utr", "five_prime_utr"}
 else:
     feature_filter = {"exon", "intron"}
+
+# Prepare label mapping for the requested features.
+feature_label_map = {
+    feature: tk.DEFAULT_FEATURE_LABELS[feature]
+    for feature in feature_filter
+    if feature in tk.DEFAULT_FEATURE_LABELS
+}
+
+next_label = max(feature_label_map.values(), default=-1) + 1
+for feature in sorted(feature_filter):
+    if feature not in feature_label_map:
+        feature_label_map[feature] = next_label
+        next_label += 1
 
 # Find files
 fastas, gffs = tk.find_files(arg.input)
@@ -67,8 +83,13 @@ tokenizer = tk.KmerTokenizer(
 )
 
 # Tokenize transcripts
-tokenized = tk.tokenize_transcripts(transcripts, tokenizer)
+tokenized, labels = tk.tokenize_transcripts(transcripts, tokenizer, feature_label_map=feature_label_map)
 
 # Write corpus
-tk.write_tokenized_corpus(arg.output, tokenized)
-print(f"Corpus successfully written to {arg.output}", flush=True)
+tk.write_tokenized_corpus(arg.tk_op, tokenized)
+print(f"Corpus successfully written to {arg.tk_op}", flush=True)
+
+# Write label output
+labels_output = arg.labels_op
+tk.write_label_sequences(labels_output, labels)
+print(f"Label sequences written to {labels_output}", flush=True)
