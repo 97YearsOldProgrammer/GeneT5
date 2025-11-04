@@ -19,6 +19,9 @@ parser.add_argument("--unk", default="<UNK>", type=str,
     help="Unknown token for unseen k-mers [%(default)s].")
 parser.add_argument("--utr", action="store_true",
     help="Include UTR regions (5' and 3' UTRs) in transcripts.")
+parser.add_argument("-io","--include_orphan", action="store_true",
+    help="Include single intron that exists in RNA Sequencing Data")
+
 
 
 arg = parser.parse_args()
@@ -56,9 +59,17 @@ for fasta in fastas:
 print(f"Finished parsing FASTA: {len(sequences)} sequences loaded", flush=True)
 
 # Parse all GFF files
-features = []
+features        = []
+total_orphans   = 0
+
 for gff in gffs:
-    features.extend(tk.parse_gff(gff))
+    parsed_features, orphan_count = tk.parse_gff(gff, adopt_orphan=arg.include_orphan)
+    features.extend(parsed_features)
+    total_orphans += orphan_count
+
+print(f"Parsed {len(features)} total features", flush=True)
+if arg.include_orphan:
+    print(f"  Including {total_orphans} orphan introns", flush=True)
 
 grouped = tk.group_features(features, feature_filter)
 print(f"Grouped into {len(grouped)} transcripts", flush=True)

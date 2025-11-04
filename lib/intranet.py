@@ -120,29 +120,42 @@ def parse_att(att):
 
     return attributes
 
-def parse_gff(filename):
+def parse_gff(filename, adopt_orphan: bool=False):
     
     fp          = getfp(filename)
     features    = []
+    orphan_count = 0
 
     with closing(fp):
         for line in fp:
-            
+
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
             line = line.split("\t")
-            if len(line) != 9:
-                continue
             
+            if len(line) == 8:
+                line.append(".")
+            elif len(line) != 9:
+                continue
+
             seqid, source, typ, beg, end, score, strand, phase, att = line
             score = None if score == "." else float(score)
             phase = None if phase == "." else int(phase)
+
+            att = parse_att(att)
             
-            att   = parse_att(att)
             if not att:
-                continue
-            
+                if adopt_orphan and typ.lower() == "intron":
+                    orphan_id = f"{source}:{seqid}:{beg}-{end}"
+                    att = {
+                        "ID": orphan_id,
+                        "Parent": orphan_id,
+                    }
+                    orphan_count += 1
+                else:
+                    continue
+
             feature = Feature(
                 seqid=  seqid,
                 source= source,
@@ -156,7 +169,7 @@ def parse_gff(filename):
             )
             features.append(feature)
 
-    return features
+    return features, orphan_count
 
 def choose_parent_id(feature):
     
