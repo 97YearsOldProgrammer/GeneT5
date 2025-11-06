@@ -351,22 +351,37 @@ def parse_glove_matrix(vectors):
             if not parts:
                 continue
             
-            idx = int(parts[0])
+            try:
+                idx = int(parts[0])
+            # glove would include <unk> automatically
+            except ValueError:
+                print(f"Skipping non-integer token: {parts[0]}")
+                continue
+            
             vector  = torch.tensor([float(x) for x in parts[1:]], dtype=torch.float32)
             embeddings[idx] = vector
     
     return embeddings
 
 def embed_sentence(line, embeddings):
-
+    
     idxs = [int(x) for x in line.strip().split()]
     
     if not idxs:
         return torch.tensor([])
 
-    embeddings = [embeddings[token_id] for token_id in idxs]
-    # stack all embedding vectors
-    return torch.stack(embeddings, dim=0)
+    # some token are too rare for embedding threshold
+    valid_embeddings = []
+    for token_id in idxs:
+        if token_id in embeddings:
+            valid_embeddings.append(embeddings[token_id])
+
+    # return empty string for rare kmer
+    if not valid_embeddings:
+        return torch.tensor([])
+
+    # Stack all embedding vectors
+    return torch.stack(valid_embeddings, dim=0)
 
 def embed_whole_corpus(corpus, embeddings):
 
@@ -543,16 +558,59 @@ class IntraNet(nn.Module):
 ###################
 
 
+def downsample_single_label_sequence(label_seq, pool_sizes):
+    """CNN would downsaple the label"""
+    
+    labels = torch.tensor(label_seq, dtype=torch.long)
+    
+    # Apply pooling iteratively like the CNN does
+    for (ph, pw) in pool_sizes:
+        L = len(labels)
+        new_L = L // ph  # Floor division at each stage
+        # Take every ph-th element, truncate to new_L
+        labels = labels[::ph][:new_L]
+    
+    return labels.tolist()
+
+
 def collate_batch(batch):
 
     sequences, labels, lengths = zip(*batch)
     
-    # Pad sequences to max length in batch
-    padded_seqs     = pad_sequence(sequences, batch_first=True, padding_value=0.0)
-    # Pad labels also val=-100 tells CrossEntropyLoss to ignore these positions
-    label_tensors   = [torch.tensor(label_seq, dtype=torch.long) for label_seq in labels]
-    padded_labels   = pad_sequence(label_tensors, batch_first=True, padding_value=-100)
-    # Get original length for LSTM track
+    # Pad sequences FIRST
+    padded_seqs = pad_sequence(sequences, batch_first=True, padding_value=0.0)
+    
+    # Get the padded length (what CNN will see)
+    padded_length = padded_seqs.shape[1]  # The L dimension
+    
+    # Calculate what length CNN will output
+    pool_sizes = [(2, 2), (2, 2), (2, 2)]
+    cnn_output_length = padded_length
+    for (ph, pw) in pool_sizes:
+        cnn_output_length = cnn_output_length // ph
+    
+    # Downsample ALL labels to this SAME length
+    downsampled_labels = []
+    for label_seq in labels:
+        # Pad or truncate each label sequence to cnn_output_length
+        labels_tensor = torch.tensor(label_seq, dtype=torch.long)
+        
+        # Downsample this label sequence
+        ds_labels = downsample_single_label_sequence(label_seq, pool_sizes)
+        
+        # Truncate or pad to match cnn_output_length exactly
+        if len(ds_labels) > cnn_output_length:
+            ds_labels = ds_labels[:cnn_output_length]
+        elif len(ds_labels) < cnn_output_length:
+            # Pad with -100
+            ds_labels = ds_labels + [-100] * (cnn_output_length - len(ds_labels))
+        
+        downsampled_labels.append(torch.tensor(ds_labels, dtype=torch.long))
+    
+    # Stack (all same length now)
+    padded_labels = torch.stack(downsampled_labels)
+    
+    # Original lengths
     lengths = torch.tensor(lengths, dtype=torch.long)
     
     return padded_seqs, padded_labels, lengths

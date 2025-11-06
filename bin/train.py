@@ -1,7 +1,7 @@
-"""Simple training script for the IntraNet CNN+BLSTM model."""
 
 import argparse
 import math
+import time
 from pathlib import Path
 
 import torch
@@ -73,8 +73,9 @@ embedding_dim = sample_vector.shape[-1]
 dataset = it.SplicingDataset(args.corpus, embeddings, args.labels)
 
 # Creating label and prediction classes
-unique_labels   = sorted(set(dataset.labels))
+unique_labels   = sorted(set(label for label_seq in dataset.labels for label in label_seq))
 num_classes     = len(unique_labels)
+
 if num_classes < 2:
     raise ValueError(
         "At least two classes are required for training. "
@@ -106,30 +107,30 @@ optimiser   = torch.optim.Adam(model.parameters(), lr=args.lr)
 
 # Monitor the Learning Rate
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-    optimiser, mode='min', factor=0.5, patience=3, verbose=True
+    optimiser, mode='min', factor=0.5, patience=3
 )
 
 for epoch in range(1, args.epochs + 1):
     model.train()
     running_loss = 0.0
     running_examples = 0
+    start_time = time.time()
 
-    for inputs, targets, lengths in train_loader:
+    for batch_idx, (inputs, targets, lengths) in enumerate(train_loader, start=1):
         inputs  = inputs.to(device)
         targets = targets.to(device)
         lengths = lengths.to(device)
-
         optimiser.zero_grad(set_to_none=True)
 
         if use_amp:
             with autocast_ctx():
-                logits = model(inputs, lengths)                   # (B, L', C)
-                loss = loss_fn(logits.permute(0, 2, 1), targets) # (B, C, L')
-            if scaler is not None:  # CUDA path
+                logits = model(inputs, lengths)
+                loss = loss_fn(logits.permute(0, 2, 1), targets)
+            if scaler:
                 scaler.scale(loss).backward()
                 scaler.step(optimiser)
                 scaler.update()
-            else:  # MPS path (no scaler)
+            else:
                 loss.backward()
                 optimiser.step()
         else:
@@ -138,11 +139,20 @@ for epoch in range(1, args.epochs + 1):
             loss.backward()
             optimiser.step()
 
-        # Average loss per *token* actually used (ignoring -100)
+        # Update metrics
         valid_mask = (targets != -100)
         batch_tokens = valid_mask.sum().item()
         running_loss += loss.item() * batch_tokens
         running_examples += batch_tokens
+
+        # Print every N batches
+        if batch_idx % 50 == 0:
+            elapsed = time.time() - start_time
+            print(f"[Epoch {epoch}/{args.epochs}] "
+                  f"Batch {batch_idx}/{len(train_loader)} "
+                  f"Loss: {loss.item():.4f}  "
+                  f"Time: {elapsed:.1f}s")
+            start_time = time.time()  # reset timer for next interval
 
     train_loss = running_loss / running_examples if running_examples else float("nan")
 
