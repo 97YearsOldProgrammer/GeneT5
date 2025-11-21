@@ -11,7 +11,8 @@ parser.add_argument("tk_op", type=str,
     help="Destination file for the generated corpus (plain text).")
 parser.add_argument("labels_op", type=str,
     help="Optional destination file for the generated label sequences.")
-parser.add_argument("--kmer", type=int, default=8,
+# default is 6mer based on other popular tokenizer
+parser.add_argument("--kmer", type=int, default=6,
     help="Size of the sliding k-mer window used for tokenisation [%(default)i].")
 parser.add_argument("--stride", type=int, default=3,
     help="Stride of the sliding window used in the tokenizer [%(default)i].")
