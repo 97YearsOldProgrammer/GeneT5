@@ -1,13 +1,8 @@
 from __future__ import annotations
 
-import gzip
 import math
-import sys
-import os
-import re
-import typing as tp
-from typing import List
 import numpy as np
+from typing         import List
 
 import torch
 import torch.nn as nn
@@ -16,324 +11,8 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset, DataLoader, random_split
 
-from pathlib        import Path
-from contextlib     import closing
 from dataclasses    import dataclass
 
-
-
-def anti(seq):
-	comp = str.maketrans('ACGTRYMKBDHVNacgtrymkbdhvn', 'TGCAYRKMVHDBNtgcayrkmvhdbn')
-	anti = seq.translate(comp)[::-1]
-	return anti
-
-
-
-#####################
-## UTILITY SECTION ##
-#####################
-
-
-def getfp(filename):
-    
-	if   filename.endswith('.gz'):
-		return gzip.open(filename, 'rt', encoding='ISO-8859-1')
-	elif filename == '-':
-		return sys.stdin
-	return open(filename)
-
-def read_fasta(filename):
-
-	name = None
-	seqs = []
-
-	fp = getfp(filename)
-
-	for line in fp:
-		line = line.rstrip()
-		if line.startswith('>'):
-			if len(seqs) > 0:
-				seq = ''.join(seqs)
-				yield(name, seq)
-				name = line[1:].split()[0]
-				seqs = []
-			else:
-				name = line[1:].split()[0]
-		else:
-			seqs.append(line)
-	yield(name, ''.join(seqs))
-	fp.close()
-
-def find_files(input_path):
-
-	fa      = re.compile(r'\.(fasta|fa|fna)(\.gz)?$', re.IGNORECASE)
-	gff     = re.compile(r'\.(gff|gff3)(\.gz)?$', re.IGNORECASE)
- 
-	fastas  = []
-	gffs    = []
-	
-	input_path = Path(input_path)
-	
-	if not input_path.exists():
-		raise FileNotFoundError(f"Input path does not exist: {input_path}")
-	
-	if not input_path.is_dir():
-		raise ValueError(f"Input path must be a directory: {input_path}")
-	
-	for root, dirs, files in os.walk(input_path):
-		for file in files:
-			filepath = os.path.join(root, file)
-			
-			if fa.search(file):
-				fastas.append(filepath)
-			elif gff.search(file):
-				gffs.append(filepath)
-	
-	return fastas, gffs
-
-@dataclass
-class Feature:
-    """ Parse Single GFF line"""
-
-    seqid:  str
-    source: str
-    typ:    str
-    beg:    int
-    end:    int
-    score:  tp.Optional[float]
-    strand: str
-    phase:  tp.Optional[int]
-    att:    tp.Dict[str, str]
-
-def parse_att(att):
-
-    attributes = {}
-
-    if not att or att == ".":
-        return attributes
-
-    for stuff in att.split(";"):
-        stuff = stuff.strip()
-        if not stuff:
-            continue
-        if "=" in stuff:
-            key, value = stuff.split("=", 1)
-        elif " " in stuff:
-            key, value = stuff.split(" ", 1)
-        else:
-            key, value = stuff, ""
-        attributes[key.strip()] = value.strip()
-
-    return attributes
-
-def parse_gff(filename, adopt_orphan: bool=False):
-    
-    fp          = getfp(filename)
-    features    = []
-    orphan_count = 0
-
-    with closing(fp):
-        for line in fp:
-
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            line = line.split("\t")
-            
-            if len(line) == 8:
-                line.append(".")
-            elif len(line) != 9:
-                continue
-
-            seqid, source, typ, beg, end, score, strand, phase, att = line
-            score = None if score == "." else float(score)
-            phase = None if phase == "." else int(phase)
-
-            att = parse_att(att)
-            
-            if not att:
-                if adopt_orphan and typ.lower() == "intron":
-                    orphan_id = f"{source}:{seqid}:{beg}-{end}"
-                    att = {
-                        "ID": orphan_id,
-                        "Parent": orphan_id,
-                    }
-                    orphan_count += 1
-                else:
-                    continue
-
-            feature = Feature(
-                seqid=  seqid,
-                source= source,
-                typ=    typ.lower(),
-                beg=    int(beg),
-                end=    int(end),
-                score=  score,
-                strand= strand,
-                phase=  phase,
-                att=    att,
-            )
-            features.append(feature)
-
-    return features, orphan_count
-
-def choose_parent_id(feature):
-    
-    if "Parent" in feature.att:
-        return feature.att["Parent"].split(",")[0]
-    if "ID" in feature.att:
-        return feature.att["ID"]
-    return feature.seqid
-
-def group_features(features, filter):
-
-    group = {}
-
-    for feature in features:
-        if feature.typ not in filter: continue
-        parent_id = choose_parent_id(feature)
-        group.setdefault(parent_id, []).append(feature)
-
-    return group
-
-def build_line(features, seqid, strand, seq):
-
-    line = []
-
-    # iterate through all feature under a parent ID
-    for feature in sorted(features, key=lambda x: x.beg):
-
-        if feature.seqid != seqid:
-            raise ValueError(
-                f"Transcript {seqid} has exons on multiple sequences "
-                f"({seqid} vs {feature.seqid})"
-            )
-            
-        if feature.strand != strand:
-            raise ValueError(
-                f"Transcript {seqid} mixes strands ({strand} vs {feature.strand})"
-            )
-        
-        word = seq[feature.beg-1 : feature.end]
-        if strand == "-":
-            word = anti(word)
-        line.append((word, feature.typ))
-
-    return line
-
-def build_transcript(grouped, sequences):
-
-    transcripts = {}
-    
-    for parent_id, features in grouped.items():
-        if not features:
-            continue
-        
-        seqid   = features[0].seqid
-        strand  = features[0].strand
-        
-        if seqid not in sequences:
-            raise KeyError(
-                f"Sequence '{seqid}' referenced in GFF but absent from FASTA"
-            )
-
-        seq = sequences[seqid]
-        transcripts[parent_id] = build_line(features, seqid, strand, seq)
-
-    return transcripts
-
-def tokenize_transcripts(transcripts, tokenizer, feature_label_map, default_label=-1):
-
-    tokenized = {}
-    labels = {}
-
-    for parent_id, segments in transcripts.items():
-        token_ids = []
-        label_ids = []
-
-        for segment, feature_type in segments:
-            segment_token_ids = tokenizer(segment)
-            token_ids.extend(segment_token_ids)
-
-            # mapping token one-to-one labels
-            label_value = feature_label_map.get(feature_type, default_label)
-            label_ids.extend([label_value] * len(segment_token_ids))
-
-        tokenized[parent_id]    = token_ids
-        labels[parent_id]       = label_ids
-
-    return tokenized, labels
-
-
-######################
-#### Tokenisation ####
-######################
-
-
-BASE_PAIR   = ("A", "C", "G", "T")
-BASE2IDX    = {base: idx for idx, base in enumerate(BASE_PAIR)}
-
-DEFAULT_FEATURE_LABELS = {
-    "exon": 0,
-    "intron": 1,
-    "five_prime_utr": 2,
-    "three_prime_utr": 3,
-}
-
-def apkmer(k: int):
-
-    if k <= 0:
-        raise ValueError("k must be a positive integer")
-
-    if k == 1:
-        return list(BASE_PAIR)
-
-    prev_kmers = apkmer(k - 1)
-    return [prefix + base for prefix in prev_kmers for base in BASE_PAIR]
-
-@dataclass
-class KmerTokenizer:
-    """DNA seq to kmer ids by sliding window algo"""
-
-    k           : int
-    stride      : int = 1
-    vocabulary  : list = None
-
-    def __post_init__(self):
-        # map all kmer with a int
-        self.token2id = {token: idx for idx, token in enumerate(self.vocabulary)}
-
-    def __call__(self, seq):
-        seq     = seq.upper()
-        tokens  = []
-
-        # sliding window algo
-        for t in range(0, max(len(seq) - self.k + 1, 0), self.stride):
-            token = seq[t:t+self.k]
-            if token in self.token2id:
-                tokens.append(self.token2id[token])
-        
-        return tokens
-
-
-################
-#### Output ####
-################
-
-
-def write_tokenized_corpus(output_path, tokenized):
-
-    with open(output_path, "w", encoding="utf-8") as fp:
-        for parent_id in sorted(tokenized):
-            token_line = " ".join(str(token_id) for token_id in tokenized[parent_id])
-            fp.write(token_line + "\n")
-
-def write_label_sequences(output_path, labels):
-
-    with open(output_path, "w", encoding="utf-8") as fp:
-        for parent_id in sorted(labels):
-            label_line = " ".join(str(label_id) for label_id in labels[parent_id])
-            fp.write(label_line + "\n")
 
 
 ###################
@@ -583,41 +262,84 @@ class BiLSTM(nn.Module):
 
 class IntraNet2(nn.Module):
     """
-    VGG-16 -> RNN scan through --> Transposed CNN upsampling --> Prediction
+    VGG-16 -> BiLSTM -> Upsample -> Compress W dimension -> FC with BatchNorm
+    
+    For DNA sequence data:
+    - H = number of tokens (sequence length)
+    - W = embedding dimension (e.g., 4 for one-hot DNA)
     """
 
     def __init__(
         self,
-        embedding_dim:          int,
-        num_classes:            int,
+        input_height:           int = None, # H = num_tokens
+        input_width:            int = 4,    # W = embedding_dim (e.g., 4 for DNA)
+        num_classes:            int = 2,
         lstm_hidden:            int = 256,
         dropout:                float = 0.5,
+        fc_hidden:              list = [256, 128, 64],  # FC layer sizes
+        compression_method:     str = 'adaptive_pool',  # 'adaptive_pool', 'avg_pool', 'max_pool', 'conv'
     ):
         super().__init__()
-        self.embedding_dim = embedding_dim
-        self.num_classes   = num_classes
-        self.dropout       = nn.Dropout2d(dropout)
+        self.input_height = input_height
+        self.input_width = input_width
+        self.num_classes = num_classes
+        self.dropout_2d = nn.Dropout2d(dropout)
 
-        # VGG-16 encoder (not whole CNN layer)
+        # VGG-16 encoder (deeper)
         self.encoder = nn.Sequential(
             self._vgg_block(1,   64,  2),       # H -> H/2
             self._vgg_block(64,  128, 2),       # H/2 -> H/4
+            self._vgg_block(128, 256, 3),       # H/4 -> H/8
+            self._vgg_block(256, 512, 3),       # H/8 -> H/16
         )
 
         # ReSeg layers
-        self.renet1 = BiLSTM(128, lstm_hidden)                    # 128 -> 2*lstm_hidden
-        self.renet2 = BiLSTM(2*lstm_hidden, lstm_hidden)          # 2*lstm_hidden -> 2*lstm_hidden
+        self.renet1 = BiLSTM(512, lstm_hidden)                    
+        self.renet2 = BiLSTM(2*lstm_hidden, lstm_hidden)          
         
-        # Transposed convolution (Upsmapling Layer)
+        # Transposed convolution
         self.upsample = nn.Sequential(
-            nn.ConvTranspose2d(2*lstm_hidden, 128, kernel_size=4, stride=2, padding=1),
+            nn.ConvTranspose2d(2*lstm_hidden, 256, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
             nn.ReLU(inplace=True),
             nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
             nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(64, 64, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
         )
+
+        # ===== COMPRESS W DIMENSION =====
+        if compression_method == 'adaptive_pool':
+            self.compress_w = nn.AdaptiveAvgPool2d((None, 1))  # (B, 64, H, W) -> (B, 64, H, 1)
+        elif compression_method == 'avg_pool':
+            self.compress_w = lambda x: torch.mean(x, dim=3, keepdim=True)
+        elif compression_method == 'max_pool':
+            self.compress_w = lambda x: torch.max(x, dim=3, keepdim=True)[0]
+        elif compression_method == 'conv':
+            # Learnable compression
+            self.compress_w = nn.Conv2d(64, 64, kernel_size=(1, input_width), padding=0)
+        else:
+            raise ValueError(f"Unknown compression method: {compression_method}")
         
-        # Final classifier
-        self.classifier = nn.Conv2d(64, num_classes, kernel_size=1)
+        # FC CLASSIFIER with BatchNorm
+        # Input: (B, 64, H, 1) -> reshape to (B*H, 64)
+        fc_layers = []
+        prev_dim = 64  # number of channels after compression
+        
+        for hidden_dim in fc_hidden:
+            fc_layers.extend([
+                nn.Linear(prev_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout)
+            ])
+            prev_dim = hidden_dim
+        
+        # Final output layer (per-token classification)
+        fc_layers.append(nn.Linear(prev_dim, num_classes))
+        
+        self.fc_classifier = nn.Sequential(*fc_layers)
         
     @staticmethod
     def _vgg_block(c_in, c_out, n_convs):
@@ -630,25 +352,45 @@ class IntraNet2(nn.Module):
         layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
         return nn.Sequential(*layers)
 
-    def forward(self, x, lengths=None):
+    def forward(self, x):
+        """
+        Args:
+            x: (B, 1, H, W) where H=num_tokens, W=embedding_dim
         
-        # x: (B, 1, H, W)
+        Returns:
+            (B, num_classes, H) - per-token predictions
+        """
         
-        # VGG encoding
-        x = self.encoder(x)                 # (B, 128, H/4, W/4)
+        B, _, H, W = x.shape
         
-        # ReSeg layers
-        x = self.renet1(x)                  # (B, 2*hidden, H/4, W/4)
-        x = self.dropout(x)
-        x = self.renet2(x)                  # (B, 2*hidden, H/4, W/4)
-        x = self.dropout(x)
+        # VGG encoding (downsample H)
+        x = self.encoder(x)                 # (B, 512, H/16, W/16)
         
-        # Upsample to original resolution
-        x = self.upsample(x)                # (B, 64, H, W)
+        # BiLSTM layers
+        x = self.renet1(x)                  # (B, 2*hidden, H/16, W/16)
+        x = self.dropout_2d(x)
+        x = self.renet2(x)                  # (B, 2*hidden, H/16, W/16)
+        x = self.dropout_2d(x)
         
-        # Classification
-        x = self.classifier(x)              # (B, num_classes, H, W)
-
+        # Upsample back to ORIGINAL (H, W)
+        x = self.upsample(x)                # (B, 64, H, W) ← back to original size!
+        
+        # ===== COMPRESS W DIMENSION =====
+        # (B, 64, H, W) -> (B, 64, H, 1)
+        x = self.compress_w(x)              # (B, 64, H, 1)
+        
+        # Reshape for FC: (B, 64, H, 1) -> (B, H, 64)
+        x = x.squeeze(3)                    # (B, 64, H)
+        x = x.permute(0, 2, 1)              # (B, H, 64)
+        x = x.contiguous().view(-1, 64)     # (B*H, 64) - each token is a 64-dim vector
+        
+        # ===== FC CLASSIFIER =====
+        x = self.fc_classifier(x)           # (B*H, num_classes)
+        
+        # Reshape back: (B*H, num_classes) -> (B, H, num_classes)
+        x = x.view(B, H, self.num_classes)  # (B, H, num_classes)
+        x = x.permute(0, 2, 1)              # (B, num_classes, H)
+        
         return x
 
     
