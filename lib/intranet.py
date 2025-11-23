@@ -121,117 +121,6 @@ class SplicingDataset(Dataset):
 #### IntraNet NN ####
 #####################
 
-
-class IntraNet(nn.Module):
-    """
-    CNN → BLSTM hybrid for embedded DNA sequences with TOKEN-LEVEL classification.
-    Predicts one label (exon/intron) per token position.
-    """
-
-    def __init__(
-        self,
-        embedding_dim:          int,
-        num_classes:            int,
-        conv_channels:          List[int]   = [64, 128, 256],
-        kernel_sizes:           List[tuple] = [(3, 3), (3, 3), (3, 3)],
-        pool_sizes:             List[tuple] = [(2, 2), (2, 2), (2, 2)],
-        lstm_hidden:            int = 128,
-        lstm_layers:            int = 1,
-        dropout:                float = 0.5,
-    ):
-        
-        super().__init__()
-        assert len(conv_channels) == len(kernel_sizes) == len(pool_sizes)
-
-        self.embedding_dim = embedding_dim
-        self.pool_sizes = pool_sizes
-
-        # Convolutional Layer
-        self.convs = nn.ModuleList()
-        self.bns   = nn.ModuleList()
-        self.pools = nn.ModuleList()
-
-        in_ch = 1
-
-        for out_ch, ksz, psz in zip(conv_channels, kernel_sizes, pool_sizes):
-            pad = self._same_pad(ksz)
-            self.convs.append(nn.Conv2d(in_ch, out_ch, kernel_size=ksz, padding=pad, bias=False))
-            self.bns.append(nn.BatchNorm2d(out_ch))
-            self.pools.append(nn.MaxPool2d(kernel_size=psz))
-            in_ch = out_ch
-
-        c_last = conv_channels[-1]
-
-        # BLSTM Layer
-        self.blstm = nn.LSTM(
-            input_size=     c_last,
-            hidden_size=    lstm_hidden,
-            num_layers=     lstm_layers,
-            batch_first=    True,
-            bidirectional=  True,
-            dropout=        dropout if lstm_layers > 1 else 0.0,
-        )
-
-        # Token-level classifier (predicts for each timestep)
-        self.dropout = nn.Dropout(dropout)
-        self.token_classifier = nn.Sequential(
-            nn.Linear(2 * lstm_hidden, 256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(256, num_classes),
-        )
-
-    @staticmethod
-    def _same_pad(kernel_hw: tuple) -> tuple:
-        kh, kw = kernel_hw
-        return (kh // 2, kw // 2)
-
-    def _downscale_lengths(self, lengths: torch.Tensor) -> torch.Tensor:
-        L = lengths.clone()
-        for (ph, pw) in self.pool_sizes:
-            L = torch.div(L, ph, rounding_mode='floor')
-        L = torch.clamp(L, min=1)
-        return L
-
-    def forward(self, x, lengths):
-        """
-        Returns token-level logits: (B, L', num_classes)
-        where L' is the downsampled sequence length after CNN pooling
-        """
-        
-        B = x.size(0)
-
-        # Add channel → (B, 1, L, E)
-        x = x.unsqueeze(1)
-
-        # CNN layers
-        for conv, bn, pool in zip(self.convs, self.bns, self.pools):
-            x = pool(F.relu(bn(conv(x))))  # (B, C, L', E')
-
-        # Mean over embedding dimension
-        x = x.mean(dim=3)  # (B, C, L')
-
-        # Swap for LSTM: (B, L', C)
-        x = x.permute(0, 2, 1).contiguous()
-
-        # BLSTM with length-aware packing
-        if lengths is not None:
-            lens_ds = self._downscale_lengths(lengths.to(x.device))
-            packed = nn.utils.rnn.pack_padded_sequence(
-                x, lens_ds.cpu(), batch_first=True, enforce_sorted=False
-            )
-            packed_out, _ = self.blstm(packed)
-            out, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True)
-        else:
-            out, _ = self.blstm(x)  # (B, L', 2*H)
-
-        # Apply token classifier to each timestep
-        # out: (B, L', 2*H) -> logits: (B, L', num_classes)
-        logits = self.token_classifier(self.dropout(out))
-        
-        return logits
-
-
 class BiLSTM(nn.Module):
     """BLSTM for vertical and horizontal scan"""
     
@@ -260,7 +149,7 @@ class BiLSTM(nn.Module):
         return h_out
 
 
-class IntraNet2(nn.Module):
+class IntraNet(nn.Module):
     """
     VGG-16 -> BiLSTM -> Upsample -> Compress W dimension -> FC with BatchNorm
     

@@ -381,28 +381,26 @@ def parse_wormbase_gff(filename):
 
 def process_introns(introns, chm_dict):
 
-    intron = []
+    intron_seqs = []
     
     for feature in introns:
-        
         seq = chm_dict[feature.chm][feature.beg-1:feature.end]
         if feature.std == "-":
             seq = anti(seq)
-        intron.append(seq)
+        intron_seqs.append(seq)
     
-    return intron
+    return intron_seqs
 
 def process_cds(proteins, chm_dict):
 
-    protein = []
+    protein_seqs = []
     
     for parent_id, features in proteins.items():
-        
         features = sorted(features, key=lambda x: x.beg)
         
         if not features:
             continue
-
+        
         chm = features[0].chm
         std = features[0].std
         
@@ -416,159 +414,138 @@ def process_cds(proteins, chm_dict):
             seq = chm_dict[chm][beg-1:feature.end]
             if std == "-":
                 seq = anti(seq)
-
+            
             cds.append(seq)
-        protein.append(cds)
+        
+        full_cds = ''.join(cds)
+        protein_seqs.append(full_cds)
+    
+    return protein_seqs
 
-    return protein
+def process_transcripts(genes, chm_dict):
 
-def separate_by_strand(genes):
-
-    fw_genes = defaultdict(list)
-    rv_genes = defaultdict(list)
+    transcripts = []
     
     for parent_id, features in genes.items():
         if not features:
             continue
         
+        features = sorted(features, key=lambda x: x.beg)
+        
+        chm = features[0].chm
         std = features[0].std
         
-        if std == "+":
-            fw_genes[f"{parent_id}"] = features
-        else:
-            rv_genes[f"{parent_id}"] = features
-    
-    return fw_genes, rv_genes
-
-def align_genes(features, chm_dict):
-
-    if not features:
-        return []
-    
-    # Sort by position
-    features = sorted(features , key=lambda x: x.beg)
-    
-    chm = features[0].chm
-    std = features[0].std
-    
-    aligned_parts = []
-    
-    for feature in features:
-        seq = ''
-        seq = chm_dict[chm][feature.beg-1:feature.end]
+        parts = []
         
+        for feature in features:
+            seq = chm_dict[chm][feature.beg-1:feature.end]
+            
+            if std == "-":
+                seq = anti(seq)
+            
+            # Determine feature label
+            if feature.typ == "five_prime_utr":
+                label = "5UTR"
+            elif feature.typ == "three_prime_utr":
+                label = "3UTR"
+            elif feature.typ == "exon":
+                label = "exon"
+            elif feature.typ == "intron":
+                label = "intron"
+            else:
+                label = feature.typ
+            
+            parts.append({
+                'typ': label,
+                'seq': seq
+            })
+        
+        # If negative strand, reverse the order of parts
         if std == "-":
-            seq = anti(seq)
+            parts = parts[::-1]
         
-        # Determine feature label
-        if feature.typ == "five_prime_utr":
-            label = "5UTR"
-        elif feature.typ == "three_prime_utr":
-            label = "3UTR"
-        elif feature.typ == "exon":
-            label = "exon"
-        elif feature.typ == "intron":
-            label = "intron"
-        else:
-            label = feature.typ
-        
-        aligned_parts.append({
-            'typ': label,
-            'beg': feature.beg,
-            'end': feature.end,
-            'seq': seq,
-            'std': std
-        })
+        transcripts.append(parts)
     
-    # If negative strand, reverse the order
-    if std == "-":
-        aligned_parts = aligned_parts[::-1]
-    
-    return aligned_parts
-
-def process_transcripts(genes, chm_dict):
-
-    fw_transcripts, rv_transcripts = separate_by_strand(genes)
-    
-    fw_aligned = {}
-    for fw_id, features in fw_transcripts.items():
-        fw_aligned[fw_id] = align_genes(features, chm_dict)
-    
-    rv_aligned = {}
-    for rv_id, features in rv_transcripts.items():
-        rv_aligned[rv_id] = align_genes(features, chm_dict)
-    
-    return fw_aligned, rv_aligned
-
-def tokenize_sequences(aligned_transcripts, tokenizer):
-
-    label_map = {
-        'exon': 0,
-        'intron': 1,
-        '5UTR': 2,
-        '3UTR': 3,
-    }
-
-    tokenized = {}
-    labels = {}
-    
-    for transcript_id, parts in aligned_transcripts.items():
-        tokens = []
-        label_ids = []
-        
-        for part in parts:
-            if part['seq']:
-                part_tokens = tokenizer(part['seq'])
-                tokens.extend(part_tokens)
-                
-                label_value = label_map.get(part['typ'], -1)
-                label_ids.extend([label_value] * len(part_tokens))
-        
-        tokenized[transcript_id]    = tokens
-        labels[transcript_id]       = label_ids
-    
-    return tokenized, labels
+    return transcripts
 
 class WormBaseDataset:
 
     def __init__(self, gff_file, fasta_files):
-        """Initialize with GFF and FASTA files"""
 
-        # Parse FASTA files into per chromosome
+        # Parse FASTA
         self.chms = {}
         for fasta in fasta_files:
             self.chms.update(parse_fasta(fasta))
 
         # Parse GFF3
-        self.introns, self.proteins, self.genes = parse_wormbase_gff(gff_file)
+        introns_raw, proteins_raw, genes_raw = parse_wormbase_gff(gff_file)
         
-        # Process datasets
-        self.introns    = process_introns(self.introns, self.chms)
-        self.proteins   = process_cds(self.proteins, self.chms)
-        self.fw_transcripts, self.rv_transcripts = process_transcripts(
-            self.genes, self.chms
-        )
-
+        # Process into simple lists
+        self.introns        = process_introns(introns_raw, self.chms)
+        self.proteins       = process_cds(proteins_raw, self.chms)
+        self.transcripts    = process_transcripts(genes_raw, self.chms)
+    
     def get_introns(self):
         return self.introns
     
-    def get_cds(self):
+    def get_proteins(self):
         return self.proteins
     
-    def get_forward_transcripts(self):
-        return self.fw_transcripts
+    def get_transcripts(self):
+        return self.transcripts
     
-    def get_reverse_transcripts(self):
-        return self.rv_transcripts
+    
+    def tokenize_introns(self, tokenizer):
+        return [tokenizer(seq) for seq in self.introns]
+    
+    def tokenize_proteins(self, tokenizer):
+        return [tokenizer(seq) for seq in self.proteins]
+    
+    def tokenize_transcripts(self, tokenizer):
+
+        tokenized = []
+        for parts in self.transcripts:
+            tokens = []
+            for part in parts:
+                if part['seq']:
+                    tokens.extend(tokenizer(part['seq']))
+            tokenized.append(tokens)
+        return tokenized
     
     def tokenize_all(self, tokenizer):
-        fw_tokens, fw_labels = tokenize_sequences(self.fw_transcripts, tokenizer)
-        rv_tokens, rv_labels = tokenize_sequences(self.rv_transcripts, tokenizer)
-        
-        return {
-            'forward': (fw_tokens, fw_labels),
-            'reverse': (rv_tokens, rv_labels)
+
+        all_tokens = []
+        all_tokens.extend(self.tokenize_introns(tokenizer))
+        all_tokens.extend(self.tokenize_proteins(tokenizer))
+        all_tokens.extend(self.tokenize_transcripts(tokenizer))
+        return all_tokens
+
+    
+    def label_introns(self, tokenizer):
+        return [[1] * len(tokenizer(seq)) for seq in self.introns]
+    
+    def label_proteins(self, tokenizer):
+        return [[0] * len(tokenizer(seq)) for seq in self.proteins]
+    
+    def label_transcripts(self, tokenizer):
+
+        label_map = {
+            'exon': 0,
+            'intron': 1,
+            '5UTR': 2,
+            '3UTR': 3,
         }
+        
+        labels_list = []
+        for parts in self.transcripts:
+            labels = []
+            for part in parts:
+                if part['seq']:
+                    part_tokens = tokenizer(part['seq'])
+                    label_value = label_map.get(part['typ'], -1)
+                    labels.extend([label_value] * len(part_tokens))
+            labels_list.append(labels)
+        return labels_list
 
 
 ################

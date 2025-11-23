@@ -20,8 +20,8 @@ t data/label/whole_celegan.txt
 The part of sequence that being tokenized for embedding is transripts, which is 5'UTR/exon/intron/3'UTR or reversed genes.  
 Introns and proteins are not considered. Since they are also a combinatoric parts of transcripts.   
 
----
 
+---
 
 
 ### Embed corpus with GloVe
@@ -30,13 +30,33 @@ Second step of the training is dumping all tokenized DNA into a Euclidean Space 
 As a statistical way of linear projection. Still considering using a another way to substitude that.    
 
 ```zsh
-python3 bin/tglove.py data/corpus/c_smg.txt data/trained/vector_smg glove/build
+python3 bin/tglove.py data/corpus/whole_celegan.txt data/glove_trained/vector_wce2 glove/build
 ```
 
 As embedding dimension is some parameter that would decide directly about the weights of input data.    
 For using the whole genome of C elegans, it seem like using embeeding dimension 256 instead 100 would results in better trainning loss.     
 
-| Dimension  | Epoch                 | Loss     |
-|------------|-----------------------|----------|
-| 100        | 15                    | 0.105146 |
-| 256        | 150                   | 0.065872 |
+| Dimension                 | Epoch                 | Loss     |
+|---------------------------|-----------------------|----------|
+| 100                       | 15                    | 0.105146 |
+| 256 (only transcripts)    | 150                   | 0.065872 |
+| 256 (inlucde aa/intron)   | 150                   | 0.134592 |
+
+
+---
+
+
+### Trainning nn
+
+The last step is trainning the neural network using given dataset.  
+All the nn is build up by stacking pytorch. So using pytroch package is necessary.  
+
+This is how you can download all package for Apple Silicon
+```zsh
+conda create -n nameyouwannaput
+conda install pytorch torchvision torchaudio -c pytorch -c conda-forge
+```
+
+This is the formal cmd for trainning. There would be an abstract evaluation afterwards.
+```zsh
+python3 

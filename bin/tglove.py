@@ -18,11 +18,12 @@ parser.add_argument("--mi", type=int, default=150,
     help="Number of maximum training iterations [%(default)s].")
 parser.add_argument("--ws", type=int, default=15,
     help="Context window size (smaller=syntax, larger=semantics) [%(default)s].")
-parser.add_argument("--m", type=float, default=4.0,
+parser.add_argument("--m", type=float, default=30,
     help="Memory limit in GB for cooccurrence and shuffle [%(default)s].")
-parser.add_argument("--nt", type=int, default=8,
+# default is 14 for Gong (remember to change)
+parser.add_argument("--nt", type=int, default=14,
     help="Number of threads for parallel training [%(default)s].")
-parser.add_argument("--xm", type=int, default=10,
+parser.add_argument("--xm", type=int, default=100,
     help="Cutoff in weighting function [%(default)s].")
 parser.add_argument("--bn", type=int, default=2, choices=[0, 1, 2],
     help="Save output in binary format (0=text, 1=binary, 2=both) [%(default)s].")
