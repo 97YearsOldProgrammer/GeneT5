@@ -43,6 +43,22 @@ For using the whole genome of C elegans, it seem like using embeeding dimension 
 | 256 (inlucde aa/intron)   | 150                   | 0.134592 |
 
 
+
+---
+
+
+### Pretrainning on the Encoder Section (BERT)
+
+To teach the nn for gene finder purpose. Instread of directly random weights. We need to pre-trained the transformer encoder for learning the rules of intron/exon.     
+
+There are two types of pre-trainning tasks:
+
+    1 Masked Language Model (MLM)   
+    2 Next Sentence Prediction (NSP)    
+  
+Masked Language Model: Instead randomly masked the kmer token, applying masked token to the splicing donor and accetpor sites for model to learning the motif.  
+Next Sentence Prediction: We could cutting off exon and intron, letting the model to learn the rule of exon and intron connection.      
+
 ---
 
 
