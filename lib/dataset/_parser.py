@@ -106,185 +106,6 @@ def find_files(input_path):
 
 
 ############################
-## Small Gene Set Parsing ##
-############################
-
-
-@dataclass
-class Feature:
-    """ Parse Single GFF line"""
-
-    seqid:  str
-    source: str
-    typ:    str
-    beg:    int
-    end:    int
-    score:  tp.Optional[float]
-    strand: str
-    phase:  tp.Optional[int]
-    att:    tp.Dict[str, str]
-
-def parse_att(att):
-
-    attributes = {}
-
-    if not att or att == ".":
-        return attributes
-
-    for stuff in att.split(";"):
-        stuff = stuff.strip()
-        if not stuff:
-            continue
-        if "=" in stuff:
-            key, value = stuff.split("=", 1)
-        elif " " in stuff:
-            key, value = stuff.split(" ", 1)
-        else:
-            key, value = stuff, ""
-        attributes[key.strip()] = value.strip()
-
-    return attributes
-
-def parse_gff(filename, adopt_orphan: bool=False):
-    
-    fp          = getfp(filename)
-    features    = []
-    orphan_count = 0
-
-    with closing(fp):
-        for line in fp:
-
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            line = line.split("\t")
-            
-            if len(line) == 8:
-                line.append(".")
-            elif len(line) != 9:
-                continue
-
-            seqid, source, typ, beg, end, score, strand, phase, att = line
-            score = None if score == "." else float(score)
-            phase = None if phase == "." else int(phase)
-
-            att = parse_att(att)
-            
-            if not att:
-                if adopt_orphan and typ.lower() == "intron":
-                    orphan_id = f"{source}:{seqid}:{beg}-{end}"
-                    att = {
-                        "ID": orphan_id,
-                        "Parent": orphan_id,
-                    }
-                    orphan_count += 1
-                else:
-                    continue
-
-            feature = Feature(
-                seqid=  seqid,
-                source= source,
-                typ=    typ.lower(),
-                beg=    int(beg),
-                end=    int(end),
-                score=  score,
-                strand= strand,
-                phase=  phase,
-                att=    att,
-            )
-            features.append(feature)
-
-    return features, orphan_count
-
-def choose_parent_id(feature):
-    
-    if "Parent" in feature.att:
-        return feature.att["Parent"].split(",")[0]
-    if "ID" in feature.att:
-        return feature.att["ID"]
-    return feature.seqid
-
-def group_features(features, filter):
-
-    group = {}
-
-    for feature in features:
-        if feature.typ not in filter: continue
-        parent_id = choose_parent_id(feature)
-        group.setdefault(parent_id, []).append(feature)
-
-    return group
-
-def build_line(features, seqid, strand, seq):
-
-    line = []
-
-    # iterate through all feature under a parent ID
-    for feature in sorted(features, key=lambda x: x.beg):
-
-        if feature.seqid != seqid:
-            raise ValueError(
-                f"Transcript {seqid} has exons on multiple sequences "
-                f"({seqid} vs {feature.seqid})"
-            )
-            
-        if feature.strand != strand:
-            raise ValueError(
-                f"Transcript {seqid} mixes strands ({strand} vs {feature.strand})"
-            )
-        
-        word = seq[feature.beg-1 : feature.end]
-        if strand == "-":
-            word = anti(word)
-        line.append((word, feature.typ))
-
-    return line
-
-def build_transcript(grouped, sequences):
-
-    transcripts = {}
-    
-    for parent_id, features in grouped.items():
-        if not features:
-            continue
-        
-        seqid   = features[0].seqid
-        strand  = features[0].strand
-        
-        if seqid not in sequences:
-            raise KeyError(
-                f"Sequence '{seqid}' referenced in GFF but absent from FASTA"
-            )
-
-        seq = sequences[seqid]
-        transcripts[parent_id] = build_line(features, seqid, strand, seq)
-
-    return transcripts
-
-def tokenize_transcripts(transcripts, tokenizer, feature_label_map, default_label=-1):
-
-    tokenized = {}
-    labels = {}
-
-    for parent_id, segments in transcripts.items():
-        token_ids = []
-        label_ids = []
-
-        for segment, feature_type in segments:
-            segment_token_ids = tokenizer(segment)
-            token_ids.extend(segment_token_ids)
-
-            # mapping token one-to-one labels
-            label_value = feature_label_map.get(feature_type, default_label)
-            label_ids.extend([label_value] * len(segment_token_ids))
-
-        tokenized[parent_id]    = token_ids
-        labels[parent_id]       = label_ids
-
-    return tokenized, labels
-
-
-############################
 ## WormBase GFF3 Feature ##
 ############################
 
@@ -468,6 +289,7 @@ def process_transcripts(genes, chm_dict):
     
     return transcripts
 
+
 class WormBaseDataset:
 
     def __init__(self, gff_file, fasta_files):
@@ -493,59 +315,185 @@ class WormBaseDataset:
     
     def get_transcripts(self):
         return self.transcripts
-    
-    
-    def tokenize_introns(self, tokenizer):
-        return [tokenizer(seq) for seq in self.introns]
-    
-    def tokenize_proteins(self, tokenizer):
-        return [tokenizer(seq) for seq in self.proteins]
-    
-    def tokenize_transcripts(self, tokenizer):
 
-        tokenized = []
-        for parts in self.transcripts:
-            tokens = []
-            for part in parts:
-                if part['seq']:
-                    tokens.extend(tokenizer(part['seq']))
-            tokenized.append(tokens)
-        return tokenized
-    
-    def tokenize_all(self, tokenizer):
 
-        all_tokens = []
-        all_tokens.extend(self.tokenize_introns(tokenizer))
-        all_tokens.extend(self.tokenize_proteins(tokenizer))
-        all_tokens.extend(self.tokenize_transcripts(tokenizer))
-        return all_tokens
+############################
+## Small Gene Set Parsing ##
+############################
 
-    
-    def label_introns(self, tokenizer):
-        return [[1] * len(tokenizer(seq)) for seq in self.introns]
-    
-    def label_proteins(self, tokenizer):
-        return [[0] * len(tokenizer(seq)) for seq in self.proteins]
-    
-    def label_transcripts(self, tokenizer):
 
-        label_map = {
-            'exon': 0,
-            'intron': 1,
-            '5UTR': 2,
-            '3UTR': 3,
-        }
+@dataclass
+class Feature:
+    """ Parse Single GFF line"""
+
+    seqid:  str
+    source: str
+    typ:    str
+    beg:    int
+    end:    int
+    score:  tp.Optional[float]
+    strand: str
+    phase:  tp.Optional[int]
+    att:    tp.Dict[str, str]
+
+def parse_att(att):
+
+    attributes = {}
+
+    if not att or att == ".":
+        return attributes
+
+    for stuff in att.split(";"):
+        stuff = stuff.strip()
+        if not stuff:
+            continue
+        if "=" in stuff:
+            key, value = stuff.split("=", 1)
+        elif " " in stuff:
+            key, value = stuff.split(" ", 1)
+        else:
+            key, value = stuff, ""
+        attributes[key.strip()] = value.strip()
+
+    return attributes
+
+def parse_gff(filename, adopt_orphan: bool=False):
+    
+    fp          = getfp(filename)
+    features    = []
+    orphan_count = 0
+
+    with closing(fp):
+        for line in fp:
+
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            line = line.split("\t")
+            
+            if len(line) == 8:
+                line.append(".")
+            elif len(line) != 9:
+                continue
+
+            seqid, source, typ, beg, end, score, strand, phase, att = line
+            score = None if score == "." else float(score)
+            phase = None if phase == "." else int(phase)
+
+            att = parse_att(att)
+            
+            if not att:
+                if adopt_orphan and typ.lower() == "intron":
+                    orphan_id = f"{source}:{seqid}:{beg}-{end}"
+                    att = {
+                        "ID": orphan_id,
+                        "Parent": orphan_id,
+                    }
+                    orphan_count += 1
+                else:
+                    continue
+
+            feature = Feature(
+                seqid=  seqid,
+                source= source,
+                typ=    typ.lower(),
+                beg=    int(beg),
+                end=    int(end),
+                score=  score,
+                strand= strand,
+                phase=  phase,
+                att=    att,
+            )
+            features.append(feature)
+
+    return features, orphan_count
+
+def choose_parent_id(feature):
+    
+    if "Parent" in feature.att:
+        return feature.att["Parent"].split(",")[0]
+    if "ID" in feature.att:
+        return feature.att["ID"]
+    return feature.seqid
+
+def group_features(features, filter):
+
+    group = {}
+
+    for feature in features:
+        if feature.typ not in filter: continue
+        parent_id = choose_parent_id(feature)
+        group.setdefault(parent_id, []).append(feature)
+
+    return group
+
+def build_line(features, seqid, strand, seq):
+
+    line = []
+
+    # iterate through all feature under a parent ID
+    for feature in sorted(features, key=lambda x: x.beg):
+
+        if feature.seqid != seqid:
+            raise ValueError(
+                f"Transcript {seqid} has exons on multiple sequences "
+                f"({seqid} vs {feature.seqid})"
+            )
+            
+        if feature.strand != strand:
+            raise ValueError(
+                f"Transcript {seqid} mixes strands ({strand} vs {feature.strand})"
+            )
         
-        labels_list = []
-        for parts in self.transcripts:
-            labels = []
-            for part in parts:
-                if part['seq']:
-                    part_tokens = tokenizer(part['seq'])
-                    label_value = label_map.get(part['typ'], -1)
-                    labels.extend([label_value] * len(part_tokens))
-            labels_list.append(labels)
-        return labels_list
+        word = seq[feature.beg-1 : feature.end]
+        if strand == "-":
+            word = anti(word)
+        line.append((word, feature.typ))
+
+    return line
+
+def build_transcript(grouped, sequences):
+
+    transcripts = {}
+    
+    for parent_id, features in grouped.items():
+        if not features:
+            continue
+        
+        seqid   = features[0].seqid
+        strand  = features[0].strand
+        
+        if seqid not in sequences:
+            raise KeyError(
+                f"Sequence '{seqid}' referenced in GFF but absent from FASTA"
+            )
+
+        seq = sequences[seqid]
+        transcripts[parent_id] = build_line(features, seqid, strand, seq)
+
+    return transcripts
+
+def tokenize_transcripts(transcripts, tokenizer, feature_label_map, default_label=-1):
+
+    tokenized = {}
+    labels = {}
+
+    for parent_id, segments in transcripts.items():
+        token_ids = []
+        label_ids = []
+
+        for segment, feature_type in segments:
+            segment_token_ids = tokenizer(segment)
+            token_ids.extend(segment_token_ids)
+
+            # mapping token one-to-one labels
+            label_value = feature_label_map.get(feature_type, default_label)
+            label_ids.extend([label_value] * len(segment_token_ids))
+
+        tokenized[parent_id]    = token_ids
+        labels[parent_id]       = label_ids
+
+    return tokenized, labels
 
 
 ################
