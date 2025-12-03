@@ -1,3 +1,10 @@
+### T5-based Encoder and Decoder Model for Gene Prediction
+
+Haven't update the new README yet. Cuz still working on finishing structure, pre-training, fine-tuning, and testing results so far.     
+Will be update soon.    
+
+
+
 ### Tokenize dataset to corpus  
 
 First step of training is converting all the DNA sequences we have through a kmer sliding window algorithm.     

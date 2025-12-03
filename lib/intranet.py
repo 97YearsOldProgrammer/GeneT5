@@ -1,419 +1,968 @@
-import math
-import numpy as np
-from typing         import List
+# -----------------------------------------------------------------------------
+# This file implements components of the T5 architecture:
+#     Raffel et al., "Exploring the Limits of Transfer Learning with a
+#     Unified Text-to-Text Transformer", JMLR 2020.
+#
+# Original reference code:
+#   - Google T5 (Apache-2.0):
+#       https://github.com/google-research/text-to-text-transfer-transformer
+#   - HuggingFace Transformers T5 (Apache-2.0):
+#       https://github.com/huggingface/transformers
+#
+# Portions of this implementation (relative position bias, RMSNorm, GEGLU)
+# are adapted from the above works. 
+#
+# Apache License 2.0 allows modification and redistribution with attribution.
+# -----------------------------------------------------------------------------
+
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import Dataset, DataLoader, random_split
-
-from dataclasses    import dataclass
+import math
 
 
+################################
+#### Relative Position Bias ####
+################################
 
-###################
-#### Embedding ####
-###################
 
-
-def parse_glove_matrix(vectors):
-
-    embeddings = {}
+class RelativePositionBias(nn.Module):
     
-    with open(vectors, 'r') as fp:
-        for line in fp:
-            parts = line.strip().split()
-            if not parts:
-                continue
-            
-            try:
-                idx = int(parts[0])
-            # glove would include <unk> automatically
-            except ValueError:
-                print(f"Skipping non-integer token: {parts[0]}")
-                continue
-            
-            vector  = torch.tensor([float(x) for x in parts[1:]], dtype=torch.float32)
-            embeddings[idx] = vector
-    
-    return embeddings
-
-def embed_sentence(line, embeddings):
-    
-    idxs = [int(x) for x in line.strip().split()]
-    
-    if not idxs:
-        return torch.tensor([])
-
-    # some token are too rare for embedding threshold
-    valid_embeddings = []
-    for token_id in idxs:
-        if token_id in embeddings:
-            valid_embeddings.append(embeddings[token_id])
-
-    # return empty string for rare kmer
-    if not valid_embeddings:
-        return torch.tensor([])
-
-    # Stack all embedding vectors
-    return torch.stack(valid_embeddings, dim=0)
-
-def embed_whole_corpus(corpus, embeddings):
-
-    with open(corpus, 'r') as fp:
-        for line in fp:
-            line = line.strip()
-            if not line:
-                continue
-
-            embedded = embed_sentence(line, embeddings)
-            yield embedded
-
-
-###################
-##### DataSet #####
-###################
-
-
-class SplicingDataset(Dataset):
-
-    def __init__(self, corpus_file, embeddings, labels_file):
-        self.embeddings = embeddings
-        self.sentences = []
-        self.labels = []
+    def __init__(self, num_heads , num_buckets=32, max_distance=128, bidirectional=True):
+        super().__init__()
         
-        # Load embeddings
-        with open(corpus_file, 'r') as fp:
-            for line in fp:
-                line = line.strip()
-                if not line:
-                    continue
-                tensor = embed_sentence(line, embeddings)  # (L, E)
-                self.sentences.append(tensor)
+        self.num_heads      = num_heads
+        self.num_buckets    = num_buckets
+        self.max_distance   = max_distance
+        # Encoder is bidirectional
+        self.bidirectional  = bidirectional
         
-        with open(labels_file, 'r') as fp:
-            for line in fp:
-                line = line.strip()
-                if not line:
-                    continue
-
-                label_seq = [int(x) for x in line.split()]
-                self.labels.append(label_seq)
+        self.relative_attention_bias = nn.Embedding(num_buckets, num_heads)
+    
+    """
+        Compute bucket indices for relative positions
         
-        assert len(self.sentences) == len(self.labels), \
-            f"Mismatch: {len(self.sentences)} sequences vs {len(self.labels)} labels"
+        T5 uses a mix of:
+            - Exact positions for small distances
+            - Log-spaced bins for larger distances
+    """
+    @staticmethod
+    def _relative_position_bucket(relative_position, num_buckets, max_distance, bidirectional=True):
 
-    def __len__(self):
-        return len(self.sentences)
+        relative_buckets = 0
+        
+        if bidirectional:
+            num_buckets     //= 2
+            relative_buckets += (relative_position > 0).to(torch.long) * num_buckets
+            relative_position = torch.abs(relative_position)
+        else:
+            relative_position = -torch.min(
+                relative_position, 
+                torch.zeros_like(relative_position)
+            )
+        
+        # Half buckets for exact positions
+        max_exact = num_buckets // 2
+        is_small = relative_position < max_exact
+        
+        # Half buckets for log-spaced bins
+        relative_position_if_large = max_exact + (
+            torch.log(relative_position.float() / max_exact)
+            / math.log(max_distance / max_exact)
+            * (num_buckets - max_exact)
+        ).to(torch.long)
+        
+        relative_position_if_large = torch.min(
+            relative_position_if_large,
+            torch.full_like(relative_position_if_large, num_buckets - 1)
+        )
+        
+        relative_buckets += torch.where(
+            is_small, relative_position, relative_position_if_large
+        )
+        
+        return relative_buckets
+    
+    def forward(self, query_length, key_length, device):
 
-    def __getitem__(self, idx):
-        x = self.sentences[idx]         # (L, E)
-        y = self.labels[idx]            # list of labels, length L
-        length = len(x)                 # L
-        return x, y, length
+        context_position    = torch.arange(query_length, dtype=torch.long, device=device)[:, None]
+        memory_position     = torch.arange(key_length, dtype=torch.long, device=device)[None, :]
+        relative_position   = memory_position - context_position
+        
+        relative_position_bucket = self._relative_position_bucket(
+            relative_position,
+            bidirectional=self.bidirectional,
+            num_buckets=self.num_buckets,
+            max_distance=self.max_distance
+        )
+        
+        values = self.relative_attention_bias(relative_position_bucket)
+        # (1, num_heads, query_len, key_len)
+        values = values.permute([2, 0, 1]).unsqueeze(0)
+        
+        return values
 
 
-#####################
-#### IntraNet NN ####
-#####################
+####################
+#### Layer Norm ####
+####################
 
-class BiLSTM(nn.Module):
-    """BLSTM for vertical and horizontal scan"""
+
+class LayerNorm(nn.Module):
+    """RMSNorm without mean centering"""
+    
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps    = eps
+    
+    def forward(self, x):
+        variance    = x.pow(2).mean(-1, keepdim=True)
+        x           = x * torch.rsqrt(variance + self.eps)
+
+        return self.weight * x
+
+
+###################
+#### Attention ####
+###################
+
+
+class Attention(nn.Module):
+    """
+    T5-style multi-head attention with relative position bias
+    
+    Key differences from standard attention:
+        - No bias in linear projections
+        - Relative position bias instead of absolute positional encoding
+        - Supports both self-attention and cross-attention
+    """
     
     def __init__(
-        self, 
-        c_in: int, 
-        hidden: int
+        self,
+        embed_dim           : int,
+        num_heads           : int,
+        dropout             : float = 0.0,
+        is_decoder          : bool = False,
+        is_cross_attention  : bool = False,
+        has_relative_bias   : bool = True,
+        use_flash           : bool = True
     ):
         super().__init__()
-        self.vgru = nn.LSTM(input_size=c_in, hidden_size=hidden, batch_first=True, bidirectional=True)
-        self.hgru = nn.LSTM(input_size=2*hidden, hidden_size=hidden, batch_first=True, bidirectional=True)
+        
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+        
+        self.embed_dim          = embed_dim
+        self.num_heads          = num_heads
+        self.head_dim           = embed_dim // num_heads
+        self.is_decoder         = is_decoder
+        self.is_cross_attention = is_cross_attention
+        self.has_relative_bias  = has_relative_bias
+        self.use_flash          = use_flash
+        
+        # No Bias in Attention Projection
+        self.q = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.k = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.v = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.o = nn.Linear(embed_dim, embed_dim, bias=False)
+        
+        self.dropout = nn.Dropout(dropout)
+        
+        # Relative position bias (only for self-attention)
+        if has_relative_bias and not is_cross_attention:
+            self.relative_bias = RelativePositionBias(
+                num_heads=num_heads,
+                # Encoder is bidirectional
+                bidirectional=not is_decoder
+            )
+        else:
+            self.relative_bias = None
+    
+    def forward(self, hidden_states, key_value_states=None, attention_mask=None, position_bias=None):
+        """
+        Args:
+            hidden_states   : (B, L, D) query states
+            key_value_states: (B, L_kv, D) for cross-attention, None for self-attention
+            attention_mask  : (B, 1, L, L_kv) additive mask
+            position_bias   : precomputed position bias for reuse
+        
+        Returns:
+            output          : (B, L, D)
+            position_bias   : for reuse in subsequent layers
+        """
+        
+        B, L, D = hidden_states.shape
+        
+        # Query from hidden_states
+        q = self.q(hidden_states)
+        
+        # k&v from cross-attn
+        if self.is_cross_attention and key_value_states is not None:
+            k       = self.k(key_value_states)
+            v       = self.v(key_value_states)
+            L_kv    = key_value_states.shape[1]
+        # k&v from self-attn
+        else:
+            k       = self.k(hidden_states)
+            v       = self.v(hidden_states)
+            L_kv    = L
+        
+        # Reshape: (B, L, D) -> (B, num_heads, L, head_dim)
+        q = q.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, L_kv, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, L_kv, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Compute relative position bias if needed
+        if self.relative_bias is not None and position_bias is None:
+            position_bias = self.relative_bias(L, L_kv, hidden_states.device)
+        
+        # Use Flash Attention if available
+        use_flash_attn = (
+            self.use_flash 
+            and hasattr(F, 'scaled_dot_product_attention')
+            and position_bias is None 
+            and attention_mask is None
+        )
+        
+        if use_flash_attn:
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                is_causal=self.is_decoder and not self.is_cross_attention
+            )
+        else:
+            # Compute Attention
+            scores = torch.matmul(q, k.transpose(-2, -1))  # (B, num_heads, L, L_kv)
+            
+            # Apply relative position bias
+            if position_bias is not None:
+                scores = scores + position_bias
+            
+            # Apply attention mask
+            if attention_mask is not None:
+                scores = scores + attention_mask
+            
+            # Softmax and dropout
+            attn_weights    = F.softmax(scores.float(), dim=-1).type_as(scores)
+            attn_weights    = self.dropout(attn_weights)
+            out             = torch.matmul(attn_weights, v)
+        
+        # Reshape back: (B, num_heads, L, head_dim) -> (B, L, D)
+        out = out.transpose(1, 2).reshape(B, L, D)
+        out = self.o(out)
+        
+        return out, position_bias
 
+
+######################
+#### Feed Forward ####
+######################
+
+
+class FeedForward(nn.Module):
+    """Gated MLP based on GeGLU"""
+    
+    def __init__(self, embed_dim, ff_dim, dropout=0.0, activation='gelu_new'):
+        super().__init__()
+        
+        # Gated linear unit style
+        self.wi_0       = nn.Linear(embed_dim, ff_dim, bias=False)  # Gate projection
+        self.wi_1       = nn.Linear(embed_dim, ff_dim, bias=False)  # Up projection
+        self.wo         = nn.Linear(ff_dim, embed_dim, bias=False)  # Down projection
+        self.dropout    = nn.Dropout(dropout)
+        
+        if activation == 'gelu_new':
+            self.act = nn.GELU()
+        elif activation == 'relu':
+            self.act = nn.ReLU()
+        elif activation == 'silu':
+            self.act = nn.SiLU()
+        else:
+            self.act = nn.GELU()
+    
     def forward(self, x):
-        B, C, H, W = x.shape    # (B, C, H, W)
 
-        # vertical scan
-        v_in        = x.permute(0, 3, 2, 1).contiguous().view(B*W, H, C)    # (B*W, H, C)
-        v_out, _    = self.vgru(v_in)                                       # (B*W, H, 2h)
-        v_out       = v_out.view(B, W, H, -1).permute(0, 2, 1, 3)           # (B, H, W, 2h)
+        # Gated activation: act(gate) * up
+        hidden = self.act(self.wi_0(x)) * self.wi_1(x)
+        hidden = self.dropout(hidden)
+        output = self.wo(hidden)
+        return output
 
-        # horizontal scan
-        h_in        = v_out.contiguous().view(B*H, W, -1)                   # (B*H, W, 2h)
-        h_out, _    = self.hgru(h_in)                                       # (B*H, W, 2h)
-        h_out       = h_out.view(B, H, W, -1).permute(0, 3, 1, 2)           # (B, 2h, H, W)
 
-        return h_out
+#################
+#### Encoder ####
+#################
+
+
+class EncoderBlock(nn.Module):
+    """
+    Encoder block with pre-norm architecture
+    
+    Structure:
+    - LayerNorm -> Self-Attention -> Residual
+    - LayerNorm -> FeedForward -> Residual
+    """
+    
+    def __init__(self, embed_dim ,num_heads, ff_dim, dropout=0.0, attn_dropout=0.0, has_relative_bias=True):
+        super().__init__()
+        
+        self.self_attn = Attention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=attn_dropout,
+            is_decoder=False,
+            is_cross_attention=False,
+            has_relative_bias=has_relative_bias
+        )
+        
+        self.norm1      = LayerNorm(embed_dim)
+        self.ff         = FeedForward(embed_dim, ff_dim, dropout)
+        self.norm2      = LayerNorm(embed_dim)
+        self.dropout    = nn.Dropout(dropout)
+    
+    def forward(self, hidden_states, attention_mask=None, position_bias=None):
+        
+        # Pre-norm
+        normed = self.norm1(hidden_states)
+        
+        # Self-attention
+        attn_output, position_bias = self.self_attn(
+            normed,
+            attention_mask=attention_mask,
+            position_bias=position_bias
+        )
+        
+        hidden_states = hidden_states + self.dropout(attn_output)
+        
+        # Pre-norm
+        normed = self.norm2(hidden_states)
+        
+        # Feed forward
+        ff_output       = self.ff(normed)
+        hidden_states   = hidden_states + self.dropout(ff_output)
+        
+        return hidden_states, position_bias
+
+
+class Encoder(nn.Module):
+    """Encoder stack with shared relative position bias"""
+    
+    def __init__(self, num_layers, embed_dim, num_heads, ff_dim, dropout=0.0, attn_dropout=0.0):
+        super().__init__()
+        
+        # Only first layer computes relative position bias
+        self.layers = nn.ModuleList([
+            EncoderBlock(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                ff_dim=ff_dim,
+                dropout=dropout,
+                attn_dropout=attn_dropout,
+                has_relative_bias=(i == 0)
+            )
+            for i in range(num_layers)
+        ])
+        
+        self.final_norm = LayerNorm(embed_dim)
+        self.dropout    = nn.Dropout(dropout)
+    
+    def forward(self, hidden_states, attention_mask=None):
+
+        position_bias = None
+        
+        for layer in self.layers:
+            hidden_states, position_bias = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_bias=position_bias
+            )
+        
+        hidden_states = self.final_norm(hidden_states)
+        # (B, L, D)
+        hidden_states = self.dropout(hidden_states)
+        
+        return hidden_states
+
+
+#################
+#### Decoder ####
+#################
+
+
+class DecoderBlock(nn.Module):
+    """
+    Decoder block with pre-norm architecture
+    
+    Structure:
+    - LayerNorm -> Causal Self-Attention -> Residual
+    - LayerNorm -> Cross-Attention -> Residual
+    - LayerNorm -> FeedForward -> Residual
+    """
+    
+    def __init__(self, embed_dim, num_heads, ff_dim, dropout=0.0, attn_dropout=0.0, has_relative_bias=True):
+        super().__init__()
+        
+        # Self-attention
+        self.self_attn = Attention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=attn_dropout,
+            is_decoder=True,
+            is_cross_attention=False,
+            has_relative_bias=has_relative_bias
+        )
+        self.norm1 = LayerNorm(embed_dim)
+        
+        # Cross-attention to encoder
+        self.cross_attn = Attention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=attn_dropout,
+            is_decoder=True,
+            is_cross_attention=True,
+            # No relative bias for cross attention
+            has_relative_bias=False
+        )
+        self.norm2 = LayerNorm(embed_dim)
+        
+        # Feed-forward
+        self.ff     = FeedForward(embed_dim, ff_dim, dropout)
+        self.norm3  = LayerNorm(embed_dim)
+        
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, hidden_states, encoder_hidden_states, attention_mask=None, encoder_attention_mask=None, position_bias=None):
+        
+        # Self-attention
+        normed = self.norm1(hidden_states)
+        attn_output, position_bias = self.self_attn(
+            normed,
+            attention_mask=attention_mask,
+            position_bias=position_bias
+        )
+        hidden_states = hidden_states + self.dropout(attn_output)
+        
+        # Cross-attention
+        normed = self.norm2(hidden_states)
+        cross_output, _ = self.cross_attn(
+            normed,
+            key_value_states=encoder_hidden_states,
+            attention_mask=encoder_attention_mask
+        )
+        hidden_states = hidden_states + self.dropout(cross_output)
+        
+        # Feed-forward
+        normed = self.norm3(hidden_states)
+        ff_output = self.ff(normed)
+        hidden_states = hidden_states + self.dropout(ff_output)
+        
+        return hidden_states, position_bias
+
+
+class Decoder(nn.Module):
+    """Decoder stack with shared relative position bias"""
+    
+    def __init__(self, num_layers, embed_dim, num_heads, ff_dim, dropout=0.0, attn_dropout=0.0):
+        super().__init__()
+        
+        self.layers = nn.ModuleList([
+            DecoderBlock(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                ff_dim=ff_dim,
+                dropout=dropout,
+                attn_dropout=attn_dropout,
+                has_relative_bias=(i == 0)
+            )
+            for i in range(num_layers)
+        ])
+        
+        self.final_norm = LayerNorm(embed_dim)
+        self.dropout    = nn.Dropout(dropout)
+    
+    def forward(self, hidden_states, encoder_hidden_states, attention_mask=None, encoder_attention_mask=None):
+        """
+        Args:
+            hidden_states           : (B, L_dec, D) embedded decoder input
+            encoder_hidden_states   : (B, L_enc, D) encoder output
+            attention_mask          : (B, 1, L_dec, L_dec) causal + padding mask
+            encoder_attention_mask  : (B, 1, 1, L_enc) encoder padding mask
+        
+        Returns:
+            hidden_states           : (B, L_dec, D) decoded output
+        """
+        position_bias = None
+        
+        for layer in self.layers:
+            hidden_states, position_bias = layer(
+                hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                attention_mask=attention_mask,
+                encoder_attention_mask=encoder_attention_mask,
+                position_bias=position_bias
+            )
+        
+        hidden_states = self.final_norm(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+        
+        return hidden_states
+
+
+##########################
+#### Main Model Class ####
+##########################
 
 
 class IntraNet(nn.Module):
     """
-    VGG-16 -> BiLSTM -> Upsample -> Compress W dimension -> FC with BatchNorm
+    T5-style encoder-decoder transformer for sequence-to-sequence tasks
     
-    For DNA sequence data:
-    - H = number of tokens (sequence length)
-    - W = embedding dimension (e.g., 4 for one-hot DNA)
+    Architecture:
+    1. Shared token embedding (encoder and decoder)
+    2. T5 Encoder with relative position bias
+    3. T5 Decoder with causal self-attention and cross-attention
+    4. Output projection head (tied with embedding)
+    
+    Input: Integer token IDs
+    Output: Logits over vocabulary
     """
-
+    
     def __init__(
         self,
-        input_height:           int = None, # H = num_tokens
-        input_width:            int = 4,    # W = embedding_dim (e.g., 4 for DNA)
-        num_classes:            int = 2,
-        lstm_hidden:            int = 256,
-        dropout:                float = 0.5,
-        fc_hidden:              list = [256, 128, 64],  # FC layer sizes
-        compression_method:     str = 'adaptive_pool',  # 'adaptive_pool', 'avg_pool', 'max_pool', 'conv'
+        vocab_size                  = 4096,
+        embed_dim                   = 768,
+        num_encoder_layers          = 12,
+        num_decoder_layers          = 12,
+        num_heads                   = 12,
+        ff_dim                      = 768*4,
+        dropout                     = 0.1,
+        attn_dropout                = 0.0,
+        pad_token_id                = 0,
+        eos_token_id                = 1,
+        decoder_start_token_id      = 0
     ):
         super().__init__()
-        self.input_height = input_height
-        self.input_width = input_width
-        self.num_classes = num_classes
-        self.dropout_2d = nn.Dropout2d(dropout)
-
-        # VGG-16 encoder (deeper)
-        self.encoder = nn.Sequential(
-            self._vgg_block(1,   64,  2),       # H -> H/2
-            self._vgg_block(64,  128, 2),       # H/2 -> H/4
-            self._vgg_block(128, 256, 3),       # H/4 -> H/8
-            self._vgg_block(256, 512, 3),       # H/8 -> H/16
+        
+        # MLP ratio = 4
+        self.ff_dim                 = 4*embed_dim,
+        
+        self.vocab_size             = vocab_size
+        self.embed_dim              = embed_dim
+        self.pad_token_id           = pad_token_id
+        self.eos_token_id           = eos_token_id
+        self.decoder_start_token_id = decoder_start_token_id
+        
+        # Shared embedding for encoder and decoder
+        self.shared_embedding = nn.Embedding(vocab_size, embed_dim)
+        
+        # Embedding scale (T5 uses this)
+        self.embed_scale = embed_dim ** 0.5
+        
+        # Encoder
+        self.encoder = Encoder(
+            num_layers=num_encoder_layers,
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            ff_dim=ff_dim,
+            dropout=dropout,
+            attn_dropout=attn_dropout
         )
-
-        # ReSeg layers
-        self.renet1 = BiLSTM(512, lstm_hidden)                    
-        self.renet2 = BiLSTM(2*lstm_hidden, lstm_hidden)          
         
-        # Transposed convolution
-        self.upsample = nn.Sequential(
-            nn.ConvTranspose2d(2*lstm_hidden, 256, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(64, 64, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
+        # Decoder
+        self.decoder = Decoder(
+            num_layers=num_decoder_layers,
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            ff_dim=ff_dim,
+            dropout=dropout,
+            attn_dropout=attn_dropout
         )
+        
+        # Output projection (tied with embedding weights)
+        self.lm_head        = nn.Linear(embed_dim, vocab_size, bias=False)
+        self.lm_head.weight = self.shared_embedding.weight
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self):
 
-        # ===== COMPRESS W DIMENSION =====
-        if compression_method == 'adaptive_pool':
-            self.compress_w = nn.AdaptiveAvgPool2d((None, 1))  # (B, 64, H, W) -> (B, 64, H, 1)
-        elif compression_method == 'avg_pool':
-            self.compress_w = lambda x: torch.mean(x, dim=3, keepdim=True)
-        elif compression_method == 'max_pool':
-            self.compress_w = lambda x: torch.max(x, dim=3, keepdim=True)[0]
-        elif compression_method == 'conv':
-            # Learnable compression
-            self.compress_w = nn.Conv2d(64, 64, kernel_size=(1, input_width), padding=0)
-        else:
-            raise ValueError(f"Unknown compression method: {compression_method}")
-        
-        # FC CLASSIFIER with BatchNorm
-        # Input: (B, 64, H, 1) -> reshape to (B*H, 64)
-        fc_layers = []
-        prev_dim = 64  # number of channels after compression
-        
-        for hidden_dim in fc_hidden:
-            fc_layers.extend([
-                nn.Linear(prev_dim, hidden_dim),
-                nn.BatchNorm1d(hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Dropout(dropout)
-            ])
-            prev_dim = hidden_dim
-        
-        # Final output layer (per-token classification)
-        fc_layers.append(nn.Linear(prev_dim, num_classes))
-        
-        self.fc_classifier = nn.Sequential(*fc_layers)
-        
-    @staticmethod
-    def _vgg_block(c_in, c_out, n_convs):
-        layers = []
-        for i in range(n_convs):
-            layers += [
-                nn.Conv2d(c_in if i == 0 else c_out, c_out, kernel_size=3, padding=1, bias=True),
-                nn.ReLU(inplace=True),
-            ]
-        layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
-        return nn.Sequential(*layers)
-
-    def forward(self, x):
+        for module in self.modules():
+            
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+                    
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                
+            elif isinstance(module, LayerNorm):
+                nn.init.ones_(module.weight)
+    
+    def _create_encoder_attention_mask(self, input_ids):
         """
-        Args:
-            x: (B, 1, H, W) where H=num_tokens, W=embedding_dim
+        Create attention mask from input ids (mask padding tokens)
         
         Returns:
-            (B, num_classes, H) - per-token predictions
+            mask: (B, 1, 1, L) with -inf for padding positions
         """
-        
-        B, _, H, W = x.shape
-        
-        # VGG encoding (downsample H)
-        x = self.encoder(x)                 # (B, 512, H/16, W/16)
-        
-        # BiLSTM layers
-        x = self.renet1(x)                  # (B, 2*hidden, H/16, W/16)
-        x = self.dropout_2d(x)
-        x = self.renet2(x)                  # (B, 2*hidden, H/16, W/16)
-        x = self.dropout_2d(x)
-        
-        # Upsample back to ORIGINAL (H, W)
-        x = self.upsample(x)                # (B, 64, H, W) ← back to original size!
-        
-        # ===== COMPRESS W DIMENSION =====
-        # (B, 64, H, W) -> (B, 64, H, 1)
-        x = self.compress_w(x)              # (B, 64, H, 1)
-        
-        # Reshape for FC: (B, 64, H, 1) -> (B, H, 64)
-        x = x.squeeze(3)                    # (B, 64, H)
-        x = x.permute(0, 2, 1)              # (B, H, 64)
-        x = x.contiguous().view(-1, 64)     # (B*H, 64) - each token is a 64-dim vector
-        
-        # ===== FC CLASSIFIER =====
-        x = self.fc_classifier(x)           # (B*H, num_classes)
-        
-        # Reshape back: (B*H, num_classes) -> (B, H, num_classes)
-        x = x.view(B, H, self.num_classes)  # (B, H, num_classes)
-        x = x.permute(0, 2, 1)              # (B, num_classes, H)
-        
-        return x
-
+        mask = (input_ids == self.pad_token_id).float()
+        mask = mask[:, None, None, :]
+        mask = mask * torch.finfo(mask.dtype).min
+        return mask
     
-###################
-#### Trainning ####
-###################
-
-
-def downsample_single_label_sequence(label_seq, pool_sizes):
-    """CNN would downsaple the label"""
-    
-    labels = torch.tensor(label_seq, dtype=torch.long)
-    
-    # Apply pooling iteratively like the CNN does
-    for (ph, pw) in pool_sizes:
-        L = len(labels)
-        new_L = L // ph  # Floor division at each stage
-        # Take every ph-th element, truncate to new_L
-        labels = labels[::ph][:new_L]
-    
-    return labels.tolist()
-
-
-def collate_batch(batch):
-
-    sequences, labels, lengths = zip(*batch)
-    
-    # Pad sequences FIRST
-    padded_seqs = pad_sequence(sequences, batch_first=True, padding_value=0.0)
-    
-    # Get the padded length (what CNN will see)
-    padded_length = padded_seqs.shape[1]  # The L dimension
-    
-    # Calculate what length CNN will output
-    pool_sizes = [(2, 2), (2, 2), (2, 2)]
-    cnn_output_length = padded_length
-    for (ph, pw) in pool_sizes:
-        cnn_output_length = cnn_output_length // ph
-    
-    # Downsample ALL labels to this SAME length
-    downsampled_labels = []
-    for label_seq in labels:
-        # Pad or truncate each label sequence to cnn_output_length
-        labels_tensor = torch.tensor(label_seq, dtype=torch.long)
+    def _create_decoder_attention_mask(self, decoder_input_ids):
+        """
+        Create causal + padding mask for decoder
         
-        # Downsample this label sequence
-        ds_labels = downsample_single_label_sequence(label_seq, pool_sizes)
+        Returns:
+            mask: (B, 1, L, L) with -inf for masked positions
+        """
+        B, L = decoder_input_ids.shape
+        device = decoder_input_ids.device
         
-        # Truncate or pad to match cnn_output_length exactly
-        if len(ds_labels) > cnn_output_length:
-            ds_labels = ds_labels[:cnn_output_length]
-        elif len(ds_labels) < cnn_output_length:
-            # Pad with -100
-            ds_labels = ds_labels + [-100] * (cnn_output_length - len(ds_labels))
-        
-        downsampled_labels.append(torch.tensor(ds_labels, dtype=torch.long))
-    
-    # Stack (all same length now)
-    padded_labels = torch.stack(downsampled_labels)
-    
-    # Original lengths
-    lengths = torch.tensor(lengths, dtype=torch.long)
-    
-    return padded_seqs, padded_labels, lengths
-
-def prepare_dataloaders(dataset, batch_size, test_split, num_workers, seed):
-    
-    if not 0 <= test_split < 1:
-        raise ValueError("test_split must be within [0, 1).")
-
-    dataset_size = len(dataset)
-    if dataset_size == 0:
-        raise ValueError("Dataset is empty. Ensure corpus and labels are non-empty.")
-
-    test_size = int(math.floor(dataset_size * test_split))
-    train_size = dataset_size - test_size
-
-    if train_size == 0:
-        raise ValueError("test_split too large: no samples left for training.")
-
-    generator = torch.Generator().manual_seed(seed)
-    if test_size > 0:
-        train_dataset, test_dataset = random_split(
-            dataset,
-            [train_size, test_size],
-            generator=generator,
+        # Causal mask (upper triangular)
+        causal_mask = torch.triu(
+            torch.ones(L, L, device=device),
+            diagonal=1
         )
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            collate_fn=collate_batch,
+        causal_mask = causal_mask * torch.finfo(causal_mask.dtype).min
+        causal_mask = causal_mask[None, None, :, :]  # (1, 1, L, L)
+        
+        # Padding mask
+        padding_mask = (decoder_input_ids == self.pad_token_id).float()
+        padding_mask = padding_mask[:, None, None, :]  # (B, 1, 1, L)
+        padding_mask = padding_mask * torch.finfo(padding_mask.dtype).min
+        
+        # Combine: broadcast addition
+        combined_mask = causal_mask + padding_mask
+        
+        return combined_mask
+    
+    def get_input_embeddings(self):
+        return self.shared_embedding
+    
+    def set_input_embeddings(self, embeddings):
+        self.shared_embedding = embeddings
+        self.lm_head.weight = embeddings.weight
+    
+    def encode(self, input_ids, attention_mask=None):
+        """
+        Encode input sequence
+        
+        Args:
+            input_ids       : (B, L) input token ids
+            attention_mask  : (B, 1, 1, L) optional attention mask
+        
+        Returns:
+            encoder_output  : (B, L, D) encoded representations
+        """
+        # Embed inputs
+        hidden_states = self.shared_embedding(input_ids)
+        
+        # Create attention mask if not provided
+        if attention_mask is None:
+            attention_mask = self._create_encoder_attention_mask(input_ids)
+        
+        # Encode
+        encoder_output = self.encoder(hidden_states, attention_mask)
+        
+        return encoder_output
+    
+    def decode(self, decoder_input_ids, encoder_hidden_states, decoder_attention_mask=None, encoder_attention_mask=None):
+        """
+        Decode with encoder outputs
+        
+        Args:
+            decoder_input_ids       : (B, L_dec) decoder token ids
+            encoder_hidden_states   : (B, L_enc, D) encoder output
+            decoder_attention_mask  : (B, 1, L_dec, L_dec) causal mask
+            encoder_attention_mask  : (B, 1, 1, L_enc) encoder mask
+        
+        Returns:
+            decoder_output          : (B, L_dec, D) decoded representations
+        """
+        # Embed decoder inputs
+        hidden_states = self.shared_embedding(decoder_input_ids)
+        
+        # Create causal mask if not provided
+        if decoder_attention_mask is None:
+            decoder_attention_mask = self._create_decoder_attention_mask(decoder_input_ids)
+        
+        # Decode
+        decoder_output = self.decoder(
+            hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            attention_mask=decoder_attention_mask,
+            encoder_attention_mask=encoder_attention_mask
         )
-    else:
-        train_dataset = dataset
-        test_loader = None
+        
+        return decoder_output
+    
+    def forward(
+        self,
+        input_ids               : torch.Tensor,
+        decoder_input_ids       : torch.Tensor,
+        attention_mask          : Optional[torch.Tensor] = None,
+        decoder_attention_mask  : Optional[torch.Tensor] = None,
+        labels                  : Optional[torch.Tensor] = None
+    ) -> dict:
+        """
+        Forward pass through encoder-decoder
+        
+        Args:
+            input_ids               : (B, L_enc) encoder input token ids
+            decoder_input_ids       : (B, L_dec) decoder input token ids
+            attention_mask          : (B, 1, 1, L_enc) encoder attention mask
+            decoder_attention_mask  : (B, 1, L_dec, L_dec) decoder attention mask
+            labels                  : (B, L_dec) target token ids for loss computation
+        
+        Returns:
+            dict with:
+                logits  : (B, L_dec, vocab_size) output logits
+                loss    : scalar loss (if labels provided)
+        """
+        # Create encoder attention mask
+        if attention_mask is None:
+            attention_mask = self._create_encoder_attention_mask(input_ids)
+        
+        # Encode
+        encoder_hidden_states = self.encode(input_ids, attention_mask)
+        
+        # Decode
+        decoder_hidden_states = self.decode(
+            decoder_input_ids,
+            encoder_hidden_states,
+            decoder_attention_mask,
+            attention_mask
+        )
+        
+        # Project to vocabulary
+        logits = self.lm_head(decoder_hidden_states)
+        
+        # Compute loss if labels provided
+        loss = None
+        if labels is not None:
+            loss_fn = nn.CrossEntropyLoss(ignore_index=self.pad_token_id)
+            loss = loss_fn(
+                logits.view(-1, self.vocab_size),
+                labels.view(-1)
+            )
+        
+        return {
+            'logits': logits,
+            'loss': loss,
+            'encoder_hidden_states': encoder_hidden_states
+        }
+    
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids       : torch.Tensor,
+        max_length      : int = 128,
+        temperature     : float = 1.0,
+        top_k           : Optional[int] = None,
+        top_p           : Optional[float] = None,
+        do_sample       : bool = False
+    ) -> torch.Tensor:
+        """
+        Autoregressive generation
+        
+        Args:
+            input_ids   : (B, L_enc) encoder input token ids
+            max_length  : maximum generation length
+            temperature : sampling temperature
+            top_k       : top-k sampling
+            top_p       : nucleus sampling threshold
+            do_sample   : whether to sample or use greedy decoding
+        
+        Returns:
+            generated   : (B, L_gen) generated token ids
+        """
+        B = input_ids.shape[0]
+        device = input_ids.device
+        
+        # Encode input
+        encoder_attention_mask = self._create_encoder_attention_mask(input_ids)
+        encoder_hidden_states = self.encode(input_ids, encoder_attention_mask)
+        
+        # Initialize decoder with start token
+        decoder_input_ids = torch.full(
+            (B, 1), 
+            self.decoder_start_token_id, 
+            dtype=torch.long, 
+            device=device
+        )
+        
+        # Generate tokens autoregressively
+        for _ in range(max_length - 1):
+            # Decode
+            decoder_output = self.decode(
+                decoder_input_ids,
+                encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask
+            )
+            
+            # Get logits for last position
+            logits = self.lm_head(decoder_output[:, -1:, :])  # (B, 1, vocab_size)
+            logits = logits[:, 0, :]  # (B, vocab_size)
+            
+            # Apply temperature
+            if temperature != 1.0:
+                logits = logits / temperature
+            
+            # Sample or greedy
+            if do_sample:
+                # Top-k filtering
+                if top_k is not None:
+                    indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+                    logits[indices_to_remove] = float('-inf')
+                
+                # Top-p (nucleus) filtering
+                if top_p is not None:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    
+                    indices_to_remove = sorted_indices_to_remove.scatter(
+                        1, sorted_indices, sorted_indices_to_remove
+                    )
+                    logits[indices_to_remove] = float('-inf')
+                
+                probs = F.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = logits.argmax(dim=-1, keepdim=True)
+            
+            # Append to sequence
+            decoder_input_ids = torch.cat([decoder_input_ids, next_token], dim=1)
+            
+            # Stop if all sequences have EOS
+            if (next_token == self.eos_token_id).all():
+                break
+        
+        return decoder_input_ids
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        collate_fn=collate_batch,
+
+##################
+#### Variants ####
+##################
+
+
+def intranet_t5_small(vocab_size: int = 32000, max_seq_length: int = 4096):
+    """T5-Small configuration (~60M params)"""
+    return IntraNet(
+        vocab_size=vocab_size,
+        max_seq_length=max_seq_length,
+        embed_dim=512,
+        num_encoder_layers=6,
+        num_decoder_layers=6,
+        num_heads=8,
+        ff_dim=2048,
+        dropout=0.1
     )
 
-    return train_loader, test_loader
 
-def evaluate(model, dataloader, device, loss_fn):
-    if dataloader is None:
-        return float("nan"), float("nan")
+def intranet_t5_base(vocab_size: int = 32000, max_seq_length: int = 4096):
+    """T5-Base configuration (~220M params)"""
+    return IntraNet(
+        vocab_size=vocab_size,
+        max_seq_length=max_seq_length,
+        embed_dim=768,
+        num_encoder_layers=12,
+        num_decoder_layers=12,
+        num_heads=12,
+        ff_dim=3072,
+        dropout=0.1
+    )
 
-    model.eval()
-    total_loss = 0.0
-    total_tokens = 0
-    total_correct = 0
 
-    with torch.no_grad():
-        for inputs, targets, lengths in dataloader:
-            inputs  = inputs.to(device)
-            targets = targets.to(device)
-            lengths = lengths.to(device)
+def intranet_t5_large(vocab_size: int = 32000, max_seq_length: int = 4096):
+    """T5-Large configuration (~770M params)"""
+    return IntraNet(
+        vocab_size=vocab_size,
+        max_seq_length=max_seq_length,
+        embed_dim=1024,
+        num_encoder_layers=24,
+        num_decoder_layers=24,
+        num_heads=16,
+        ff_dim=4096,
+        dropout=0.1
+    )
 
-            logits  = model(inputs, lengths)                       # (B, L', C)
-            loss    = loss_fn(logits.permute(0, 2, 1), targets)    # (B, C, L')
 
-            # Mask padding for accuracy
-            pred = torch.argmax(logits, dim=2)                     # (B, L')
-            mask = (targets != -100)
-            correct = (pred.eq(targets) & mask).sum().item()
-            tokens  = mask.sum().item()
+def intranet_t5_xl(vocab_size: int = 32000, max_seq_length: int = 4096):
+    """T5-XL configuration (~3B params)"""
+    return IntraNet(
+        vocab_size=vocab_size,
+        max_seq_length=max_seq_length,
+        embed_dim=2048,
+        num_encoder_layers=24,
+        num_decoder_layers=24,
+        num_heads=32,
+        ff_dim=5120,
+        dropout=0.1
+    )
 
-            total_loss   += loss.item() * tokens
-            total_correct += correct
-            total_tokens  += tokens
 
-    avg_loss = total_loss / total_tokens if total_tokens else float("nan")
-    accuracy = total_correct / total_tokens if total_tokens else float("nan")
-    return avg_loss, accuracy
+##################
+#### Auxiliary ####
+##################
+
+
+def count_parameters(model: nn.Module) -> int:
+    """Count trainable parameters"""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def test_model():
+    """Test the model with random input"""
+    print("=" * 60)
+    print("Testing IntraNet T5")
+    print("=" * 60)
+    
+    model = intranet_t5_base(vocab_size=32000, max_seq_length=4096)
+    print(f"\nModel parameters: {count_parameters(model):,}")
+    
+    # Test forward pass
+    input_ids = torch.randint(0, 32000, (2, 128))
+    decoder_input_ids = torch.randint(0, 32000, (2, 64))
+    labels = torch.randint(0, 32000, (2, 64))
+    
+    print(f"\nInput shape: {input_ids.shape}")
+    print(f"Decoder input shape: {decoder_input_ids.shape}")
+    
+    output = model(input_ids, decoder_input_ids, labels=labels)
+    print(f"Output logits shape: {output['logits'].shape}")
+    print(f"Loss: {output['loss'].item():.4f}")
+    
+    # Test generation
+    print("\nTesting generation...")
+    generated = model.generate(input_ids, max_length=32)
+    print(f"Generated shape: {generated.shape}")
+    
+    # Test different model sizes
+    print("\n" + "=" * 60)
+    print("Model Size Comparison")
+    print("=" * 60)
+    
+    for name, model_fn in [
+        ("T5-Small", intranet_t5_small),
+        ("T5-Base", intranet_t5_base),
+        ("T5-Large", intranet_t5_large),
+    ]:
+        model = model_fn()
+        params = count_parameters(model)
+        print(f"{name}: {params:,} parameters ({params/1e6:.1f}M)")
+    
+    print("\nAll tests passed!")
+    return model
+
+
+if __name__ == "__main__":
+    test_model()
