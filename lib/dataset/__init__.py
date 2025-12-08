@@ -10,7 +10,7 @@ from ._parser import (
     WormBaseDataset
 )
 
-from ._tokenisation import (
+from ._tokenizer import (
     DEFAULT_FEATURE_LABELS,
     apkmer,
     KmerTokenizer

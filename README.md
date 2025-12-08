@@ -1,70 +1,36 @@
-### T5-based Encoder and Decoder Model for Gene Prediction
+### End-to-end gene prediction with pure deep learning structure
 
-Haven't update the new README yet. Cuz still working on finishing structure, pre-training, fine-tuning, and testing results so far.     
-Will be update soon.    
+The idea of this project is using deep learning approach to replace traditional Hidden Markov-model for gene prediction.    
+In short human language, for example, the goal is replacing Augustus with cutting-edge deep learning model.     
 
+There are certain pros for considering such action:     
 
+1. Transformer have attention mechanism that reasonablily better than markov process.   
+   (no longer solely depend on previous state)     
+2. With certain deep learning mechanism, such as: pre-train, fine-tune, MoE.    
+   The model no longer need to self-trained again for achieve higher accuary as normal HMM.   
 
-### Tokenize dataset to corpus  
-
-First step of training is converting all the DNA sequences we have through a kmer sliding window algorithm.     
-It's amazing design that uses a kmer length way of tokenizing DNA sequences instead of one hot string.     
-Based on two datasets, there are two tokenizer programs.   
-
-First one: [`data2token.py`](/bin/data2token.py) is built for small gene set     
-
-```zsh
-python3 bin/data2token.py dataset/smg data/corpus/c_smg.txt data/label/l_smg.txt -io
-```
-
-Second one: [`data2token2.py`](/bin/data2token2.py) is built for a more generic purpose.
-
-```zsh
-python3 bin/data2token2.py dataset/whole_celegan/ce_exintron.gff3 dataset/whole_celegan/caenorhabditis_elegans.PRJNA13758.WBPS19.genomic.fa data/corpus/whole_celegan.tx
-t data/label/whole_celegan.txt 
-```
-
-The part of sequence that being tokenized for embedding is transripts, which is 5'UTR/exon/intron/3'UTR or reversed genes.  
-Introns and proteins are not considered. Since they are also a combinatoric parts of transcripts.   
+Cons:
+1. It's computational hard for running such program. Def need more memory space and time complexity.    
+   Both require extremely nice engineering capability to handle them.     
+2. It's extremely hard to develop and design such program. That's why no biologists did it so far.  
 
 
 ---
 
 
-### Embed corpus with GloVe
+### Encoder (BERT)
 
-Second step of the training is dumping all tokenized DNA into a Euclidean Space through official GloVe, an unsupervised learning embedding model.     
-As a statistical way of linear projection. Still considering using a another way to substitude that.    
+The current stage of planning is not pre-trainning everything from stracth rather accepte a open-source model from hugging face.        
+The choice is DNABert-v2, a pre-trained model that published weights on hugging face.   
+That model is already trained for capture local pattern, motif through trainning.   
+So, it would be the backbone of encoder block.  
+For the first step of design such program is that we need a encoder-decoder transformer model that fine-tuned to *Ab Initio Prediction*.  
 
-```zsh
-python3 bin/tglove.py data/corpus/whole_celegan.txt data/glove_trained/vector_wce2 glove/build
-```
-
-As embedding dimension is some parameter that would decide directly about the weights of input data.    
-For using the whole genome of C elegans, it seem like using embeeding dimension 256 instead 100 would results in better trainning loss.     
-
-| Dimension                 | Epoch                 | Loss     |
-|---------------------------|-----------------------|----------|
-| 100                       | 15                    | 0.105146 |
-| 256 (only transcripts)    | 150                   | 0.065872 |
-| 256 (inlucde aa/intron)   | 150                   | 0.134592 |
+*Ab Initio Prediction* is the most basic functionality for such gene finder program. It's require able to generate prediction in form of GFF/GTF in terms of given DNA input sequences.   
+Therefore, theoretically, for achieving this, there have to be a decoder part for generating (to transfer what have already learned) the ideal outputs.  
 
 
-
----
-
-
-### Pretrainning on the Encoder Section (BERT)
-
-To teach the nn for gene finder purpose. Instread of directly random weights. We need to pre-trained the transformer encoder for learning the rules of intron/exon.     
-
-There are two types of pre-trainning tasks:
-
-    1 Masked Language Model (MLM)   
-    2 Next Sentence Prediction (NSP)    
-  
-Masked Language Model: Instead randomly masked the kmer token, applying masked token to the splicing donor and accetpor sites for model to learning the motif.  
-Next Sentence Prediction: We could cutting off exon and intron, letting the model to learn the rule of exon and intron connection.      
 
 ---
 
@@ -74,12 +40,15 @@ Next Sentence Prediction: We could cutting off exon and intron, letting the mode
 The last step is trainning the neural network using given dataset.  
 All the nn is build up by stacking pytorch. So using pytroch package is necessary.  
 
-This is how you can download all package for Apple Silicon
+This is how you can download all package for Apple Silicon.     
+
 ```zsh
 conda create -n nameyouwannaput
 conda install pytorch torchvision torchaudio -c pytorch -c conda-forge
 ```
 
-This is the formal cmd for trainning. There would be an abstract evaluation afterwards.
+Beside, you also need hugging face transformer package to load the pre-trained model for encoder.   
+
 ```zsh
-python3 
+conda install -c conda-forge transformers
+```     
