@@ -4,88 +4,6 @@ import torch.nn.functional as F
 import math
 
 
-################################
-#### Relative Position Bias ####
-################################
-
-
-class RelativePositionBias(nn.Module):
-    
-    def __init__(self, num_heads , num_buckets=32, max_distance=128, bidirectional=True):
-        super().__init__()
-        
-        self.num_heads      = num_heads
-        self.num_buckets    = num_buckets
-        self.max_distance   = max_distance
-        # Encoder is bidirectional
-        self.bidirectional  = bidirectional
-        
-        self.relative_attention_bias = nn.Embedding(num_buckets, num_heads)
-    
-    """
-        Compute bucket indices for relative positions
-        
-        T5 uses a mix of:
-            - Exact positions for small distances
-            - Log-spaced bins for larger distances
-    """
-    @staticmethod
-    def _relative_position_bucket(relative_position, num_buckets, max_distance, bidirectional=True):
-
-        relative_buckets = 0
-        
-        if bidirectional:
-            num_buckets     //= 2
-            relative_buckets += (relative_position > 0).to(torch.long) * num_buckets
-            relative_position = torch.abs(relative_position)
-        else:
-            relative_position = -torch.min(
-                relative_position, 
-                torch.zeros_like(relative_position)
-            )
-        
-        # Half buckets for exact positions
-        max_exact = num_buckets // 2
-        is_small = relative_position < max_exact
-        
-        # Half buckets for log-spaced bins
-        relative_position_if_large = max_exact + (
-            torch.log(relative_position.float() / max_exact)
-            / math.log(max_distance / max_exact)
-            * (num_buckets - max_exact)
-        ).to(torch.long)
-        
-        relative_position_if_large = torch.min(
-            relative_position_if_large,
-            torch.full_like(relative_position_if_large, num_buckets - 1)
-        )
-        
-        relative_buckets += torch.where(
-            is_small, relative_position, relative_position_if_large
-        )
-        
-        return relative_buckets
-    
-    def forward(self, query_length, key_length, device):
-
-        context_position    = torch.arange(query_length, dtype=torch.long, device=device)[:, None]
-        memory_position     = torch.arange(key_length, dtype=torch.long, device=device)[None, :]
-        relative_position   = memory_position - context_position
-        
-        relative_position_bucket = self._relative_position_bucket(
-            relative_position,
-            bidirectional=self.bidirectional,
-            num_buckets=self.num_buckets,
-            max_distance=self.max_distance
-        )
-        
-        values = self.relative_attention_bias(relative_position_bucket)
-        # (1, num_heads, query_len, key_len)
-        values = values.permute([2, 0, 1]).unsqueeze(0)
-        
-        return values
-
-
 ####################
 #### Layer Norm ####
 ####################
@@ -112,14 +30,7 @@ class LayerNorm(nn.Module):
 
 
 class Attention(nn.Module):
-    """
-    T5-style multi-head attention with relative position bias
-    
-    Key differences from standard attention:
-        - No bias in linear projections
-        - Relative position bias instead of absolute positional encoding
-        - Supports both self-attention and cross-attention
-    """
+    """ Class for Generalized Attention """
     
     def __init__(
         self,
@@ -129,11 +40,13 @@ class Attention(nn.Module):
         is_decoder          : bool = False,
         is_cross_attention  : bool = False,
         has_relative_bias   : bool = True,
+        use_alibi           : bool = False,
         use_flash           : bool = True
     ):
         super().__init__()
         
         assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+        assert not (has_relative_bias and use_alibi), "Cannot use both relative bias and ALiBi"
         
         self.embed_dim          = embed_dim
         self.num_heads          = num_heads
@@ -141,6 +54,7 @@ class Attention(nn.Module):
         self.is_decoder         = is_decoder
         self.is_cross_attention = is_cross_attention
         self.has_relative_bias  = has_relative_bias
+        self.use_alibi          = use_alibi
         self.use_flash          = use_flash
         
         # No Bias in Attention Projection
@@ -151,15 +65,19 @@ class Attention(nn.Module):
         
         self.dropout = nn.Dropout(dropout)
         
-        # Relative position bias (only for self-attention)
-        if has_relative_bias and not is_cross_attention:
-            self.relative_bias = RelativePositionBias(
-                num_heads=num_heads,
-                # Encoder is bidirectional
-                bidirectional=not is_decoder
-            )
+        # Position bias
+        if not is_cross_attention:
+            if use_alibi:
+                self.position_bias_module = ALiBi(num_heads=num_heads)
+            elif has_relative_bias:
+                self.position_bias_module = RelativePositionBias(
+                    num_heads=num_heads,
+                    bidirectional=not is_decoder
+                )
+            else:
+                self.position_bias_module = None
         else:
-            self.relative_bias = None
+            self.position_bias_module = None
     
     def forward(self, hidden_states, key_value_states=None, attention_mask=None, position_bias=None):
         """
@@ -195,9 +113,9 @@ class Attention(nn.Module):
         k = k.view(B, L_kv, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, L_kv, self.num_heads, self.head_dim).transpose(1, 2)
         
-        # Compute relative position bias if needed
-        if self.relative_bias is not None and position_bias is None:
-            position_bias = self.relative_bias(L, L_kv, hidden_states.device)
+        # Compute position bias
+        if self.position_bias_module is not None and position_bias is None:
+            position_bias = self.position_bias_module(L, L_kv, hidden_states.device)
         
         # Use Flash Attention if available
         use_flash_attn = (
@@ -247,19 +165,9 @@ class BigBirdSparseAttention(nn.Module):
     BigBird sparse attention mechanism for encoder (bidirectional)
     
     Combines three attention patterns:
-    1. Global tokens: First/last blocks attend to all and are attended by all
-    2. Window attention: Each token attends to local neighborhood
-    3. Random attention: Each token attends to random set of blocks
-    
-    This reduces complexity from O(n²) to O(n) while maintaining expressiveness.
-    
-    Args:
-        embed_dim       : Embedding dimension
-        num_heads       : Number of attention heads
-        block_size      : Size of attention blocks (sequence must be divisible by this)
-        num_rand_blocks : Number of random blocks to attend to
-        dropout         : Dropout probability
-        use_flash       : Use flash attention when possible (limited support for sparse)
+        1. Global tokens    : First/last blocks attend to all and are attended by all
+        2. Window attention : Each token attends to local neighborhood
+        3. Random attention : Each token attends to random set of blocks
     """
     
     def __init__(
@@ -269,6 +177,7 @@ class BigBirdSparseAttention(nn.Module):
         block_size          : int = 64,
         num_rand_blocks     : int = 3,
         dropout             : float = 0.0,
+        use_alibi           : bool = False,
         use_flash           : bool = False
     ):
         super().__init__()
@@ -280,15 +189,16 @@ class BigBirdSparseAttention(nn.Module):
         self.head_dim           = embed_dim // num_heads
         self.block_size         = block_size
         self.num_rand_blocks    = num_rand_blocks
+        self.use_alibi          = use_alibi
         self.use_flash          = use_flash
         
-        # Attention uses 3 blocks for window (1 left, self, 1 right for each block)
+        # Attention uses 3 blocks
         self.window_size = 3
         
-        # Global blocks (first and last)
+        # Global blocks
         self.num_global_blocks = 2
         
-        # Projections (no bias like T5)
+        # Projections
         self.q = nn.Linear(embed_dim, embed_dim, bias=False)
         self.k = nn.Linear(embed_dim, embed_dim, bias=False)
         self.v = nn.Linear(embed_dim, embed_dim, bias=False)
@@ -296,20 +206,22 @@ class BigBirdSparseAttention(nn.Module):
         
         self.dropout = nn.Dropout(dropout)
         
-        # Initialize random seed for reproducible random attention
+        # ALiBi position bias
+        if use_alibi:
+            self.alibi = ALiBi(num_heads=num_heads)
+        else:
+            self.alibi = None
+        
+        # Initialize random seed
         self._seed = None
     
     def _get_random_block_indices(self, num_blocks, device):
-        """
-        Generate random block indices for each non-global block.
+        """ Generate random block indices for each non-global block """
         
-        Returns:
-            rand_attn: (num_blocks-2, num_rand_blocks) random block indices
-        """
-        # Exclude global blocks (first and last)
+        # Exclude global blocks
         num_non_global = num_blocks - self.num_global_blocks
         
-        # For each non-global block, sample random blocks to attend to
+        # Each non-global block sample random blocks
         rand_indices = []
         for i in range(num_non_global):
             # Can attend to any block except itself (block i+1 in full sequence)
@@ -323,35 +235,28 @@ class BigBirdSparseAttention(nn.Module):
             if self._seed is not None:
                 torch.manual_seed(self._seed + i)
             
-            sampled = torch.randperm(len(available), device=device)[:self.num_rand_blocks]
-            sampled_blocks = torch.tensor([available[idx] for idx in sampled], device=device)
+            sampled         = torch.randperm(len(available), device=device)[:self.num_rand_blocks]
+            sampled_blocks  = torch.tensor([available[idx] for idx in sampled], device=device)
             rand_indices.append(sampled_blocks)
         
-        return torch.stack(rand_indices)  # (num_non_global, num_rand_blocks)
+        return torch.stack(rand_indices)
     
     def _create_sparse_attention_mask(self, seq_len, device):
-        """
-        Create BigBird sparse attention mask.
+        """ Create BigBird sparse attention mask """
         
-        Returns:
-            mask: (seq_len, seq_len) boolean mask where True means attend
-        """
         num_blocks = seq_len // self.block_size
         
         # Initialize mask as all False (no attention)
         mask = torch.zeros(seq_len, seq_len, dtype=torch.bool, device=device)
         
-        # 1. Global attention: First and last blocks
-        # First block attends to all and is attended by all
-        mask[:self.block_size, :] = True
-        mask[:, :self.block_size] = True
+        # Global attention
+        mask[:self.block_size, :]   = True
+        mask[:, :self.block_size]   = True
+        mask[-self.block_size:, :]  = True
+        mask[:, -self.block_size:]  = True
         
-        # Last block attends to all and is attended by all
-        mask[-self.block_size:, :] = True
-        mask[:, -self.block_size:] = True
-        
-        # 2. Window attention: Each block attends to itself and neighbors
-        for block_idx in range(1, num_blocks - 1):  # Exclude global blocks
+        # Window attention
+        for block_idx in range(1, num_blocks - 1):
             start_pos = block_idx * self.block_size
             end_pos = start_pos + self.block_size
             
@@ -370,12 +275,12 @@ class BigBirdSparseAttention(nn.Module):
                 next_end = next_start + self.block_size
                 mask[start_pos:end_pos, next_start:next_end] = True
         
-        # 3. Random attention: Each non-global block attends to random blocks
+        # Random attention
         rand_block_indices = self._get_random_block_indices(num_blocks, device)
         
         for local_idx, block_idx in enumerate(range(1, num_blocks - 1)):
-            start_pos = block_idx * self.block_size
-            end_pos = start_pos + self.block_size
+            start_pos   = block_idx * self.block_size
+            end_pos     = start_pos + self.block_size
             
             # Get random blocks for this block
             random_blocks = rand_block_indices[local_idx]
@@ -388,19 +293,10 @@ class BigBirdSparseAttention(nn.Module):
         return mask
     
     def forward(self, hidden_states, attention_mask=None, position_bias=None):
-        """
-        Args:
-            hidden_states   : (B, L, D) query states
-            attention_mask  : (B, 1, L, L) additive mask for padding
-            position_bias   : precomputed position bias (optional)
-        
-        Returns:
-            output          : (B, L, D)
-            position_bias   : for compatibility (always None for sparse)
-        """
+
         B, L, D = hidden_states.shape
         
-        # Verify sequence length is divisible by block_size
+        # Verify sequence length
         if L % self.block_size != 0:
             raise ValueError(
                 f"Sequence length ({L}) must be divisible by block_size ({self.block_size})"
@@ -416,23 +312,27 @@ class BigBirdSparseAttention(nn.Module):
         k = k.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         
-        # Create sparse attention mask
+        # Masking
         sparse_mask = self._create_sparse_attention_mask(L, hidden_states.device)
-        
-        # Expand for batch and heads: (L, L) -> (B, num_heads, L, L)
         sparse_mask = sparse_mask.unsqueeze(0).unsqueeze(0).expand(B, self.num_heads, -1, -1)
         
         # Compute attention scores
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         
-        # Apply sparse mask (set non-attended positions to -inf)
+        # Apply sparse mask
         scores = scores.masked_fill(~sparse_mask, float('-inf'))
         
-        # Apply position bias if provided
+        # Apply ALiBi bias
+        if self.alibi is not None:
+            alibi_bias = self.alibi(L, L, hidden_states.device)
+            # Apply only to non-masked positions
+            scores = scores + alibi_bias.masked_fill(~sparse_mask, 0.0)
+        
+        # Apply position bias
         if position_bias is not None:
             scores = scores + position_bias
         
-        # Apply padding mask if provided
+        # Apply padding mask
         if attention_mask is not None:
             scores = scores + attention_mask
         
@@ -447,7 +347,8 @@ class BigBirdSparseAttention(nn.Module):
         out = out.transpose(1, 2).reshape(B, L, D)
         out = self.o(out)
         
-        return out, None  # Return None for position_bias for compatibility
+        # None for position bias
+        return out, None
 
 
 ######################
@@ -456,7 +357,7 @@ class BigBirdSparseAttention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    """Gated MLP based on GeGLU"""
+    """ Gated MLP based on GeGLU """
     
     def __init__(self, embed_dim, ff_dim, dropout=0.0, activation='gelu_new'):
         super().__init__()
@@ -617,6 +518,166 @@ class MoEFeedForward(nn.Module):
         return self.load_balance * loss
 
 
+################################
+#### Relative Position Bias ####
+################################
+
+
+class RelativePositionBias(nn.Module):
+    """
+        Compute bucket indices for relative positions
+        
+        T5 uses a mix of:
+            - Exact positions for small distances
+            - Log-spaced bins for larger distances
+    """
+    
+    def __init__(self, num_heads , num_buckets=32, max_distance=128, bidirectional=True):
+        super().__init__()
+        
+        self.num_heads      = num_heads
+        self.num_buckets    = num_buckets
+        self.max_distance   = max_distance
+        # Encoder is bidirectional
+        self.bidirectional  = bidirectional
+        
+        self.relative_attention_bias = nn.Embedding(num_buckets, num_heads)
+    
+    @staticmethod
+    def _relative_position_bucket(relative_position, num_buckets, max_distance, bidirectional=True):
+
+        relative_buckets = 0
+        
+        if bidirectional:
+            num_buckets     //= 2
+            relative_buckets += (relative_position > 0).to(torch.long) * num_buckets
+            relative_position = torch.abs(relative_position)
+        else:
+            relative_position = -torch.min(
+                relative_position, 
+                torch.zeros_like(relative_position)
+            )
+        
+        # Half buckets for exact positions
+        max_exact   = num_buckets // 2
+        is_small    = relative_position < max_exact
+        
+        # Half buckets for log-spaced bins
+        relative_position_if_large = max_exact + (
+            torch.log(relative_position.float() / max_exact)
+            / math.log(max_distance / max_exact)
+            * (num_buckets - max_exact)
+        ).to(torch.long)
+        
+        relative_position_if_large = torch.min(
+            relative_position_if_large,
+            torch.full_like(relative_position_if_large, num_buckets - 1)
+        )
+        
+        relative_buckets += torch.where(
+            is_small, relative_position, relative_position_if_large
+        )
+        
+        return relative_buckets
+    
+    def forward(self, query_length, key_length, device):
+
+        context_position    = torch.arange(query_length, dtype=torch.long, device=device)[:, None]
+        memory_position     = torch.arange(key_length, dtype=torch.long, device=device)[None, :]
+        relative_position   = memory_position - context_position
+        
+        relative_position_bucket = self._relative_position_bucket(
+            relative_position,
+            bidirectional=self.bidirectional,
+            num_buckets=self.num_buckets,
+            max_distance=self.max_distance
+        )
+        
+        values = self.relative_attention_bias(relative_position_bucket)
+        # (1, num_heads, query_len, key_len)
+        values = values.permute([2, 0, 1]).unsqueeze(0)
+        
+        return values
+
+
+###############
+#### ALiBi ####
+###############
+
+
+class ALiBi(nn.Module):
+    """
+    Attention with Linear Biases
+    
+    Reference: "Train Short, Test Long" (Press et al., 2021)
+    """
+    
+    def __init__(self, num_heads, max_seq_len=8192):
+        super().__init__()
+        
+        self.num_heads      = num_heads
+        self.max_seq_len    = max_seq_len
+        
+        # Compute slopes for each head (geometric sequence)
+        slopes = self._get_slopes(num_heads)
+        self.register_buffer('slopes', slopes)
+        
+        # Precompute bias for max_seq_len
+        alibi_bias = self._build_alibi_bias(max_seq_len, slopes)
+        self.register_buffer('alibi_bias', alibi_bias)
+    
+    @staticmethod
+    def _get_slopes(num_heads):
+
+        def get_slopes_power_of_2(n):
+            start = 2 ** (-2 ** -(math.log2(n) - 3))
+            ratio = start
+            return torch.tensor([start * (ratio ** i) for i in range(n)])
+        
+        # Handle non-power-of-2 num_heads
+        if math.log2(num_heads).is_integer():
+            return get_slopes_power_of_2(num_heads)
+        else:
+            # Closest power of 2
+            closest_power_of_2 = 2 ** math.floor(math.log2(num_heads))
+            slopes = torch.cat([
+                get_slopes_power_of_2(closest_power_of_2),
+                get_slopes_power_of_2(2 * closest_power_of_2)[0::2][:num_heads - closest_power_of_2]
+            ])
+            return slopes
+    
+    @staticmethod
+    def _build_alibi_bias(seq_len, slopes):
+        """ Build ALiBi bias matrix: -m * |i - j| """
+        
+        # Distance matrix |i - j|
+        context_position    = torch.arange(seq_len)[:, None]
+        memory_position     = torch.arange(seq_len)[None, :]
+        relative_position   = torch.abs(memory_position - context_position)  # (seq_len, seq_len)
+        
+        # Apply head-specific slopes: -m * |i - j|
+        slopes              = slopes[:, None, None]
+        relative_position   = relative_position[None, :, :].float()
+        
+        alibi_bias = -slopes * relative_position    # (num_heads, seq_len, seq_len)
+        alibi_bias = alibi_bias.unsqueeze(0)        # (1, num_heads, seq_len, seq_len)
+        
+        return alibi_bias
+    
+    def forward(self, query_length, key_length, device):
+
+        # Use cached bias if within max_seq_len
+        if query_length <= self.max_seq_len and key_length <= self.max_seq_len:
+            bias = self.alibi_bias[:, :, :query_length, :key_length].to(device)
+        else:
+            # Recompute for longer sequences
+            slopes = self.slopes.to(device)
+            bias = self._build_alibi_bias(max(query_length, key_length), slopes)
+            bias = bias[:, :, :query_length, :key_length].to(device)
+        
+        return bias
+
+
 #################
 #### Encoder ####
 #################
@@ -639,6 +700,7 @@ class EncoderBlock(nn.Module):
         dropout=0.0, 
         attn_dropout=0.0, 
         has_relative_bias=True,
+        use_alibi=False,
         use_bigbird_sparse=False,
         block_size=64,
         num_rand_blocks=3
@@ -654,7 +716,8 @@ class EncoderBlock(nn.Module):
                 num_heads=num_heads,
                 block_size=block_size,
                 num_rand_blocks=num_rand_blocks,
-                dropout=attn_dropout
+                dropout=attn_dropout,
+                use_alibi=use_alibi
             )
         else:
             self.self_attn = Attention(
@@ -663,7 +726,8 @@ class EncoderBlock(nn.Module):
                 dropout=attn_dropout,
                 is_decoder=False,
                 is_cross_attention=False,
-                has_relative_bias=has_relative_bias
+                has_relative_bias=has_relative_bias and not use_alibi,
+                use_alibi=use_alibi
             )
         
         self.norm1      = LayerNorm(embed_dim)
@@ -706,6 +770,7 @@ class Encoder(nn.Module):
         ff_dim, 
         dropout=0.0, 
         attn_dropout=0.0,
+        use_alibi=False,
         use_bigbird_sparse=False,
         block_size=64,
         num_rand_blocks=3
@@ -713,8 +778,10 @@ class Encoder(nn.Module):
         super().__init__()
         
         self.use_bigbird_sparse = use_bigbird_sparse
+        self.use_alibi = use_alibi
         
-        # Only first layer computes relative position bias (not used with BigBird)
+        # Only first layer computes position bias (not used with BigBird or ALiBi)
+        # ALiBi is computed every layer (it's cheap - just a static bias)
         self.layers = nn.ModuleList([
             EncoderBlock(
                 embed_dim=embed_dim,
@@ -722,7 +789,8 @@ class Encoder(nn.Module):
                 ff_dim=ff_dim,
                 dropout=dropout,
                 attn_dropout=attn_dropout,
-                has_relative_bias=(i == 0 and not use_bigbird_sparse),
+                has_relative_bias=(i == 0 and not use_bigbird_sparse and not use_alibi),
+                use_alibi=use_alibi,
                 use_bigbird_sparse=use_bigbird_sparse,
                 block_size=block_size,
                 num_rand_blocks=num_rand_blocks
@@ -784,6 +852,7 @@ class DecoderBlock(nn.Module):
         dropout=0.0, 
         attn_dropout=0.0, 
         has_relative_bias=True,
+        use_alibi=False,
         use_moe=False,
         num_experts=8,
         moe_top_k=2,
@@ -800,7 +869,8 @@ class DecoderBlock(nn.Module):
             dropout=attn_dropout,
             is_decoder=True,
             is_cross_attention=False,
-            has_relative_bias=has_relative_bias
+            has_relative_bias=has_relative_bias and not use_alibi,
+            use_alibi=use_alibi
         )
         self.norm1 = LayerNorm(embed_dim)
         
@@ -811,8 +881,8 @@ class DecoderBlock(nn.Module):
             dropout=attn_dropout,
             is_decoder=True,
             is_cross_attention=True,
-            # No relative bias for cross attention
-            has_relative_bias=False
+            has_relative_bias=False,
+            use_alibi=False  # No position bias for cross-attention
         )
         self.norm2 = LayerNorm(embed_dim)
         
@@ -877,6 +947,7 @@ class Decoder(nn.Module):
         ff_dim, 
         dropout=0.0, 
         attn_dropout=0.0,
+        use_alibi=False,
         use_moe=False,
         num_experts=8,
         moe_top_k=2,
@@ -885,6 +956,7 @@ class Decoder(nn.Module):
         super().__init__()
         
         self.use_moe = use_moe
+        self.use_alibi = use_alibi
         
         self.layers = nn.ModuleList([
             DecoderBlock(
@@ -893,7 +965,8 @@ class Decoder(nn.Module):
                 ff_dim=ff_dim,
                 dropout=dropout,
                 attn_dropout=attn_dropout,
-                has_relative_bias=(i == 0),
+                has_relative_bias=(i == 0 and not use_alibi),
+                use_alibi=use_alibi,
                 use_moe=use_moe,
                 num_experts=num_experts,
                 moe_top_k=moe_top_k,
