@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from network import _blocks as util
 
+
 ##########################
 #### Main Model Class ####
 ##########################
