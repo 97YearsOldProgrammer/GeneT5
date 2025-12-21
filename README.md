@@ -21,14 +21,20 @@ Cons:
 
 ### Encoder (BERT)
 
-The current stage of planning is not pre-trainning everything from stracth rather accepte a open-source model from hugging face.        
-The choice is DNABert-v2, a pre-trained model that published weights on hugging face.   
-That model is already trained for capture local pattern, motif through trainning.   
-So, it would be the backbone of encoder block.  
-For the first step of design such program is that we need a encoder-decoder transformer model that fine-tuned to *Ab Initio Prediction*.  
+The current stage of planning is not pre-trainning everything from stracth rather accepte a open-source model from hugging face. The choice is DNABert-v2, a pre-trained model that published weights on hugging face. That model is already trained for capture local pattern, motif through trainning. So, it would be the backbone of encoder block. For the first step of design such program is that we need a encoder-decoder transformer model that fine-tuned to *Ab Initio Prediction*.    
 
 *Ab Initio Prediction* is the most basic functionality for such gene finder program. It's require able to generate prediction in form of GFF/GTF in terms of given DNA input sequences.   
 Therefore, theoretically, for achieving this, there have to be a decoder part for generating (to transfer what have already learned) the ideal outputs.  
+
+While getting the Pre-trained understanding about Genomic Sequnece. We shall keep the weights and bias for both decoder as the following components:
+
+| Component                   | Action          | Reason
+| :-------------------------: | :-----------:   | :---- 
+| **Encoder Self-Attention**  | **Copy**        | It already knows how to find context in the input.
+| **Decoder Self-Attention**  | **Copy**        | It can reuse the Encoder's logic for finding context.
+| **Cross-Attention**         | **Random Init** | This is the "new" connection that links input to output.
+| **Layer Norms**             | **Copy**        | Keeps the math stable from the start.
+| **Output Head**             | **Copy/Init**   | Usually initialized from the Input Embeddings (Shared).
 
 
 ---
