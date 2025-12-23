@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-from lib.blocks._component import BigBirdSparseAttention, LayerNorm, Attention, ALiBi, FeedForward
+from lib.blocks._component import LayerNorm, Attention, ALiBi, FeedForward
 
 
 #################

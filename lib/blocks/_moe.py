@@ -1,17 +1,4 @@
-"""
-Production-Grade Mixture of Experts Implementation
-
-Solves ALL four limitations from the naive implementation:
-1. Grouped GEMM kernel → Triton fused expert computation
-2. Expert Parallelism → DeepSpeed MoE sharding across GPUs
-3. All-to-All communication → DeepSpeed expert parallel dispatch
-4. Position-counting loop → Triton parallel prefix sum
-
-Requirements:
-    pip install torch deepspeed triton
-
-Author: Claude
-"""
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
@@ -20,6 +7,28 @@ import torch.distributed as dist
 import math
 from typing import Tuple, Optional, List
 from dataclasses import dataclass
+
+
+#################
+#####  MoE  #####
+#################
+
+
+class ProductionMoE(nn.Module):
+    """Complete production MoE module ready for large-scale training"""
+    
+    def __init__(self, config):
+        super().__init__()
+        self.moe    = ProductionMoELayer(config)
+        self.config = config
+    
+    def forward(self, x):
+        return self.moe(x)
+
+
+##################
+#####  CUDA  #####
+##################
 
 
 try:
@@ -35,39 +44,33 @@ if TRITON_AVAILABLE:
     
     @triton.jit
     def grouped_gemm_kernel(
-
         # Pointers
-        X_ptr,          # Input: (total_tokens, embed_dim)
-        W_ptr,          # Weights: (num_experts, out_dim, in_dim)
-        Y_ptr,          # Output: (total_tokens, out_dim)
-        expert_ids_ptr, # Expert assignment per token: (total_tokens,)
-
+        X_ptr,
+        W_ptr,
+        Y_ptr,
+        expert_ids_ptr,
         # Dimensions
         total_tokens,
         in_dim,
         out_dim,
         num_experts,
-
         # Strides for X
         stride_x_token,
         stride_x_dim,
-
-        # Strides for W (3D: expert, out, in)
+        # Strides for W
         stride_w_expert,
         stride_w_out,
         stride_w_in,
-
         # Strides for Y
         stride_y_token,
         stride_y_dim,
-
         # Block sizes
-        BLOCK_M: tl.constexpr,  # Tokens per block
-        BLOCK_N: tl.constexpr,  # Output dims per block
-        BLOCK_K: tl.constexpr,  # Inner dimension tile
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
     ):
         """
-        Replace pytrhon loop of MoE:
+        Replace python loop of MoE:
             for expert_idx in range(num_experts):
                 mask = (expert_indices == expert_idx)
                 output[mask] = x[mask] @ experts[expert_idx].weight.T
@@ -75,43 +78,26 @@ if TRITON_AVAILABLE:
         With a single kernel that:
             output[i] = x[i] @ experts[expert_ids[i]].weight.T
         """
-
-        # Program ID
-        pid_m = tl.program_id(0)  # Which token block
-        pid_n = tl.program_id(1)  # Which output dim block
+        pid_m       = tl.program_id(0)
+        pid_n       = tl.program_id(1)
         
-        # Token indices for this block
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        offs_k = tl.arange(0, BLOCK_K)
+        offs_m      = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n      = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_k      = tl.arange(0, BLOCK_K)
         
-        # Mask for valid tokens
-        mask_m = offs_m < total_tokens
-        mask_n = offs_n < out_dim
+        mask_m      = offs_m < total_tokens
+        mask_n      = offs_n < out_dim
         
-        # Load expert IDs for this block of tokens
-        expert_ids = tl.load(expert_ids_ptr + offs_m, mask=mask_m, other=0)
+        expert_ids  = tl.load(expert_ids_ptr + offs_m, mask=mask_m, other=0)
+        acc         = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         
-        # Accumulator
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        
-        # Loop over K dimension
         for k_start in range(0, in_dim, BLOCK_K):
-            k_offs = k_start + offs_k
-            mask_k = k_offs < in_dim
+            k_offs  = k_start + offs_k
+            mask_k  = k_offs < in_dim
             
-            # Load X block: (BLOCK_M, BLOCK_K)
-            x_ptrs = X_ptr + offs_m[:, None] * stride_x_token + k_offs[None, :] * stride_x_dim
+            x_ptrs  = X_ptr + offs_m[:, None] * stride_x_token + k_offs[None, :] * stride_x_dim
             x_block = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
             
-            # Load W block for each token's expert: (BLOCK_M, BLOCK_N, BLOCK_K)
-            # W[expert_ids[m], n, k]
-            w_ptrs = (W_ptr + 
-                      expert_ids[:, None, None] * stride_w_expert +
-                      offs_n[None, :, None] * stride_w_out +
-                      k_offs[None, None, :] * stride_w_in)
-            
-            # Reshape for batch matmul
             w_block = tl.load(
                 W_ptr + expert_ids[:, None] * stride_w_expert + 
                 offs_n[None, :] * stride_w_out + k_start * stride_w_in,
@@ -119,16 +105,12 @@ if TRITON_AVAILABLE:
                 other=0.0
             )
             
-            # For proper grouped gemm, we need per-token weight loading
-            # Simplified: accumulate x @ w^T
             for k_idx in range(BLOCK_K):
                 if k_start + k_idx < in_dim:
                     x_col = tl.load(
                         X_ptr + offs_m * stride_x_token + (k_start + k_idx) * stride_x_dim,
                         mask=mask_m, other=0.0
                     )
-
-                    # Load weight row for each token's expert
                     w_row = tl.load(
                         W_ptr + expert_ids * stride_w_expert + 
                         offs_n[None, :] * stride_w_out + 
@@ -138,21 +120,17 @@ if TRITON_AVAILABLE:
                     )
                     acc += x_col[:, None] * w_row
         
-        # Store output
         y_ptrs = Y_ptr + offs_m[:, None] * stride_y_token + offs_n[None, :] * stride_y_dim
         tl.store(y_ptrs, acc, mask=mask_m[:, None] & mask_n[None, :])
 
 
     @triton.jit
     def expert_position_kernel(
-
         # Inputs
-        expert_ids_ptr,     # (num_tokens,) - which expert each token goes to
-
+        expert_ids_ptr,
         # Outputs
-        positions_ptr,      # (num_tokens,) - position within expert's buffer
-        expert_counts_ptr,  # (num_experts,) - count per expert
-
+        positions_ptr,
+        expert_counts_ptr,
         # Sizes
         num_tokens,
         num_experts,
@@ -160,154 +138,99 @@ if TRITON_AVAILABLE:
     ):
         """
         Compute position of each token within its expert's buffer.
-        
-        Replaces the serial loop:
-            for i in range(num_tokens):
-                expert = expert_ids[i]
-                positions[i] = expert_counts[expert]
-                expert_counts[expert] += 1
-        
-        With parallel histogram + prefix sum.
+        Uses atomic operations which results in non-deterministic ordering.
         """
-
-        pid     = tl.program_id(0)
-        offs    = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        mask    = offs < num_tokens
+        pid         = tl.program_id(0)
+        block_start = pid * BLOCK_SIZE
         
-        # Load expert assignments
-        expert_ids = tl.load(expert_ids_ptr + offs, mask=mask, other=0)
-        
-        # Use atomic operations for position counting
-        # Each token atomically increments its expert's counter
         for i in range(BLOCK_SIZE):
-            if pid * BLOCK_SIZE + i < num_tokens:
-                idx = pid * BLOCK_SIZE + i
-                expert = tl.load(expert_ids_ptr + idx)
-                # Atomic add returns old value = position
-                pos = tl.atomic_add(expert_counts_ptr + expert, 1)
+            idx = block_start + i
+            if idx < num_tokens:
+                expert  = tl.load(expert_ids_ptr + idx)
+                pos     = tl.atomic_add(expert_counts_ptr + expert, 1)
                 tl.store(positions_ptr + idx, pos)
 
 
     @triton.jit  
-    def fused_geglu_kernel(
-
+    def fused_geglu_kernel_simple(
         # Inputs
-        X_ptr,              # (num_tokens, embed_dim)
-        W_gate_ptr,         # (num_experts, ff_dim, embed_dim)
-        W_up_ptr,           # (num_experts, ff_dim, embed_dim)
-        W_down_ptr,         # (num_experts, embed_dim, ff_dim)
-        expert_ids_ptr,     # (num_tokens,)
-
+        X_ptr,
+        W_gate_ptr,
+        W_up_ptr,
+        W_down_ptr,
+        expert_ids_ptr,
         # Output
-        Y_ptr,              # (num_tokens, embed_dim)
-
+        Y_ptr,
         # Dimensions
         num_tokens,
         embed_dim,
         ff_dim,
-
         # Strides
         stride_x_t, stride_x_d,
         stride_wg_e, stride_wg_f, stride_wg_d,
         stride_wu_e, stride_wu_f, stride_wu_d,
         stride_wd_e, stride_wd_d, stride_wd_f,
         stride_y_t, stride_y_d,
-
         # Block sizes
-        BLOCK_T: tl.constexpr,
         BLOCK_F: tl.constexpr,
         BLOCK_D: tl.constexpr,
     ):
         """
-        Fused GeGLU Expert Computation:
+        Fused GeGLU Expert Computation (one token per program):
             hidden = SiLU(x @ W_gate.T) * (x @ W_up.T)
             output = hidden @ W_down.T
-        
-        All in one kernel, no intermediate memory allocation.
         """
-
-        pid_t = tl.program_id(0)  # Token block
-        pid_d = tl.program_id(1)  # Output embed dim block
+        token_id = tl.program_id(0)
         
-        offs_t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
-        offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+        if token_id >= num_tokens:
+            return
         
-        mask_t = offs_t < num_tokens
-        mask_d = offs_d < embed_dim
+        expert_id   = tl.load(expert_ids_ptr + token_id)
+        pid_d       = tl.program_id(1)
+        offs_d      = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+        mask_d      = offs_d < embed_dim
+        acc         = tl.zeros((BLOCK_D,), dtype=tl.float32)
         
-        # Load expert IDs
-        expert_ids = tl.load(expert_ids_ptr + offs_t, mask=mask_t, other=0)
-        
-        # Accumulator for final output
-        acc = tl.zeros((BLOCK_T, BLOCK_D), dtype=tl.float32)
-        
-        # Loop over ff_dim
         for f_start in range(0, ff_dim, BLOCK_F):
-            offs_f = f_start + tl.arange(0, BLOCK_F)
-            mask_f = offs_f < ff_dim
+            offs_f  = f_start + tl.arange(0, BLOCK_F)
+            mask_f  = offs_f < ff_dim
+            gate    = tl.zeros((BLOCK_F,), dtype=tl.float32)
+            up      = tl.zeros((BLOCK_F,), dtype=tl.float32)
             
-            # Compute gate and up projections for this ff block
-            gate_acc = tl.zeros((BLOCK_T, BLOCK_F), dtype=tl.float32)
-            up_acc = tl.zeros((BLOCK_T, BLOCK_F), dtype=tl.float32)
-            
-            # Inner loop over embed_dim for gate/up projection
-            for d_start in range(0, embed_dim, BLOCK_D):
-                d_offs = d_start + tl.arange(0, BLOCK_D)
-                d_mask = d_offs < embed_dim
+            for d_idx in range(embed_dim):
+                x_val   = tl.load(X_ptr + token_id * stride_x_t + d_idx * stride_x_d)
+                wg_ptrs = W_gate_ptr + expert_id * stride_wg_e + offs_f * stride_wg_f + d_idx * stride_wg_d
+                wg_vals = tl.load(wg_ptrs, mask=mask_f, other=0.0)
+                gate    += x_val * wg_vals
                 
-                # Load X
-                x = tl.load(
-                    X_ptr + offs_t[:, None] * stride_x_t + d_offs[None, :] * stride_x_d,
-                    mask=mask_t[:, None] & d_mask[None, :],
-                    other=0.0
-                )
-                
-                # Load W_gate and W_up (expert-specific)
-                # Simplified loading - in practice would need per-token expert indexing
-                for t_idx in range(BLOCK_T):
-                    if pid_t * BLOCK_T + t_idx < num_tokens:
-                        exp_id = tl.load(expert_ids_ptr + pid_t * BLOCK_T + t_idx)
-                        # Accumulate gate and up
-                        
-            # Apply SiLU to gate
-            gate_activated = gate_acc * tl.sigmoid(gate_acc)  # SiLU = x * sigmoid(x)
+                wu_ptrs = W_up_ptr + expert_id * stride_wu_e + offs_f * stride_wu_f + d_idx * stride_wu_d
+                wu_vals = tl.load(wu_ptrs, mask=mask_f, other=0.0)
+                up      += x_val * wu_vals
             
-            # Multiply gate * up
-            hidden = gate_activated * up_acc
-            
-            # Project down and accumulate
-            # acc += hidden @ W_down[:, offs_d, offs_f]
+            hidden  = gate * tl.sigmoid(gate) * up
+            wd_ptrs = W_down_ptr + expert_id * stride_wd_e + offs_d[:, None] * stride_wd_d + offs_f[None, :] * stride_wd_f
+            wd_vals = tl.load(wd_ptrs, mask=mask_d[:, None] & mask_f[None, :], other=0.0)
+            acc     += tl.sum(wd_vals * hidden[None, :], axis=1)
         
-        # Store output
-        y_ptrs = Y_ptr + offs_t[:, None] * stride_y_t + offs_d[None, :] * stride_y_d
-        tl.store(y_ptrs, acc, mask=mask_t[:, None] & mask_d[None, :])
+        y_ptrs = Y_ptr + token_id * stride_y_t + offs_d * stride_y_d
+        tl.store(y_ptrs, acc, mask=mask_d)
 
 
-# =============================================================================
-# PART 2: TRITON-ACCELERATED PYTORCH MODULES  
-# =============================================================================
+###################
+#####  TORCH  #####
+###################
+
 
 class TritonGroupedGEMM(torch.autograd.Function):
-    """Autograd wrapper for Triton grouped GEMM."""
+    """Autograd wrapper for Triton grouped GEMM"""
     
     @staticmethod
     def forward(ctx, x, weight, expert_ids):
-        """
-        Args:
-            x: (num_tokens, in_dim)
-            weight: (num_experts, out_dim, in_dim)
-            expert_ids: (num_tokens,) - expert index for each token
-        
-        Returns:
-            output: (num_tokens, out_dim)
-        """
-        num_tokens, in_dim = x.shape
+        num_tokens, in_dim      = x.shape
         num_experts, out_dim, _ = weight.shape
-        
-        output = torch.empty(num_tokens, out_dim, device=x.device, dtype=x.dtype)
+        output                  = torch.empty(num_tokens, out_dim, device=x.device, dtype=x.dtype)
         
         if TRITON_AVAILABLE and x.is_cuda:
-            # Use Triton kernel
             BLOCK_M = 32
             BLOCK_N = 64
             BLOCK_K = 32
@@ -325,28 +248,23 @@ class TritonGroupedGEMM(torch.autograd.Function):
                 output.stride(0), output.stride(1),
                 BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
             )
-        # Fallback: vectorized PyTorch
         else:
-            selected_weights = weight[expert_ids]  # (num_tokens, out_dim, in_dim)
-            output = torch.einsum('nd,nod->no', x, selected_weights)
+            selected_weights    = weight[expert_ids]
+            output              = torch.einsum('nd,nod->no', x, selected_weights)
         
         ctx.save_for_backward(x, weight, expert_ids)
         return output
     
     @staticmethod
     def backward(ctx, grad_output):
-        x, weight, expert_ids = ctx.saved_tensors
+        x, weight, expert_ids   = ctx.saved_tensors
+        num_experts             = weight.shape[0]
+        selected_weights        = weight[expert_ids]
+        grad_x                  = torch.einsum('no,nod->nd', grad_output, selected_weights)
+        grad_weight             = torch.zeros_like(weight)
+        grad_contribution       = torch.einsum('no,nd->nod', grad_output, x)
         
-        # Gradient w.r.t. x
-        selected_weights    = weight[expert_ids]
-        grad_x              = torch.einsum('no,nod->nd', grad_output, selected_weights)
-        
-        # Gradient w.r.t. weight (scatter-add)
-        grad_weight         = torch.zeros_like(weight)
-        grad_contribution   = torch.einsum('no,nd->nod', grad_output, x)
-        
-        # Scatter gradients to correct expert weights
-        for i in range(weight.shape[0]):
+        for i in range(num_experts):
             mask = expert_ids == i
             if mask.any():
                 grad_weight[i] = grad_contribution[mask].sum(dim=0)
@@ -355,51 +273,29 @@ class TritonGroupedGEMM(torch.autograd.Function):
 
 
 def triton_grouped_gemm(x, weight, expert_ids):
-    """Functional interface for Triton grouped GEMM."""
+    """Functional interface for Triton grouped GEMM"""
     return TritonGroupedGEMM.apply(x, weight, expert_ids)
 
 
 class TritonExpertDispatch(nn.Module):
-    """
-    Efficient token dispatch using Triton kernels.
+    """Efficient token dispatch using Triton kernels"""
     
-    Solves the position-counting loop problem with parallel atomics.
-    """
-    
-    def __init__(self, num_experts, capacity_factor: float = 1.25):
+    def __init__(self, num_experts, capacity_factor=1.25):
         super().__init__()
         self.num_experts        = num_experts
         self.capacity_factor    = capacity_factor
     
     def forward(self, x, expert_ids, expert_weights):
-        """
-        Dispatch tokens to experts with capacity limiting.
-        
-        Args:
-            x: (num_tokens, embed_dim)
-            expert_ids: (num_tokens,) - primary expert for each token
-            expert_weights: (num_tokens,) - routing weight for each token
-        
-        Returns:
-            dispatched_x: (num_experts, capacity, embed_dim)
-            combine_weights: (num_experts, capacity)
-            token_indices: (num_experts, capacity) - original token index
-            tokens_dropped: int
-        """
-
         num_tokens, embed_dim   = x.shape
         capacity                = int((num_tokens / self.num_experts) * self.capacity_factor)
         capacity                = max(capacity, 1)
-        
-        device = x.device
+        device                  = x.device
         
         if TRITON_AVAILABLE and x.is_cuda:
-            # Use Triton kernel for position computation
             positions       = torch.zeros(num_tokens, dtype=torch.int32, device=device)
             expert_counts   = torch.zeros(self.num_experts, dtype=torch.int32, device=device)
-            
-            BLOCK_SIZE = 256
-            grid = (triton.cdiv(num_tokens, BLOCK_SIZE),)
+            BLOCK_SIZE      = 256
+            grid            = (triton.cdiv(num_tokens, BLOCK_SIZE),)
             
             expert_position_kernel[grid](
                 expert_ids, positions, expert_counts,
@@ -409,26 +305,19 @@ class TritonExpertDispatch(nn.Module):
             positions       = positions.long()
             expert_counts   = expert_counts.long()
         else:
-            # Fallback: PyTorch implementation
-            expert_counts = torch.bincount(expert_ids, minlength=self.num_experts)
+            expert_counts   = torch.bincount(expert_ids, minlength=self.num_experts)
+            sorted_indices  = torch.argsort(expert_ids)
+            sorted_experts  = expert_ids[sorted_indices]
+            cumsum          = torch.cumsum(expert_counts, dim=0)
+            starts          = torch.cat([torch.tensor([0], device=device), cumsum[:-1]])
+            positions       = torch.zeros(num_tokens, dtype=torch.long, device=device)
             
-            # Compute positions using cumsum trick
-            sorted_indices = torch.argsort(expert_ids)
-            sorted_experts = expert_ids[sorted_indices]
-            
-            # Position = index within sorted - start of that expert
-            cumsum = torch.cumsum(expert_counts, dim=0)
-            starts = torch.cat([torch.tensor([0], device=device), cumsum[:-1]])
-            
-            positions = torch.zeros(num_tokens, dtype=torch.long, device=device)
             for i, (idx, exp) in enumerate(zip(sorted_indices, sorted_experts)):
                 positions[idx] = i - starts[exp]
         
-        # Apply capacity limit
         valid_mask      = positions < capacity
         tokens_dropped  = (~valid_mask).sum().item()
         
-        # Initialize output tensors
         dispatched_x = torch.zeros(
             self.num_experts, capacity, embed_dim, 
             dtype=x.dtype, device=device
@@ -442,23 +331,16 @@ class TritonExpertDispatch(nn.Module):
             dtype=torch.long, device=device
         )
         
-        # Scatter tokens to expert buffers
         valid_tokens    = torch.where(valid_mask)[0]
         valid_experts   = expert_ids[valid_mask]
         valid_positions = positions[valid_mask]
         
-        # Use advanced indexing for scatter
         dispatched_x[valid_experts, valid_positions]    = x[valid_tokens]
         combine_weights[valid_experts, valid_positions] = expert_weights[valid_tokens]
         token_indices[valid_experts, valid_positions]   = valid_tokens
         
         return dispatched_x, combine_weights, token_indices, tokens_dropped
 
-
-# =============================================================================
-# PART 3: DEEPSPEED MOE INTEGRATION
-# Solves: Expert Parallelism, All-to-All Communication
-# =============================================================================
 
 try:
     import deepspeed
@@ -472,91 +354,76 @@ except ImportError:
 
 @dataclass
 class ProductionMoEConfig:
-    """Configuration for production MoE."""
-    embed_dim: int = 768
-    ff_dim: int = 3072
-    num_experts: int = 8
-    num_local_experts: int = None  # Experts per GPU (auto-computed if None)
-    top_k: int = 2
-    capacity_factor: float = 1.25
-    eval_capacity_factor: float = 2.0  # Higher capacity during eval
-    dropout: float = 0.0
-    activation: str = 'silu'
-    load_balance_weight: float = 0.01
+    """Configuration for production MoE"""
+    embed_dim: int              = 768
+    ff_dim: int                 = 3072
+    num_experts: int            = 8
+    num_local_experts: int      = None
+    top_k: int                  = 2
+    capacity_factor: float      = 1.25
+    eval_capacity_factor: float = 2.0
+    dropout: float              = 0.0
+    activation: str             = 'silu'
+    load_balance_weight: float  = 0.01
     router_z_loss_weight: float = 0.001
-    use_triton: bool = True
-    use_deepspeed: bool = True
-    expert_parallel_size: int = None  # Number of GPUs for expert parallelism
+    use_triton: bool            = True
+    use_deepspeed: bool         = True
+    expert_parallel_size: int   = None
 
 
 class TritonGeGLUExpert(nn.Module):
-    """Single expert with optional Triton acceleration."""
+    """Single expert with optional Triton acceleration"""
     
-    def __init__(self, embed_dim: int, ff_dim: int, dropout: float = 0.0):
+    def __init__(self, embed_dim, ff_dim, dropout=0.0):
         super().__init__()
-        self.wi_gate = nn.Linear(embed_dim, ff_dim, bias=False)
-        self.wi_up = nn.Linear(embed_dim, ff_dim, bias=False)
-        self.wo = nn.Linear(ff_dim, embed_dim, bias=False)
-        self.dropout = nn.Dropout(dropout)
+        self.wi_gate    = nn.Linear(embed_dim, ff_dim, bias=False)
+        self.wi_up      = nn.Linear(embed_dim, ff_dim, bias=False)
+        self.wo         = nn.Linear(ff_dim, embed_dim, bias=False)
+        self.dropout    = nn.Dropout(dropout)
     
     def forward(self, x):
-        gate = F.silu(self.wi_gate(x))
-        up = self.wi_up(x)
-        hidden = self.dropout(gate * up)
+        gate    = F.silu(self.wi_gate(x))
+        up      = self.wi_up(x)
+        hidden  = self.dropout(gate * up)
         return self.wo(hidden)
 
 
 class ProductionMoELayer(nn.Module):
-    """
-    Production-grade MoE layer with Triton + DeepSpeed.
+    """Production-grade MoE layer with Triton + DeepSpeed"""
     
-    Features:
-    - Triton kernels for grouped GEMM and dispatch
-    - DeepSpeed expert parallelism across GPUs
-    - All-to-All communication for token routing
-    - Capacity-based load balancing
-    """
-    
-    def __init__(self, config: ProductionMoEConfig):
+    def __init__(self, config):
         super().__init__()
-        self.config = config
-        self.embed_dim = config.embed_dim
-        self.num_experts = config.num_experts
-        self.top_k = config.top_k
-        self.use_triton = config.use_triton and TRITON_AVAILABLE
-        self.use_deepspeed = config.use_deepspeed and DEEPSPEED_AVAILABLE
+        self.config                 = config
+        self.embed_dim              = config.embed_dim
+        self.num_experts            = config.num_experts
+        self.top_k                  = config.top_k
+        self.use_triton             = config.use_triton and TRITON_AVAILABLE
+        self.use_deepspeed          = config.use_deepspeed and DEEPSPEED_AVAILABLE
+        self.load_balance_weight    = config.load_balance_weight
+        self.router_z_weight        = config.router_z_loss_weight
         
-        # Determine expert parallelism
         if dist.is_initialized():
-            world_size = dist.get_world_size()
-            self.expert_parallel_size = config.expert_parallel_size or world_size
-            self.num_local_experts = config.num_experts // self.expert_parallel_size
+            world_size                  = dist.get_world_size()
+            self.expert_parallel_size   = config.expert_parallel_size or world_size
+            self.num_local_experts      = config.num_experts // self.expert_parallel_size
         else:
-            self.expert_parallel_size = 1
-            self.num_local_experts = config.num_experts
+            self.expert_parallel_size   = 1
+            self.num_local_experts      = config.num_experts
         
-        # Router
         self.gate = nn.Linear(config.embed_dim, config.num_experts, bias=False)
         
         if self.use_deepspeed and dist.is_initialized():
-            # Use DeepSpeed's expert-parallel MoE
             self._init_deepspeed_experts(config)
         else:
-            # Use local experts with Triton acceleration
             self._init_local_experts(config)
         
-        # Triton dispatch helper
         if self.use_triton:
             self.dispatcher = TritonExpertDispatch(
                 config.num_experts, config.capacity_factor
             )
-        
-        self.load_balance_weight = config.load_balance_weight
-        self.router_z_weight = config.router_z_loss_weight
     
     def _init_local_experts(self, config):
-        """Initialize experts on local device."""
-        # Batched weights for Triton grouped GEMM
+        """Initialize experts on local device"""
         self.expert_wi_gate = nn.Parameter(
             torch.empty(config.num_experts, config.ff_dim, config.embed_dim)
         )
@@ -575,48 +442,27 @@ class ProductionMoELayer(nn.Module):
                 nn.init.kaiming_uniform_(param[i], a=math.sqrt(5))
     
     def _init_deepspeed_experts(self, config):
-        """Initialize DeepSpeed expert-parallel MoE."""
-        # Create expert modules
+        """Initialize DeepSpeed expert-parallel MoE"""
         self.experts = nn.ModuleList([
             TritonGeGLUExpert(config.embed_dim, config.ff_dim, config.dropout)
             for _ in range(self.num_local_experts)
         ])
         
-        # DeepSpeed handles the parallelism
         self.expert_group = None
         if dist.is_initialized():
-            # Create expert parallel group
-            ranks = list(range(dist.get_world_size()))
-            self.expert_group = dist.new_group(ranks)
+            ranks               = list(range(dist.get_world_size()))
+            self.expert_group   = dist.new_group(ranks)
     
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, dict]:
-        """
-        Forward pass with expert parallelism.
+    def forward(self, x):
+        batch_size, seq_len, embed_dim  = x.shape
+        num_tokens                      = batch_size * seq_len
+        x_flat                          = x.view(num_tokens, embed_dim)
         
-        Args:
-            x: (batch_size, seq_len, embed_dim)
-        
-        Returns:
-            output: (batch_size, seq_len, embed_dim)
-            aux_loss: Scalar auxiliary loss
-            metadata: Routing statistics
-        """
-        batch_size, seq_len, embed_dim = x.shape
-        num_tokens = batch_size * seq_len
-        x_flat = x.view(num_tokens, embed_dim)
-        
-        # =====================================================================
-        # STEP 1: Compute routing
-        # =====================================================================
-        router_logits = self.gate(x_flat)
-        router_probs = F.softmax(router_logits, dim=-1)
+        router_logits   = self.gate(x_flat)
+        router_probs    = F.softmax(router_logits, dim=-1)
         
         top_k_probs, top_k_indices = torch.topk(router_probs, self.top_k, dim=-1)
         top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
-        
-        # =====================================================================
-        # STEP 2: Dispatch tokens to experts
-        # =====================================================================
         
         if self.use_deepspeed and dist.is_initialized():
             output, tokens_dropped = self._deepspeed_forward(
@@ -631,12 +477,8 @@ class ProductionMoELayer(nn.Module):
                 x_flat, top_k_indices, top_k_probs
             )
         
-        output = output.view(batch_size, seq_len, embed_dim)
-        
-        # =====================================================================
-        # STEP 3: Compute auxiliary losses
-        # =====================================================================
-        aux_loss = self._compute_aux_loss(router_logits, router_probs, top_k_indices)
+        output      = output.view(batch_size, seq_len, embed_dim)
+        aux_loss    = self._compute_aux_loss(router_logits, router_probs, top_k_indices)
         
         metadata = {
             'tokens_dropped': tokens_dropped,
@@ -648,24 +490,19 @@ class ProductionMoELayer(nn.Module):
         return output, aux_loss, metadata
     
     def _triton_forward(self, x_flat, top_k_indices, top_k_probs):
-        """Forward pass using Triton kernels."""
-        num_tokens, embed_dim = x_flat.shape
-        output = torch.zeros_like(x_flat)
-        total_dropped = 0
+        """Forward pass using Triton kernels"""
+        num_tokens, embed_dim   = x_flat.shape
+        output                  = torch.zeros_like(x_flat)
+        total_dropped           = 0
         
         for k in range(self.top_k):
-            expert_ids = top_k_indices[:, k]
-            expert_weights = top_k_probs[:, k]
+            expert_ids      = top_k_indices[:, k]
+            expert_weights  = top_k_probs[:, k]
             
-            # Dispatch tokens
             dispatched_x, combine_weights, token_indices, dropped = \
                 self.dispatcher(x_flat, expert_ids, expert_weights)
             total_dropped += dropped
             
-            # Process through experts using grouped GEMM
-            # Shape: (num_experts, capacity, embed_dim)
-            
-            # Gate projection
             gate_out = triton_grouped_gemm(
                 dispatched_x.view(-1, embed_dim),
                 self.expert_wi_gate,
@@ -675,7 +512,6 @@ class ProductionMoELayer(nn.Module):
             ).view(self.num_experts, -1, self.config.ff_dim)
             gate_out = F.silu(gate_out)
             
-            # Up projection
             up_out = triton_grouped_gemm(
                 dispatched_x.view(-1, embed_dim),
                 self.expert_wi_up,
@@ -684,10 +520,8 @@ class ProductionMoELayer(nn.Module):
                 )
             ).view(self.num_experts, -1, self.config.ff_dim)
             
-            # GeGLU
             hidden = self.dropout(gate_out * up_out)
             
-            # Down projection
             expert_out = triton_grouped_gemm(
                 hidden.view(-1, self.config.ff_dim),
                 self.expert_wo,
@@ -696,94 +530,94 @@ class ProductionMoELayer(nn.Module):
                 )
             ).view(self.num_experts, -1, embed_dim)
             
-            # Scatter back with weights
             for e in range(self.num_experts):
-                valid_mask = token_indices[e] >= 0
-                valid_tokens = token_indices[e][valid_mask]
-                valid_weights = combine_weights[e][valid_mask].unsqueeze(-1)
-                valid_outputs = expert_out[e, :valid_mask.sum()]
+                valid_mask      = token_indices[e] >= 0
+                valid_tokens    = token_indices[e][valid_mask]
+                valid_weights   = combine_weights[e][valid_mask].unsqueeze(-1)
+                valid_outputs   = expert_out[e, :valid_mask.sum()]
                 
                 output.index_add_(0, valid_tokens, valid_outputs * valid_weights)
         
         return output, total_dropped
     
     def _deepspeed_forward(self, x_flat, top_k_indices, top_k_probs):
-        """Forward pass using DeepSpeed expert parallelism."""
-        num_tokens, embed_dim = x_flat.shape
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
+        """Forward pass using DeepSpeed expert parallelism"""
+        num_tokens, embed_dim   = x_flat.shape
+        rank                    = dist.get_rank()
+        world_size              = dist.get_world_size()
+        device                  = x_flat.device
+        dtype                   = x_flat.dtype
         
-        # =====================================================================
-        # ALL-TO-ALL: Send tokens to the GPU that owns their expert
-        # =====================================================================
-        
-        # Determine which GPU owns which expert
-        expert_to_rank = torch.arange(self.num_experts, device=x_flat.device) % world_size
-        
-        # For each token, find destination rank
+        expert_to_rank  = torch.arange(self.num_experts, device=device) % world_size
         primary_experts = top_k_indices[:, 0]
-        dest_ranks = expert_to_rank[primary_experts]
+        dest_ranks      = expert_to_rank[primary_experts]
+        send_counts     = torch.zeros(world_size, dtype=torch.long, device=device)
         
-        # Count tokens going to each rank
-        send_counts = torch.bincount(dest_ranks, minlength=world_size)
+        for r in range(world_size):
+            send_counts[r] = (dest_ranks == r).sum()
         
-        # All-to-all to exchange counts
-        recv_counts = torch.zeros_like(send_counts)
+        recv_counts = torch.zeros(world_size, dtype=torch.long, device=device)
         dist.all_to_all_single(recv_counts, send_counts, group=self.expert_group)
         
-        # Sort tokens by destination
-        sorted_indices = torch.argsort(dest_ranks)
-        sorted_tokens = x_flat[sorted_indices]
-        sorted_probs = top_k_probs[sorted_indices, 0]
-        sorted_experts = primary_experts[sorted_indices]
+        sorted_indices  = torch.argsort(dest_ranks)
+        sorted_tokens   = x_flat[sorted_indices]
+        sorted_probs    = top_k_probs[sorted_indices, 0]
+        sorted_experts  = primary_experts[sorted_indices]
         
-        # All-to-all to exchange tokens
+        total_recv  = recv_counts.sum().item()
+        recv_tokens = torch.zeros(total_recv, embed_dim, dtype=dtype, device=device)
+        recv_probs  = torch.zeros(total_recv, dtype=dtype, device=device)
+        recv_experts = torch.zeros(total_recv, dtype=torch.long, device=device)
+        
         send_splits = send_counts.tolist()
         recv_splits = recv_counts.tolist()
         
-        recv_tokens = torch.zeros(
-            recv_counts.sum().item(), embed_dim,
-            dtype=x_flat.dtype, device=x_flat.device
-        )
+        send_token_list = list(sorted_tokens.split(send_splits))
+        recv_token_list = list(recv_tokens.split(recv_splits))
+        dist.all_to_all(recv_token_list, send_token_list, group=self.expert_group)
+        recv_tokens = torch.cat(recv_token_list, dim=0) if total_recv > 0 else recv_tokens
         
-        dist.all_to_all(
-            list(recv_tokens.split(recv_splits)),
-            list(sorted_tokens.split(send_splits)),
-            group=self.expert_group
-        )
+        send_prob_list  = list(sorted_probs.split(send_splits))
+        recv_prob_list  = [torch.zeros(s, dtype=dtype, device=device) for s in recv_splits]
+        dist.all_to_all(recv_prob_list, send_prob_list, group=self.expert_group)
+        recv_probs = torch.cat(recv_prob_list, dim=0) if total_recv > 0 else recv_probs
         
-
-        # Process local experts        
+        send_expert_list = list(sorted_experts.split(send_splits))
+        recv_expert_list = [torch.zeros(s, dtype=torch.long, device=device) for s in recv_splits]
+        dist.all_to_all(recv_expert_list, send_expert_list, group=self.expert_group)
+        recv_experts = torch.cat(recv_expert_list, dim=0) if total_recv > 0 else recv_experts
+        
         local_expert_start  = rank * self.num_local_experts
         local_expert_end    = local_expert_start + self.num_local_experts
+        processed_tokens    = torch.zeros_like(recv_tokens)
         
-        processed_tokens = recv_tokens  # Placeholder
+        for local_idx, expert in enumerate(self.experts):
+            global_expert_id = local_expert_start + local_idx
+            mask = recv_experts == global_expert_id
+            if mask.any():
+                expert_input    = recv_tokens[mask]
+                expert_output   = expert(expert_input)
+                processed_tokens[mask] = expert_output * recv_probs[mask].unsqueeze(-1)
         
-        # ALL-TO-ALL: Send results back
-        result_tokens = torch.zeros_like(sorted_tokens)
-        dist.all_to_all(
-            list(result_tokens.split(send_splits)),
-            list(processed_tokens.split(recv_splits)),
-            group=self.expert_group
-        )
+        send_result_list = list(processed_tokens.split(recv_splits))
+        recv_result_list = [torch.zeros(s, embed_dim, dtype=dtype, device=device) for s in send_splits]
+        dist.all_to_all(recv_result_list, send_result_list, group=self.expert_group)
+        result_tokens = torch.cat(recv_result_list, dim=0) if num_tokens > 0 else torch.zeros_like(sorted_tokens)
         
-        # Unsort to original order
         output = torch.zeros_like(x_flat)
         output[sorted_indices] = result_tokens
         
-        return output, 0  # Token dropping handled differently with DeepSpeed
+        return output, 0
     
     def _pytorch_forward(self, x_flat, top_k_indices, top_k_probs):
-        """Fallback PyTorch forward without Triton/DeepSpeed."""
-
-        num_tokens, embed_dim = x_flat.shape
-        output = torch.zeros_like(x_flat)
+        """Fallback PyTorch forward without Triton/DeepSpeed"""
+        num_tokens, embed_dim   = x_flat.shape
+        output                  = torch.zeros_like(x_flat)
         
         for k in range(self.top_k):
             expert_ids      = top_k_indices[:, k]
             expert_weights  = top_k_probs[:, k:k+1]
             
-            # Vectorized expert computation
             selected_wi_gate    = self.expert_wi_gate[expert_ids]
             selected_wi_up      = self.expert_wi_up[expert_ids]
             selected_wo         = self.expert_wo[expert_ids]
@@ -798,113 +632,14 @@ class ProductionMoELayer(nn.Module):
         return output, 0
     
     def _compute_aux_loss(self, router_logits, router_probs, top_k_indices):
-        """Compute auxiliary losses."""
-
-        num_tokens = router_logits.shape[0]
-        
-        # Load balance loss
+        """Compute auxiliary losses"""
+        num_tokens  = router_logits.shape[0]
         expert_mask = F.one_hot(top_k_indices, self.num_experts).float().sum(dim=1)
-        f = expert_mask.sum(dim=0) / (num_tokens * self.top_k)
-        P = router_probs.mean(dim=0)
-        load_balance_loss = self.num_experts * (f * P).sum()
+        f           = expert_mask.sum(dim=0) / (num_tokens * self.top_k)
+        P           = router_probs.mean(dim=0)
         
-        # Router z-loss
+        load_balance_loss = self.num_experts * (f * P).sum()
         z_loss = torch.logsumexp(router_logits, dim=-1).square().mean()
         
         return (self.load_balance_weight * load_balance_loss + 
                 self.router_z_weight * z_loss)
-
-
-# =============================================================================
-# PART 4: COMPLETE PRODUCTION MOE WITH ALL FEATURES
-# =============================================================================
-
-class ProductionMoE(nn.Module):
-    """
-    Complete production MoE module ready for large-scale training.
-    
-    Usage:
-        # Single GPU with Triton
-        config = ProductionMoEConfig(use_deepspeed=False, use_triton=True)
-        moe = ProductionMoE(config)
-        
-        # Multi-GPU with DeepSpeed
-        config = ProductionMoEConfig(use_deepspeed=True, expert_parallel_size=8)
-        moe = ProductionMoE(config)
-        deepspeed.init_distributed()
-        model, optimizer, _, _ = deepspeed.initialize(model=moe, ...)
-    """
-    
-    def __init__(self, config: ProductionMoEConfig):
-        super().__init__()
-        self.moe    = ProductionMoELayer(config)
-        self.config = config
-    
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, dict]:
-        return self.moe(x)
-
-
-# =============================================================================
-# PART 5: UTILITY FUNCTIONS
-# =============================================================================
-
-def create_deepspeed_config(
-    batch_size: int = 32,
-    gradient_accumulation_steps: int = 1,
-    fp16: bool = True,
-    expert_parallel_size: int = 8,
-) -> dict:
-    """Create DeepSpeed configuration for MoE training."""
-    return {
-        "train_batch_size": batch_size * gradient_accumulation_steps,
-        "gradient_accumulation_steps": gradient_accumulation_steps,
-        "fp16": {
-            "enabled": fp16,
-            "loss_scale": 0,
-            "initial_scale_power": 16,
-        },
-        "zero_optimization": {
-            "stage": 2,  # ZeRO-2 works well with MoE
-            "offload_optimizer": {"device": "cpu"},
-        },
-        "moe": {
-            "enabled": True,
-            "ep_size": expert_parallel_size,
-            "moe_param_group": True,
-        },
-        "activation_checkpointing": {
-            "partition_activations": True,
-            "cpu_checkpointing": True,
-        },
-    }
-
-
-def estimate_moe_memory(config: ProductionMoEConfig, batch_size: int, seq_len: int) -> dict:
-    """Estimate memory usage for MoE layer."""
-    # Parameter memory
-    expert_params = config.num_experts * (
-        config.embed_dim * config.ff_dim * 3  # wi_gate, wi_up, wo
-    )
-    router_params = config.embed_dim * config.num_experts
-    total_params = expert_params + router_params
-    
-    # Activation memory (per token)
-    tokens = batch_size * seq_len
-    capacity = int((tokens * config.top_k / config.num_experts) * config.capacity_factor)
-    
-    activation_mem = (
-        tokens * config.embed_dim +  # Input
-        config.num_experts * capacity * config.embed_dim +  # Dispatched
-        config.num_experts * capacity * config.ff_dim * 2 +  # Hidden (gate + up)
-        tokens * config.embed_dim  # Output
-    )
-    
-    bytes_per_param = 4  # float32
-    
-    return {
-        "parameters": total_params,
-        "param_memory_mb": total_params * bytes_per_param / 1e6,
-        "activation_memory_mb": activation_mem * bytes_per_param / 1e6,
-        "total_memory_mb": (total_params + activation_mem) * bytes_per_param / 1e6,
-        "params_per_gpu": total_params // config.expert_parallel_size if config.expert_parallel_size else total_params,
-    }
