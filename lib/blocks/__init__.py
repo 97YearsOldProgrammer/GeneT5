@@ -1,16 +1,12 @@
-from ._component import (
-    LayerNorm,
-    Encoder,
+from .encoder import (
+    Encoder
+)
+
+from .decoder import (
     Decoder
 )
 
-from ._transfer import (
-    dnabert2tobigbird
-)
-
 __all__ = [
-    "LayerNorm",
     "Encoder",
     "Decoder",
-    "dnabert2tobigbird"
 ]
