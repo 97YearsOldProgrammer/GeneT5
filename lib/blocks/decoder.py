@@ -3,7 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-from lib.blocks._component import BigBirdSparseAttention, LayerNorm, Attention, ALiBi
+from lib.blocks._component  import LayerNorm, Attention, FeedForward
+from lib.blocks._moe        import ProductionMoE, ProductionMoEConfig
 
 
 #################
@@ -26,13 +27,16 @@ class DecoderBlock(nn.Module):
         embed_dim, 
         num_heads, 
         ff_dim, 
-        dropout=0.0, 
-        attn_dropout=0.0, 
-        use_alibi=True,
-        use_moe=False,
-        num_experts=8,
-        moe_top_k=2,
-        moe_load_balance=0.01
+        dropout         =0.0, 
+        attn_dropout    =0.0, 
+        use_alibi       =True,
+        use_moe         =False,
+        num_experts     =8,
+        moe_top_k       =2,
+        moe_load_balance=0.01,
+        moe_router_z    =0.001,
+        use_triton      =True,
+        use_deepspeed   =False
     ):
         super().__init__()
         
@@ -62,14 +66,18 @@ class DecoderBlock(nn.Module):
         
         # Feed-forward: MoE or standard
         if use_moe:
-            self.ff = MoEFeedForward(
-                embed_dim=embed_dim,
-                ff_dim=ff_dim,
-                num_experts=num_experts,
-                top_k=moe_top_k,
-                dropout=dropout,
-                load_balance=moe_load_balance
+            moe_config = ProductionMoEConfig(
+                embed_dim               =embed_dim,
+                ff_dim                  =ff_dim,
+                num_experts             =num_experts,
+                top_k                   =moe_top_k,
+                dropout                 =dropout,
+                load_balance_weight     =moe_load_balance,
+                router_z_loss_weight    =moe_router_z,
+                use_triton              =use_triton,
+                use_deepspeed           =use_deepspeed
             )
+            self.ff = ProductionMoE(config=moe_config)
         else:
             self.ff = FeedForward(embed_dim, ff_dim, dropout)
         
@@ -100,8 +108,8 @@ class DecoderBlock(nn.Module):
         normed = self.norm3(hidden_states)
         
         if self.use_moe:
-            ff_output, moe_aux_loss = self.ff(normed)
-            hidden_states           = hidden_states + self.dropout(ff_output)
+            ff_output, moe_aux_loss, _ = self.ff(normed)
+            hidden_states               = hidden_states + self.dropout(ff_output)
             return hidden_states, position_bias, moe_aux_loss
         else:
             ff_output       = self.ff(normed)
@@ -124,7 +132,10 @@ class Decoder(nn.Module):
         use_moe         =True,
         num_experts     =8,
         moe_top_k       =2,
-        moe_load_balance=0.01
+        moe_load_balance=0.01,
+        moe_router_z    =0.001,
+        use_triton      =True,
+        use_deepspeed   =False
     ):
         super().__init__()
         
@@ -142,7 +153,10 @@ class Decoder(nn.Module):
                 use_moe             =use_moe,
                 num_experts         =num_experts,
                 moe_top_k           =moe_top_k,
-                moe_load_balance    =moe_load_balance
+                moe_load_balance    =moe_load_balance,
+                moe_router_z        =moe_router_z,
+                use_triton          =use_triton,
+                use_deepspeed       =use_deepspeed
             )
             for i in range(num_layers)
         ])
@@ -158,10 +172,10 @@ class Decoder(nn.Module):
         for layer in self.layers:
             result = layer(
                 hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                attention_mask=attention_mask,
-                encoder_attention_mask=encoder_attention_mask,
-                position_bias=position_bias
+                encoder_hidden_states   =encoder_hidden_states,
+                attention_mask          =attention_mask,
+                encoder_attention_mask  =encoder_attention_mask,
+                position_bias           =position_bias
             )
             
             if self.use_moe:
