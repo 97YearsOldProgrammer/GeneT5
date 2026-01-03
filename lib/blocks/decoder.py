@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import math
 
 from lib.blocks._component  import LayerNorm, Attention, FeedForward
-from lib.blocks._moe        import ProductionMoE, ProductionMoEConfig
+from lib.blocks.moe._moe_cuda        import ProductionMoE, ProductionMoEConfig
 
 
 #################

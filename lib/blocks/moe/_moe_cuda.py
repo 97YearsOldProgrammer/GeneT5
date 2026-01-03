@@ -36,183 +36,181 @@ try:
     TRITON_AVAILABLE = True
 except ImportError:
     TRITON_AVAILABLE = False
-    print("Triton not available. Install with: pip install triton")
+    raise RuntimeError("Triton required. Install with: pip install triton")
 
 
-if TRITON_AVAILABLE:
+@triton.jit
+def grouped_gemm_kernel(
+    # Pointers
+    X_ptr,
+    W_ptr,
+    Y_ptr,
+    expert_ids_ptr,
+    # Dimensions
+    total_tokens,
+    in_dim,
+    out_dim,
+    num_experts,
+    # Strides for X
+    stride_x_token,
+    stride_x_dim,
+    # Strides for W
+    stride_w_expert,
+    stride_w_out,
+    stride_w_in,
+    # Strides for Y
+    stride_y_token,
+    stride_y_dim,
+    # Block sizes
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Replace python loop of MoE:
+        for expert_idx in range(num_experts):
+            mask = (expert_indices == expert_idx)
+            output[mask] = x[mask] @ experts[expert_idx].weight.T
     
-    @triton.jit
-    def grouped_gemm_kernel(
-        # Pointers
-        X_ptr,
-        W_ptr,
-        Y_ptr,
-        expert_ids_ptr,
-        # Dimensions
-        total_tokens,
-        in_dim,
-        out_dim,
-        num_experts,
-        # Strides for X
-        stride_x_token,
-        stride_x_dim,
-        # Strides for W
-        stride_w_expert,
-        stride_w_out,
-        stride_w_in,
-        # Strides for Y
-        stride_y_token,
-        stride_y_dim,
-        # Block sizes
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-        BLOCK_K: tl.constexpr,
-    ):
-        """
-        Replace python loop of MoE:
-            for expert_idx in range(num_experts):
-                mask = (expert_indices == expert_idx)
-                output[mask] = x[mask] @ experts[expert_idx].weight.T
+    With a single kernel that:
+        output[i] = x[i] @ experts[expert_ids[i]].weight.T
+    """
+    pid_m       = tl.program_id(0)
+    pid_n       = tl.program_id(1)
+    
+    offs_m      = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n      = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k      = tl.arange(0, BLOCK_K)
+    
+    mask_m      = offs_m < total_tokens
+    mask_n      = offs_n < out_dim
+    
+    expert_ids  = tl.load(expert_ids_ptr + offs_m, mask=mask_m, other=0)
+    acc         = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    for k_start in range(0, in_dim, BLOCK_K):
+        k_offs  = k_start + offs_k
+        mask_k  = k_offs < in_dim
         
-        With a single kernel that:
-            output[i] = x[i] @ experts[expert_ids[i]].weight.T
-        """
-        pid_m       = tl.program_id(0)
-        pid_n       = tl.program_id(1)
+        x_ptrs  = X_ptr + offs_m[:, None] * stride_x_token + k_offs[None, :] * stride_x_dim
+        x_block = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
         
-        offs_m      = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_n      = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        offs_k      = tl.arange(0, BLOCK_K)
+        w_block = tl.load(
+            W_ptr + expert_ids[:, None] * stride_w_expert + 
+            offs_n[None, :] * stride_w_out + k_start * stride_w_in,
+            mask=mask_m[:, None] & mask_n[None, :],
+            other=0.0
+        )
         
-        mask_m      = offs_m < total_tokens
-        mask_n      = offs_n < out_dim
-        
-        expert_ids  = tl.load(expert_ids_ptr + offs_m, mask=mask_m, other=0)
-        acc         = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        
-        for k_start in range(0, in_dim, BLOCK_K):
-            k_offs  = k_start + offs_k
-            mask_k  = k_offs < in_dim
-            
-            x_ptrs  = X_ptr + offs_m[:, None] * stride_x_token + k_offs[None, :] * stride_x_dim
-            x_block = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
-            
-            w_block = tl.load(
-                W_ptr + expert_ids[:, None] * stride_w_expert + 
-                offs_n[None, :] * stride_w_out + k_start * stride_w_in,
-                mask=mask_m[:, None] & mask_n[None, :],
-                other=0.0
-            )
-            
-            for k_idx in range(BLOCK_K):
-                if k_start + k_idx < in_dim:
-                    x_col = tl.load(
-                        X_ptr + offs_m * stride_x_token + (k_start + k_idx) * stride_x_dim,
-                        mask=mask_m, other=0.0
-                    )
-                    w_row = tl.load(
-                        W_ptr + expert_ids * stride_w_expert + 
-                        offs_n[None, :] * stride_w_out + 
-                        (k_start + k_idx) * stride_w_in,
-                        mask=mask_m[:, None] & mask_n[None, :],
-                        other=0.0
-                    )
-                    acc += x_col[:, None] * w_row
-        
-        y_ptrs = Y_ptr + offs_m[:, None] * stride_y_token + offs_n[None, :] * stride_y_dim
-        tl.store(y_ptrs, acc, mask=mask_m[:, None] & mask_n[None, :])
+        for k_idx in range(BLOCK_K):
+            if k_start + k_idx < in_dim:
+                x_col = tl.load(
+                    X_ptr + offs_m * stride_x_token + (k_start + k_idx) * stride_x_dim,
+                    mask=mask_m, other=0.0
+                )
+                w_row = tl.load(
+                    W_ptr + expert_ids * stride_w_expert + 
+                    offs_n[None, :] * stride_w_out + 
+                    (k_start + k_idx) * stride_w_in,
+                    mask=mask_m[:, None] & mask_n[None, :],
+                    other=0.0
+                )
+                acc += x_col[:, None] * w_row
+    
+    y_ptrs = Y_ptr + offs_m[:, None] * stride_y_token + offs_n[None, :] * stride_y_dim
+    tl.store(y_ptrs, acc, mask=mask_m[:, None] & mask_n[None, :])
 
 
-    @triton.jit
-    def expert_position_kernel(
-        # Inputs
-        expert_ids_ptr,
-        # Outputs
-        positions_ptr,
-        expert_counts_ptr,
-        # Sizes
-        num_tokens,
-        num_experts,
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        """
-        Compute position of each token within its expert's buffer.
-        Uses atomic operations which results in non-deterministic ordering.
-        """
-        pid         = tl.program_id(0)
-        block_start = pid * BLOCK_SIZE
-        
-        for i in range(BLOCK_SIZE):
-            idx = block_start + i
-            if idx < num_tokens:
-                expert  = tl.load(expert_ids_ptr + idx)
-                pos     = tl.atomic_add(expert_counts_ptr + expert, 1)
-                tl.store(positions_ptr + idx, pos)
+@triton.jit
+def expert_position_kernel(
+    # Inputs
+    expert_ids_ptr,
+    # Outputs
+    positions_ptr,
+    expert_counts_ptr,
+    # Sizes
+    num_tokens,
+    num_experts,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Compute position of each token within its expert's buffer.
+    Uses atomic operations which results in non-deterministic ordering.
+    """
+    pid         = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    
+    for i in range(BLOCK_SIZE):
+        idx = block_start + i
+        if idx < num_tokens:
+            expert  = tl.load(expert_ids_ptr + idx)
+            pos     = tl.atomic_add(expert_counts_ptr + expert, 1)
+            tl.store(positions_ptr + idx, pos)
 
 
-    @triton.jit  
-    def fused_geglu_kernel_simple(
-        # Inputs
-        X_ptr,
-        W_gate_ptr,
-        W_up_ptr,
-        W_down_ptr,
-        expert_ids_ptr,
-        # Output
-        Y_ptr,
-        # Dimensions
-        num_tokens,
-        embed_dim,
-        ff_dim,
-        # Strides
-        stride_x_t, stride_x_d,
-        stride_wg_e, stride_wg_f, stride_wg_d,
-        stride_wu_e, stride_wu_f, stride_wu_d,
-        stride_wd_e, stride_wd_d, stride_wd_f,
-        stride_y_t, stride_y_d,
-        # Block sizes
-        BLOCK_F: tl.constexpr,
-        BLOCK_D: tl.constexpr,
-    ):
-        """
-        Fused GeGLU Expert Computation (one token per program):
-            hidden = SiLU(x @ W_gate.T) * (x @ W_up.T)
-            output = hidden @ W_down.T
-        """
-        token_id = tl.program_id(0)
+@triton.jit  
+def fused_geglu_kernel_simple(
+    # Inputs
+    X_ptr,
+    W_gate_ptr,
+    W_up_ptr,
+    W_down_ptr,
+    expert_ids_ptr,
+    # Output
+    Y_ptr,
+    # Dimensions
+    num_tokens,
+    embed_dim,
+    ff_dim,
+    # Strides
+    stride_x_t, stride_x_d,
+    stride_wg_e, stride_wg_f, stride_wg_d,
+    stride_wu_e, stride_wu_f, stride_wu_d,
+    stride_wd_e, stride_wd_d, stride_wd_f,
+    stride_y_t, stride_y_d,
+    # Block sizes
+    BLOCK_F: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """
+    Fused GeGLU Expert Computation (one token per program):
+        hidden = SiLU(x @ W_gate.T) * (x @ W_up.T)
+        output = hidden @ W_down.T
+    """
+    token_id = tl.program_id(0)
+    
+    if token_id >= num_tokens:
+        return
+    
+    expert_id   = tl.load(expert_ids_ptr + token_id)
+    pid_d       = tl.program_id(1)
+    offs_d      = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask_d      = offs_d < embed_dim
+    acc         = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    
+    for f_start in range(0, ff_dim, BLOCK_F):
+        offs_f  = f_start + tl.arange(0, BLOCK_F)
+        mask_f  = offs_f < ff_dim
+        gate    = tl.zeros((BLOCK_F,), dtype=tl.float32)
+        up      = tl.zeros((BLOCK_F,), dtype=tl.float32)
         
-        if token_id >= num_tokens:
-            return
-        
-        expert_id   = tl.load(expert_ids_ptr + token_id)
-        pid_d       = tl.program_id(1)
-        offs_d      = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
-        mask_d      = offs_d < embed_dim
-        acc         = tl.zeros((BLOCK_D,), dtype=tl.float32)
-        
-        for f_start in range(0, ff_dim, BLOCK_F):
-            offs_f  = f_start + tl.arange(0, BLOCK_F)
-            mask_f  = offs_f < ff_dim
-            gate    = tl.zeros((BLOCK_F,), dtype=tl.float32)
-            up      = tl.zeros((BLOCK_F,), dtype=tl.float32)
+        for d_idx in range(embed_dim):
+            x_val   = tl.load(X_ptr + token_id * stride_x_t + d_idx * stride_x_d)
+            wg_ptrs = W_gate_ptr + expert_id * stride_wg_e + offs_f * stride_wg_f + d_idx * stride_wg_d
+            wg_vals = tl.load(wg_ptrs, mask=mask_f, other=0.0)
+            gate    += x_val * wg_vals
             
-            for d_idx in range(embed_dim):
-                x_val   = tl.load(X_ptr + token_id * stride_x_t + d_idx * stride_x_d)
-                wg_ptrs = W_gate_ptr + expert_id * stride_wg_e + offs_f * stride_wg_f + d_idx * stride_wg_d
-                wg_vals = tl.load(wg_ptrs, mask=mask_f, other=0.0)
-                gate    += x_val * wg_vals
-                
-                wu_ptrs = W_up_ptr + expert_id * stride_wu_e + offs_f * stride_wu_f + d_idx * stride_wu_d
-                wu_vals = tl.load(wu_ptrs, mask=mask_f, other=0.0)
-                up      += x_val * wu_vals
-            
-            hidden  = gate * tl.sigmoid(gate) * up
-            wd_ptrs = W_down_ptr + expert_id * stride_wd_e + offs_d[:, None] * stride_wd_d + offs_f[None, :] * stride_wd_f
-            wd_vals = tl.load(wd_ptrs, mask=mask_d[:, None] & mask_f[None, :], other=0.0)
-            acc     += tl.sum(wd_vals * hidden[None, :], axis=1)
+            wu_ptrs = W_up_ptr + expert_id * stride_wu_e + offs_f * stride_wu_f + d_idx * stride_wu_d
+            wu_vals = tl.load(wu_ptrs, mask=mask_f, other=0.0)
+            up      += x_val * wu_vals
         
-        y_ptrs = Y_ptr + token_id * stride_y_t + offs_d * stride_y_d
-        tl.store(y_ptrs, acc, mask=mask_d)
+        hidden  = gate * tl.sigmoid(gate) * up
+        wd_ptrs = W_down_ptr + expert_id * stride_wd_e + offs_d[:, None] * stride_wd_d + offs_f[None, :] * stride_wd_f
+        wd_vals = tl.load(wd_ptrs, mask=mask_d[:, None] & mask_f[None, :], other=0.0)
+        acc     += tl.sum(wd_vals * hidden[None, :], axis=1)
+    
+    y_ptrs = Y_ptr + token_id * stride_y_t + offs_d * stride_y_d
+    tl.store(y_ptrs, acc, mask=mask_d)
 
 
 ###################
@@ -229,27 +227,23 @@ class TritonGroupedGEMM(torch.autograd.Function):
         num_experts, out_dim, _ = weight.shape
         output                  = torch.empty(num_tokens, out_dim, device=x.device, dtype=x.dtype)
         
-        if TRITON_AVAILABLE and x.is_cuda:
-            BLOCK_M = 32
-            BLOCK_N = 64
-            BLOCK_K = 32
-            
-            grid = (
-                triton.cdiv(num_tokens, BLOCK_M),
-                triton.cdiv(out_dim, BLOCK_N),
-            )
-            
-            grouped_gemm_kernel[grid](
-                x, weight, output, expert_ids,
-                num_tokens, in_dim, out_dim, num_experts,
-                x.stride(0), x.stride(1),
-                weight.stride(0), weight.stride(1), weight.stride(2),
-                output.stride(0), output.stride(1),
-                BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-            )
-        else:
-            selected_weights    = weight[expert_ids]
-            output              = torch.einsum('nd,nod->no', x, selected_weights)
+        BLOCK_M = 32
+        BLOCK_N = 64
+        BLOCK_K = 32
+        
+        grid = (
+            triton.cdiv(num_tokens, BLOCK_M),
+            triton.cdiv(out_dim, BLOCK_N),
+        )
+        
+        grouped_gemm_kernel[grid](
+            x, weight, output, expert_ids,
+            num_tokens, in_dim, out_dim, num_experts,
+            x.stride(0), x.stride(1),
+            weight.stride(0), weight.stride(1), weight.stride(2),
+            output.stride(0), output.stride(1),
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        )
         
         ctx.save_for_backward(x, weight, expert_ids)
         return output
@@ -290,29 +284,18 @@ class TritonExpertDispatch(nn.Module):
         capacity                = max(capacity, 1)
         device                  = x.device
         
-        if TRITON_AVAILABLE and x.is_cuda:
-            positions       = torch.zeros(num_tokens, dtype=torch.int32, device=device)
-            expert_counts   = torch.zeros(self.num_experts, dtype=torch.int32, device=device)
-            BLOCK_SIZE      = 256
-            grid            = (triton.cdiv(num_tokens, BLOCK_SIZE),)
-            
-            expert_position_kernel[grid](
-                expert_ids, positions, expert_counts,
-                num_tokens, self.num_experts,
-                BLOCK_SIZE=BLOCK_SIZE,
-            )
-            positions       = positions.long()
-            expert_counts   = expert_counts.long()
-        else:
-            expert_counts   = torch.bincount(expert_ids, minlength=self.num_experts)
-            sorted_indices  = torch.argsort(expert_ids)
-            sorted_experts  = expert_ids[sorted_indices]
-            cumsum          = torch.cumsum(expert_counts, dim=0)
-            starts          = torch.cat([torch.tensor([0], device=device), cumsum[:-1]])
-            positions       = torch.zeros(num_tokens, dtype=torch.long, device=device)
-            
-            for i, (idx, exp) in enumerate(zip(sorted_indices, sorted_experts)):
-                positions[idx] = i - starts[exp]
+        positions       = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+        expert_counts   = torch.zeros(self.num_experts, dtype=torch.int32, device=device)
+        BLOCK_SIZE      = 256
+        grid            = (triton.cdiv(num_tokens, BLOCK_SIZE),)
+        
+        expert_position_kernel[grid](
+            expert_ids, positions, expert_counts,
+            num_tokens, self.num_experts,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+        positions       = positions.long()
+        expert_counts   = expert_counts.long()
         
         valid_mask      = positions < capacity
         tokens_dropped  = (~valid_mask).sum().item()
@@ -353,7 +336,7 @@ try:
     DEEPSPEED_AVAILABLE = True
 except ImportError:
     DEEPSPEED_AVAILABLE = False
-    print("DeepSpeed not available. Install with: pip install deepspeed")
+    raise RuntimeError("DeepSpeed required. Install with: pip install deepspeed")
 
 
 @dataclass
@@ -474,10 +457,6 @@ class ProductionMoELayer(nn.Module):
             )
         elif self.use_triton:
             output, tokens_dropped = self._triton_forward(
-                x_flat, top_k_indices, top_k_probs
-            )
-        else:
-            output, tokens_dropped = self._pytorch_forward(
                 x_flat, top_k_indices, top_k_probs
             )
         
@@ -610,28 +589,6 @@ class ProductionMoELayer(nn.Module):
         
         output = torch.zeros_like(x_flat)
         output[sorted_indices] = result_tokens
-        
-        return output, 0
-    
-    def _pytorch_forward(self, x_flat, top_k_indices, top_k_probs):
-        """Fallback PyTorch forward without Triton/DeepSpeed"""
-        num_tokens, embed_dim   = x_flat.shape
-        output                  = torch.zeros_like(x_flat)
-        
-        for k in range(self.top_k):
-            expert_ids      = top_k_indices[:, k]
-            expert_weights  = top_k_probs[:, k:k+1]
-            
-            selected_wi_gate    = self.expert_wi_gate[expert_ids]
-            selected_wi_up      = self.expert_wi_up[expert_ids]
-            selected_wo         = self.expert_wo[expert_ids]
-            
-            gate        = F.silu(torch.einsum('nd,nfd->nf', x_flat, selected_wi_gate))
-            up          = torch.einsum('nd,nfd->nf', x_flat, selected_wi_up)
-            hidden      = self.dropout(gate * up)
-            expert_out  = torch.einsum('nf,ndf->nd', hidden, selected_wo)
-            
-            output += expert_weights * expert_out
         
         return output, 0
     
