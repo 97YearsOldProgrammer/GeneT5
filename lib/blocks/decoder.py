@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import math
 
 from lib.blocks._component  import LayerNorm, Attention, FeedForward
-from lib.blocks.moe._moe_cuda        import ProductionMoE, ProductionMoEConfig
+from lib.blocks._moe        import MoE, MoEConfig
 
 
 #################
@@ -13,14 +13,6 @@ from lib.blocks.moe._moe_cuda        import ProductionMoE, ProductionMoEConfig
 
 
 class DecoderBlock(nn.Module):
-    """
-    Decoder block with pre-norm architecture
-    
-    Structure:
-        - LayerNorm -> Causal Self-Attention -> Residual
-        - LayerNorm -> Cross-Attention -> Residual
-        - LayerNorm -> FeedForward/MoE -> Residual
-    """
     
     def __init__(
         self, 
@@ -35,14 +27,13 @@ class DecoderBlock(nn.Module):
         moe_top_k       =2,
         moe_load_balance=0.01,
         moe_router_z    =0.001,
-        use_triton      =True,
-        use_deepspeed   =False
+        use_deepspeed   =False,
+        force_backend   =None
     ):
         super().__init__()
         
         self.use_moe = use_moe
         
-        # Self-attention with ALiBi enabled
         self.self_attn = Attention(
             embed_dim           =embed_dim,
             num_heads           =num_heads,
@@ -53,7 +44,6 @@ class DecoderBlock(nn.Module):
         )
         self.norm1 = LayerNorm(embed_dim)
         
-        # Cross-attention to encoder
         self.cross_attn = Attention(
             embed_dim           =embed_dim,
             num_heads           =num_heads,
@@ -64,9 +54,8 @@ class DecoderBlock(nn.Module):
         )
         self.norm2 = LayerNorm(embed_dim)
         
-        # Feed-forward: MoE or standard
         if use_moe:
-            moe_config = ProductionMoEConfig(
+            moe_config = MoEConfig(
                 embed_dim               =embed_dim,
                 ff_dim                  =ff_dim,
                 num_experts             =num_experts,
@@ -74,10 +63,9 @@ class DecoderBlock(nn.Module):
                 dropout                 =dropout,
                 load_balance_weight     =moe_load_balance,
                 router_z_loss_weight    =moe_router_z,
-                use_triton              =use_triton,
                 use_deepspeed           =use_deepspeed
             )
-            self.ff = ProductionMoE(config=moe_config)
+            self.ff = MoE(config=moe_config, force_backend=force_backend)
         else:
             self.ff = FeedForward(embed_dim, ff_dim, dropout)
         
@@ -86,7 +74,6 @@ class DecoderBlock(nn.Module):
     
     def forward(self, hidden_states, encoder_hidden_states, attention_mask=None, encoder_attention_mask=None, position_bias=None):
         
-        # Self-attention
         normed = self.norm1(hidden_states)
         attn_output, position_bias = self.self_attn(
             normed,
@@ -95,7 +82,6 @@ class DecoderBlock(nn.Module):
         )
         hidden_states = hidden_states + self.dropout(attn_output)
         
-        # Cross-attention
         normed = self.norm2(hidden_states)
         cross_output, _ = self.cross_attn(
             normed,
@@ -104,12 +90,11 @@ class DecoderBlock(nn.Module):
         )
         hidden_states = hidden_states + self.dropout(cross_output)
         
-        # Feed-forward
         normed = self.norm3(hidden_states)
         
         if self.use_moe:
-            ff_output, moe_aux_loss, _ = self.ff(normed)
-            hidden_states               = hidden_states + self.dropout(ff_output)
+            ff_output, moe_aux_loss = self.ff(normed)
+            hidden_states           = hidden_states + self.dropout(ff_output)
             return hidden_states, position_bias, moe_aux_loss
         else:
             ff_output       = self.ff(normed)
@@ -118,7 +103,6 @@ class DecoderBlock(nn.Module):
 
 
 class Decoder(nn.Module):
-    """Decoder stack with ALiBi position bias and optional MoE"""
     
     def __init__(
         self, 
@@ -134,8 +118,8 @@ class Decoder(nn.Module):
         moe_top_k       =2,
         moe_load_balance=0.01,
         moe_router_z    =0.001,
-        use_triton      =True,
-        use_deepspeed   =False
+        use_deepspeed   =False,
+        force_backend   =None
     ):
         super().__init__()
         
@@ -155,8 +139,8 @@ class Decoder(nn.Module):
                 moe_top_k           =moe_top_k,
                 moe_load_balance    =moe_load_balance,
                 moe_router_z        =moe_router_z,
-                use_triton          =use_triton,
-                use_deepspeed       =use_deepspeed
+                use_deepspeed       =use_deepspeed,
+                force_backend       =force_backend
             )
             for i in range(num_layers)
         ])
