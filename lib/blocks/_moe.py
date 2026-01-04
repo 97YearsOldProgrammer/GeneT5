@@ -22,7 +22,6 @@ except ImportError:
 
 try:
     import deepspeed
-    from deepspeed.moe.layer import MoE as DeepSpeedMoE
     DEEPSPEED_AVAILABLE = True
 except ImportError:
     DEEPSPEED_AVAILABLE = False
@@ -77,20 +76,20 @@ class MoE(nn.Module):
 
 @dataclass
 class MoEConfig:
-    embed_dim:              int   = 768
-    ff_dim:                 int   = 3072
-    num_experts:            int   = 8
-    top_k:                  int   = 2
-    dropout:                float = 0.0
-    capacity_factor:        float = 1.25
-    eval_capacity_factor:   float = 2.0
-    aux_loss_weight:        float = 0.01
-    load_balance_weight:    float = 0.01
-    router_z_loss_weight:   float = 0.001
-    activation:             str   = 'silu'
-    use_deepspeed:          bool  = False
-    expert_parallel_size:   Optional[int] = None
-    num_local_experts:      Optional[int] = None
+    embed_dim:            int            = 768
+    ff_dim:               int            = 3072
+    num_experts:          int            = 8
+    top_k:                int            = 2
+    dropout:              float          = 0.0
+    capacity_factor:      float          = 1.25
+    eval_capacity_factor: float          = 2.0
+    aux_loss_weight:      float          = 0.01
+    load_balance_weight:  float          = 0.01
+    router_z_loss_weight: float          = 0.001
+    activation:           str            = 'silu'
+    use_deepspeed:        bool           = False
+    expert_parallel_size: Optional[int]  = None
+    num_local_experts:    Optional[int]  = None
 
 
 ##################
@@ -234,14 +233,14 @@ if TRITON_AVAILABLE:
         
         def __init__(self, num_experts, capacity_factor=1.25):
             super().__init__()
-            self.num_experts        = num_experts
-            self.capacity_factor    = capacity_factor
+            self.num_experts     = num_experts
+            self.capacity_factor = capacity_factor
         
         def forward(self, x, expert_ids, expert_weights):
-            num_tokens, embed_dim   = x.shape
-            capacity                = int((num_tokens / self.num_experts) * self.capacity_factor)
-            capacity                = max(capacity, 1)
-            device                  = x.device
+            num_tokens, embed_dim = x.shape
+            capacity              = int((num_tokens / self.num_experts) * self.capacity_factor)
+            capacity              = max(capacity, 1)
+            device                = x.device
             
             positions       = torch.zeros(num_tokens, dtype=torch.int32, device=device)
             expert_counts   = torch.zeros(self.num_experts, dtype=torch.int32, device=device)
@@ -376,7 +375,10 @@ class MPSMoEBackend(nn.Module):
         total_slots = self.num_experts * capacity
         total_k     = num_tokens * self.top_k
         
-        if self._last_capacity != capacity or self._dispatch_buffer is None:
+        if (self._dispatch_buffer is None or 
+            self._dispatch_buffer.shape[0] != total_slots or
+            self._combine_buffer.shape[0] != total_k):
+            
             self._dispatch_buffer = torch.zeros(
                 total_slots, self.embed_dim, device=device, dtype=dtype
             )
@@ -459,12 +461,12 @@ if TRITON_AVAILABLE:
             self.router_z_weight     = config.router_z_loss_weight
             
             if dist.is_initialized():
-                world_size                  = dist.get_world_size()
-                self.expert_parallel_size   = config.expert_parallel_size or world_size
-                self.num_local_experts      = config.num_experts // self.expert_parallel_size
+                world_size                = dist.get_world_size()
+                self.expert_parallel_size = config.expert_parallel_size or world_size
+                self.num_local_experts    = config.num_experts // self.expert_parallel_size
             else:
-                self.expert_parallel_size   = 1
-                self.num_local_experts      = config.num_experts
+                self.expert_parallel_size = 1
+                self.num_local_experts    = config.num_experts
             
             self.gate = nn.Linear(config.embed_dim, config.num_experts, bias=False)
             
@@ -506,13 +508,20 @@ if TRITON_AVAILABLE:
                 ranks             = list(range(dist.get_world_size()))
                 self.expert_group = dist.new_group(ranks)
         
+        def __del__(self):
+            if hasattr(self, 'expert_group') and self.expert_group is not None:
+                try:
+                    dist.destroy_process_group(self.expert_group)
+                except:
+                    pass
+        
         def forward(self, x):
-            batch_size, seq_len, embed_dim  = x.shape
-            num_tokens                      = batch_size * seq_len
-            x_flat                          = x.view(num_tokens, embed_dim)
+            batch_size, seq_len, embed_dim = x.shape
+            num_tokens                     = batch_size * seq_len
+            x_flat                         = x.view(num_tokens, embed_dim)
             
-            router_logits   = self.gate(x_flat)
-            router_probs    = F.softmax(router_logits, dim=-1)
+            router_logits = self.gate(x_flat)
+            router_probs  = F.softmax(router_logits, dim=-1)
             
             top_k_probs, top_k_indices = torch.topk(router_probs, self.top_k, dim=-1)
             top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
@@ -526,26 +535,19 @@ if TRITON_AVAILABLE:
                     x_flat, top_k_indices, top_k_probs
                 )
             
-            output      = output.view(batch_size, seq_len, embed_dim)
-            aux_loss    = self._compute_aux_loss(router_logits, router_probs, top_k_indices)
-            
-            metadata = {
-                'tokens_dropped': tokens_dropped,
-                'expert_counts': torch.bincount(
-                    top_k_indices.flatten(), minlength=self.num_experts
-                ).tolist(),
-            }
+            output   = output.view(batch_size, seq_len, embed_dim)
+            aux_loss = self._compute_aux_loss(router_logits, router_probs, top_k_indices)
             
             return output, aux_loss
         
         def _triton_forward(self, x_flat, top_k_indices, top_k_probs):
-            num_tokens, embed_dim   = x_flat.shape
-            output                  = torch.zeros_like(x_flat)
-            total_dropped           = 0
+            num_tokens, embed_dim = x_flat.shape
+            output                = torch.zeros_like(x_flat)
+            total_dropped         = 0
             
             for k in range(self.top_k):
-                expert_ids      = top_k_indices[:, k]
-                expert_weights  = top_k_probs[:, k]
+                expert_ids     = top_k_indices[:, k]
+                expert_weights = top_k_probs[:, k]
                 
                 dispatched_x, combine_weights, token_indices, dropped = \
                     self.dispatcher(x_flat, expert_ids, expert_weights)
@@ -579,21 +581,21 @@ if TRITON_AVAILABLE:
                 ).view(self.num_experts, -1, embed_dim)
                 
                 for e in range(self.num_experts):
-                    valid_mask      = token_indices[e] >= 0
-                    valid_tokens    = token_indices[e][valid_mask]
-                    valid_weights   = combine_weights[e][valid_mask].unsqueeze(-1)
-                    valid_outputs   = expert_out[e, :valid_mask.sum()]
+                    valid_mask    = token_indices[e] >= 0
+                    valid_tokens  = token_indices[e][valid_mask]
+                    valid_weights = combine_weights[e][valid_mask].unsqueeze(-1)
+                    valid_outputs = expert_out[e, :valid_mask.sum()]
                     
                     output.index_add_(0, valid_tokens, valid_outputs * valid_weights)
             
             return output, total_dropped
         
         def _deepspeed_forward(self, x_flat, top_k_indices, top_k_probs):
-            num_tokens, embed_dim   = x_flat.shape
-            rank                    = dist.get_rank()
-            world_size              = dist.get_world_size()
-            device                  = x_flat.device
-            dtype                   = x_flat.dtype
+            num_tokens, embed_dim = x_flat.shape
+            rank                  = dist.get_rank()
+            world_size            = dist.get_world_size()
+            device                = x_flat.device
+            dtype                 = x_flat.dtype
             
             expert_to_rank  = torch.arange(self.num_experts, device=device) % world_size
             primary_experts = top_k_indices[:, 0]
@@ -606,14 +608,14 @@ if TRITON_AVAILABLE:
             recv_counts = torch.zeros(world_size, dtype=torch.long, device=device)
             dist.all_to_all_single(recv_counts, send_counts, group=self.expert_group)
             
-            sorted_indices  = torch.argsort(dest_ranks)
-            sorted_tokens   = x_flat[sorted_indices]
-            sorted_probs    = top_k_probs[sorted_indices, 0]
-            sorted_experts  = primary_experts[sorted_indices]
+            sorted_indices = torch.argsort(dest_ranks)
+            sorted_tokens  = x_flat[sorted_indices]
+            sorted_probs   = top_k_probs[sorted_indices, 0]
+            sorted_experts = primary_experts[sorted_indices]
             
-            total_recv  = recv_counts.sum().item()
-            recv_tokens = torch.zeros(total_recv, embed_dim, dtype=dtype, device=device)
-            recv_probs  = torch.zeros(total_recv, dtype=dtype, device=device)
+            total_recv   = recv_counts.sum().item()
+            recv_tokens  = torch.zeros(total_recv, embed_dim, dtype=dtype, device=device)
+            recv_probs   = torch.zeros(total_recv, dtype=dtype, device=device)
             recv_experts = torch.zeros(total_recv, dtype=torch.long, device=device)
             
             send_splits = send_counts.tolist()
@@ -624,8 +626,8 @@ if TRITON_AVAILABLE:
             dist.all_to_all(recv_token_list, send_token_list, group=self.expert_group)
             recv_tokens = torch.cat(recv_token_list, dim=0) if total_recv > 0 else recv_tokens
             
-            send_prob_list  = list(sorted_probs.split(send_splits))
-            recv_prob_list  = [torch.zeros(s, dtype=dtype, device=device) for s in recv_splits]
+            send_prob_list = list(sorted_probs.split(send_splits))
+            recv_prob_list = [torch.zeros(s, dtype=dtype, device=device) for s in recv_splits]
             dist.all_to_all(recv_prob_list, send_prob_list, group=self.expert_group)
             recv_probs = torch.cat(recv_prob_list, dim=0) if total_recv > 0 else recv_probs
             
@@ -634,16 +636,16 @@ if TRITON_AVAILABLE:
             dist.all_to_all(recv_expert_list, send_expert_list, group=self.expert_group)
             recv_experts = torch.cat(recv_expert_list, dim=0) if total_recv > 0 else recv_experts
             
-            local_expert_start  = rank * self.num_local_experts
-            local_expert_end    = local_expert_start + self.num_local_experts
-            processed_tokens    = torch.zeros_like(recv_tokens)
+            local_expert_start = rank * self.num_local_experts
+            local_expert_end   = local_expert_start + self.num_local_experts
+            processed_tokens   = torch.zeros_like(recv_tokens)
             
             for local_idx, expert in enumerate(self.experts):
                 global_expert_id = local_expert_start + local_idx
                 mask = recv_experts == global_expert_id
                 if mask.any():
-                    expert_input    = recv_tokens[mask]
-                    expert_output   = expert(expert_input)
+                    expert_input           = recv_tokens[mask]
+                    expert_output          = expert(expert_input)
                     processed_tokens[mask] = expert_output * recv_probs[mask].unsqueeze(-1)
             
             send_result_list = list(processed_tokens.split(recv_splits))
@@ -665,7 +667,6 @@ if TRITON_AVAILABLE:
             P           = router_probs.mean(dim=0)
             
             load_balance_loss = self.num_experts * (f * P).sum()
-            z_loss = torch.logsumexp(router_logits, dim=-1).square().mean()
+            z_loss            = torch.logsumexp(router_logits, dim=-1).square().mean()
             
-            return (self.load_balance_weight * load_balance_loss +
-                    self.router_z_weight * z_loss)
+            return self.load_balance_weight * load_balance_loss + self.router_z_weight * z_loss
