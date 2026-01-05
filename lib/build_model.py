@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import json
@@ -29,7 +28,7 @@ def build_gt5(
     Build GeneT5 from DNABERT-2 and save clean checkpoint.
     
     Weight Transfer:
-        Encoder Self-Attention  -> COPY from DNABERT-2
+        Encoder Self-Attention  -> COPY from DNABERT-2 (unzip fused Wqkv)
         Decoder Self-Attention  -> COPY from Encoder
         Cross-Attention         -> RANDOM INIT
         Layer Norms             -> COPY
@@ -83,29 +82,87 @@ def build_gt5(
     
     # Transfer Encoder Weights
     print("\n[3] Transferring Encoder Weights from DNABERT-2")
-    original_layers = original_model.bert.encoder.layer
+    original_layers = original_model.encoder.layer
     
     for idx, (orig, new) in enumerate(zip(original_layers, encoder.layers)):
         orig_attn = orig.attention.self
-        new_attn  = new.self_attn
+        new_attn  = new.self_attn.attention  # Access nested attention module
         
-        # Q, K, V, O
-        new_attn.q.weight.data.copy_(orig_attn.query.weight.data)
-        new_attn.k.weight.data.copy_(orig_attn.key.weight.data)
-        new_attn.v.weight.data.copy_(orig_attn.value.weight.data)
+        # === UNZIP FUSED Wqkv ===
+        if hasattr(orig_attn, 'Wqkv'):
+            # DNABERT-2 uses fused QKV projection
+            Wqkv_weight = orig_attn.Wqkv.weight.data  # Shape: (3*hidden, hidden)
+            
+            # Split into Q, K, V chunks along dimension 0
+            q_weight, k_weight, v_weight = Wqkv_weight.chunk(3, dim=0)
+            
+            # Copy to separate Q, K, V layers
+            new_attn.q.weight.data.copy_(q_weight)
+            new_attn.k.weight.data.copy_(k_weight)
+            new_attn.v.weight.data.copy_(v_weight)
+            
+            # Handle biases if they exist
+            if hasattr(orig_attn.Wqkv, 'bias') and orig_attn.Wqkv.bias is not None:
+                Wqkv_bias = orig_attn.Wqkv.bias.data
+                q_bias, k_bias, v_bias = Wqkv_bias.chunk(3, dim=0)
+                
+                # Check if new attention has biases
+                if new_attn.q.bias is not None:
+                    new_attn.q.bias.data.copy_(q_bias)
+                    new_attn.k.bias.data.copy_(k_bias)
+                    new_attn.v.bias.data.copy_(v_bias)
+        
+        else:
+            # Fallback: Standard BERT with separate query/key/value
+            new_attn.q.weight.data.copy_(orig_attn.query.weight.data)
+            new_attn.k.weight.data.copy_(orig_attn.key.weight.data)
+            new_attn.v.weight.data.copy_(orig_attn.value.weight.data)
+            
+            if orig_attn.query.bias is not None and new_attn.q.bias is not None:
+                new_attn.q.bias.data.copy_(orig_attn.query.bias.data)
+                new_attn.k.bias.data.copy_(orig_attn.key.bias.data)
+                new_attn.v.bias.data.copy_(orig_attn.value.bias.data)
+        
+        # Copy output projection
         new_attn.o.weight.data.copy_(orig.attention.output.dense.weight.data)
+        if hasattr(orig.attention.output.dense, 'bias') and orig.attention.output.dense.bias is not None:
+            if new_attn.o.bias is not None:
+                new_attn.o.bias.data.copy_(orig.attention.output.dense.bias.data)
         
-        # Layer norm
+        # Copy layer norm after attention
         new.norm1.weight.data.copy_(orig.attention.output.LayerNorm.weight.data)
+        if hasattr(orig.attention.output.LayerNorm, 'bias') and orig.attention.output.LayerNorm.bias is not None:
+            if hasattr(new.norm1, 'bias') and new.norm1.bias is not None:
+                new.norm1.bias.data.copy_(orig.attention.output.LayerNorm.bias.data)
         
-        # FFN
+        # Copy FFN weights
         new.ff.wi_0.weight.data.copy_(orig.intermediate.dense.weight.data)
         new.ff.wi_1.weight.data.copy_(orig.intermediate.dense.weight.data)
         new.ff.wo.weight.data.copy_(orig.output.dense.weight.data)
+        
+        # Copy biases for FFN if they exist
+        if hasattr(orig.intermediate.dense, 'bias') and orig.intermediate.dense.bias is not None:
+            if hasattr(new.ff.wi_0, 'bias') and new.ff.wi_0.bias is not None:
+                new.ff.wi_0.bias.data.copy_(orig.intermediate.dense.bias.data)
+                new.ff.wi_1.bias.data.copy_(orig.intermediate.dense.bias.data)
+        
+        if hasattr(orig.output.dense, 'bias') and orig.output.dense.bias is not None:
+            if hasattr(new.ff.wo, 'bias') and new.ff.wo.bias is not None:
+                new.ff.wo.bias.data.copy_(orig.output.dense.bias.data)
+        
+        # Copy layer norm after FFN
         new.norm2.weight.data.copy_(orig.output.LayerNorm.weight.data)
+        if hasattr(orig.output.LayerNorm, 'bias') and orig.output.LayerNorm.bias is not None:
+            if hasattr(new.norm2, 'bias') and new.norm2.bias is not None:
+                new.norm2.bias.data.copy_(orig.output.LayerNorm.bias.data)
     
-    encoder.final_norm.weight.data.copy_(original_model.bert.encoder.LayerNorm.weight.data)
-    print("    ✓ Encoder weights copied")
+    # Copy final encoder norm
+    encoder.final_norm.weight.data.copy_(original_model.encoder.LayerNorm.weight.data)
+    if hasattr(original_model.encoder.LayerNorm, 'bias') and original_model.encoder.LayerNorm.bias is not None:
+        if hasattr(encoder.final_norm, 'bias') and encoder.final_norm.bias is not None:
+            encoder.final_norm.bias.data.copy_(original_model.encoder.LayerNorm.bias.data)
+    
+    print("    ✓ Encoder weights copied (Wqkv unzipped successfully)")
     
     # Build Decoder
     print(f"\n[4] Building Decoder (layers={decoder_num_layers}, moe={decoder_use_moe})")
@@ -127,7 +184,7 @@ def build_gt5(
     num_copy = min(decoder_num_layers, len(encoder.layers))
     
     for idx in range(num_copy):
-        enc_attn = encoder.layers[idx].self_attn
+        enc_attn = encoder.layers[idx].self_attn.attention
         dec_attn = decoder.layers[idx].self_attn
         
         dec_attn.q.weight.data.copy_(enc_attn.q.weight.data)
@@ -135,7 +192,19 @@ def build_gt5(
         dec_attn.v.weight.data.copy_(enc_attn.v.weight.data)
         dec_attn.o.weight.data.copy_(enc_attn.o.weight.data)
         
+        # Copy biases if they exist
+        if enc_attn.q.bias is not None and dec_attn.q.bias is not None:
+            dec_attn.q.bias.data.copy_(enc_attn.q.bias.data)
+            dec_attn.k.bias.data.copy_(enc_attn.k.bias.data)
+            dec_attn.v.bias.data.copy_(enc_attn.v.bias.data)
+        
+        if enc_attn.o.bias is not None and dec_attn.o.bias is not None:
+            dec_attn.o.bias.data.copy_(enc_attn.o.bias.data)
+        
         decoder.layers[idx].norm1.weight.data.copy_(encoder.layers[idx].norm1.weight.data)
+        if hasattr(encoder.layers[idx].norm1, 'bias') and encoder.layers[idx].norm1.bias is not None:
+            if hasattr(decoder.layers[idx].norm1, 'bias') and decoder.layers[idx].norm1.bias is not None:
+                decoder.layers[idx].norm1.bias.data.copy_(encoder.layers[idx].norm1.bias.data)
     
     print(f"    ✓ Copied {num_copy} layers")
     
@@ -147,6 +216,17 @@ def build_gt5(
         nn.init.xavier_uniform_(layer.cross_attn.v.weight)
         nn.init.xavier_uniform_(layer.cross_attn.o.weight)
         nn.init.ones_(layer.norm2.weight)
+        
+        # Initialize biases if they exist
+        if layer.cross_attn.q.bias is not None:
+            nn.init.zeros_(layer.cross_attn.q.bias)
+            nn.init.zeros_(layer.cross_attn.k.bias)
+            nn.init.zeros_(layer.cross_attn.v.bias)
+        if layer.cross_attn.o.bias is not None:
+            nn.init.zeros_(layer.cross_attn.o.bias)
+        if hasattr(layer.norm2, 'bias') and layer.norm2.bias is not None:
+            nn.init.zeros_(layer.norm2.bias)
+    
     print("    ✓ Cross-attention initialized")
     
     # Random Init Decoder FFN (or MoE)
@@ -160,6 +240,11 @@ def build_gt5(
                         nn.init.xavier_uniform_(expert.wi_0.weight)
                         nn.init.xavier_uniform_(expert.wi_1.weight)
                         nn.init.xavier_uniform_(expert.wo.weight)
+                        if expert.wi_0.bias is not None:
+                            nn.init.zeros_(expert.wi_0.bias)
+                            nn.init.zeros_(expert.wi_1.bias)
+                        if expert.wo.bias is not None:
+                            nn.init.zeros_(expert.wo.bias)
             if hasattr(layer.ff, 'router'):
                 nn.init.xavier_uniform_(layer.ff.router.weight)
         else:
@@ -167,8 +252,20 @@ def build_gt5(
                 nn.init.xavier_uniform_(layer.ff.wi_0.weight)
                 nn.init.xavier_uniform_(layer.ff.wi_1.weight)
                 nn.init.xavier_uniform_(layer.ff.wo.weight)
+                if layer.ff.wi_0.bias is not None:
+                    nn.init.zeros_(layer.ff.wi_0.bias)
+                    nn.init.zeros_(layer.ff.wi_1.bias)
+                if layer.ff.wo.bias is not None:
+                    nn.init.zeros_(layer.ff.wo.bias)
+        
         nn.init.ones_(layer.norm3.weight)
+        if hasattr(layer.norm3, 'bias') and layer.norm3.bias is not None:
+            nn.init.zeros_(layer.norm3.bias)
+    
     nn.init.ones_(decoder.final_norm.weight)
+    if hasattr(decoder.final_norm, 'bias') and decoder.final_norm.bias is not None:
+        nn.init.zeros_(decoder.final_norm.bias)
+    
     print("    ✓ FFN initialized")
     
     # Build Embeddings and LM Head

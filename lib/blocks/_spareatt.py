@@ -11,14 +11,14 @@ from dataclasses import dataclass
 class SparseAttentionConfig:
     """Configuration for BigBird sparse attention"""
     
-    embed_dim           = 768
-    num_heads           = 12
-    block_size          = 64
-    window_size         = 256           # Local window (tokens, not blocks)
-    num_global_tokens   = 64            # Global tokens at start
-    num_random_blocks   = 3             # Random blocks per query block
-    dropout             = 0.0
-    use_alibi           = True
+    embed_dim:          int     = 768
+    num_heads:          int     = 12
+    block_size:         int     = 64
+    window_size:        int     = 256       # Local window (tokens, not blocks)
+    num_global_tokens:  int     = 64        # Global tokens at start
+    num_random_blocks:  int     = 3         # Random blocks per query block
+    dropout:            float   = 0.0
+    use_alibi:          bool    = True
 
 
 ##############################

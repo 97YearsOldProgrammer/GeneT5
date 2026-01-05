@@ -22,7 +22,7 @@ parser.add_argument("--tie_weights", action="store_true", default=True,
     help="Tie input/output embeddings.")
 parser.add_argument("--no_tie_weights", action="store_false", dest="tie_weights",
     help="Do not tie input/output embeddings.")
-parser.add_argument("--use_moe", action="store_true", 
+parser.add_argument("--use_moe", action="store_true", default=True,
     help="Enable Mixture of Experts in Decoder.")
 parser.add_argument("--num_experts", type=int, default=8, 
     help="Number of experts for MoE.")

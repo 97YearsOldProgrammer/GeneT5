@@ -48,6 +48,18 @@ conda install -c conda-forge einops
 
 ### Dependencies
 
+The first part of getting the nn is copying weights and biases from the pre-trarined model. For achieving that, the CUDA environment is required for accessing the triton packages to get weights and biases from DNABERT-v2 through hugging faces. Here is a full backing receipe for Windows user.  
+
+```powershell
+wsl --install -d Ubuntu
+```
+
+And then register an account. 
+
+```wsl
+pip install torch transformers einops triton
+```
+
 The software require pytorch to build building blocks of nn.
 
 ```zsh
