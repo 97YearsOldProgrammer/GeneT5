@@ -36,6 +36,12 @@ While getting the Pre-trained understanding about Genomic Sequnece. We shall kee
 | **Layer Norms**             | **Copy**        | Keeps the math stable from the start.
 | **Output Head**             | **Copy/Init**   | Usually initialized from the Input Embeddings (Shared).
 
+For initializing the model, downloading weights and biases from the DNABERT, the eniops packages are required for processing the model.   
+
+```zsh
+conda install -c conda-forge einops
+```
+
 
 ---
 
