@@ -19,8 +19,8 @@ def build_gt5(
     decoder_dropout     = 0.1,
     decoder_use_alibi   = True,
     decoder_use_moe     = False,
-    decoder_num_experts = 8,
-    decoder_moe_top_k   = 2,
+    decoder_num_experts = 1,      # Changed: Start with 1 expert (sparse upcycling)
+    decoder_moe_top_k   = 1,      # Changed: top_k=1 when num_experts=1
     vocab_size          = 4096,
     tie_weights         = True
 ):
@@ -28,7 +28,7 @@ def build_gt5(
     Build GeneT5 from DNABERT-2 and save clean checkpoint.
     
     Weight Transfer:
-        Encoder Self-Attention  -> COPY from DNABERT-2 (unzip fused Wqkv)
+        Encoder Self-Attention  -> COPY from DNABERT-2
         Decoder Self-Attention  -> COPY from Encoder
         Cross-Attention         -> RANDOM INIT
         Layer Norms             -> COPY
@@ -82,87 +82,160 @@ def build_gt5(
     
     # Transfer Encoder Weights
     print("\n[3] Transferring Encoder Weights from DNABERT-2")
-    original_layers = original_model.encoder.layer
+    
+    # DNABERT-2's AutoModel returns BertModel directly (no .bert wrapper)
+    # Could be original_model.encoder or original_model.bert.encoder depending on version
+    if hasattr(original_model, 'bert'):
+        bert = original_model.bert
+    else:
+        bert = original_model
+    
+    original_layers = bert.encoder.layer
+    
+    # Debug: print layer 0 structure
+    layer0 = original_layers[0]
+    print(f"    DNABERT-2 Layer Structure:")
+    print(f"      Attention: {'Wqkv (fused)' if hasattr(layer0.attention.self, 'Wqkv') else 'Q/K/V (separate)'}")
+    print(f"      FFN: {'mlp' if hasattr(layer0, 'mlp') else 'intermediate/output'}")
+    if hasattr(layer0, 'mlp'):
+        mlp = layer0.mlp
+        print(f"      MLP attrs: {[n for n,_ in mlp.named_children()]}")
+        if hasattr(mlp, 'gated_layers'):
+            print(f"      gated_layers shape: {mlp.gated_layers.weight.shape}")
+        if hasattr(mlp, 'wo'):
+            print(f"      wo shape: {mlp.wo.weight.shape}")
+        if hasattr(mlp, 'fc1'):
+            print(f"      fc1 shape: {mlp.fc1.weight.shape}")
+        if hasattr(mlp, 'fc2'):
+            print(f"      fc2 shape: {mlp.fc2.weight.shape}")
     
     for idx, (orig, new) in enumerate(zip(original_layers, encoder.layers)):
         orig_attn = orig.attention.self
-        new_attn  = new.self_attn.attention  # Access nested attention module
         
-        # === UNZIP FUSED Wqkv ===
+        # Your SparseAttention is a wrapper - actual Q/K/V are in .attention
+        if hasattr(new.self_attn, 'attention'):
+            new_attn = new.self_attn.attention  # TritonSparseAttention or FlexAttentionSparse
+        else:
+            new_attn = new.self_attn
+        
+        # DNABERT-2 uses Flash Attention with fused Wqkv projection
+        # BertUnpadSelfAttention stores Q,K,V in a single fused tensor: Wqkv
+        # Shape: (3 * hidden_size, hidden_size) - Q, K, V stacked along dim 0
         if hasattr(orig_attn, 'Wqkv'):
-            # DNABERT-2 uses fused QKV projection
-            Wqkv_weight = orig_attn.Wqkv.weight.data  # Shape: (3*hidden, hidden)
+            # Fused QKV projection - split into separate Q, K, V
+            Wqkv = orig_attn.Wqkv.weight.data  # (3*H, H)
+            hidden_size = Wqkv.shape[1]
+            q_weight, k_weight, v_weight = Wqkv.chunk(3, dim=0)
             
-            # Split into Q, K, V chunks along dimension 0
-            q_weight, k_weight, v_weight = Wqkv_weight.chunk(3, dim=0)
-            
-            # Copy to separate Q, K, V layers
             new_attn.q.weight.data.copy_(q_weight)
             new_attn.k.weight.data.copy_(k_weight)
             new_attn.v.weight.data.copy_(v_weight)
             
-            # Handle biases if they exist
-            if hasattr(orig_attn.Wqkv, 'bias') and orig_attn.Wqkv.bias is not None:
-                Wqkv_bias = orig_attn.Wqkv.bias.data
-                q_bias, k_bias, v_bias = Wqkv_bias.chunk(3, dim=0)
-                
-                # Check if new attention has biases
-                if new_attn.q.bias is not None:
+            # Handle bias if present
+            if orig_attn.Wqkv.bias is not None:
+                q_bias, k_bias, v_bias = orig_attn.Wqkv.bias.data.chunk(3, dim=0)
+                if hasattr(new_attn.q, 'bias') and new_attn.q.bias is not None:
                     new_attn.q.bias.data.copy_(q_bias)
                     new_attn.k.bias.data.copy_(k_bias)
                     new_attn.v.bias.data.copy_(v_bias)
-        
         else:
-            # Fallback: Standard BERT with separate query/key/value
+            # Standard BERT with separate Q, K, V (fallback for other models)
             new_attn.q.weight.data.copy_(orig_attn.query.weight.data)
             new_attn.k.weight.data.copy_(orig_attn.key.weight.data)
             new_attn.v.weight.data.copy_(orig_attn.value.weight.data)
-            
-            if orig_attn.query.bias is not None and new_attn.q.bias is not None:
-                new_attn.q.bias.data.copy_(orig_attn.query.bias.data)
-                new_attn.k.bias.data.copy_(orig_attn.key.bias.data)
-                new_attn.v.bias.data.copy_(orig_attn.value.bias.data)
         
-        # Copy output projection
+        # Output projection - same structure in both Flash and standard
         new_attn.o.weight.data.copy_(orig.attention.output.dense.weight.data)
-        if hasattr(orig.attention.output.dense, 'bias') and orig.attention.output.dense.bias is not None:
-            if new_attn.o.bias is not None:
-                new_attn.o.bias.data.copy_(orig.attention.output.dense.bias.data)
         
-        # Copy layer norm after attention
+        # Layer norm after attention
         new.norm1.weight.data.copy_(orig.attention.output.LayerNorm.weight.data)
-        if hasattr(orig.attention.output.LayerNorm, 'bias') and orig.attention.output.LayerNorm.bias is not None:
-            if hasattr(new.norm1, 'bias') and new.norm1.bias is not None:
-                new.norm1.bias.data.copy_(orig.attention.output.LayerNorm.bias.data)
         
-        # Copy FFN weights
-        new.ff.wi_0.weight.data.copy_(orig.intermediate.dense.weight.data)
-        new.ff.wi_1.weight.data.copy_(orig.intermediate.dense.weight.data)
-        new.ff.wo.weight.data.copy_(orig.output.dense.weight.data)
-        
-        # Copy biases for FFN if they exist
-        if hasattr(orig.intermediate.dense, 'bias') and orig.intermediate.dense.bias is not None:
-            if hasattr(new.ff.wi_0, 'bias') and new.ff.wi_0.bias is not None:
-                new.ff.wi_0.bias.data.copy_(orig.intermediate.dense.bias.data)
-                new.ff.wi_1.bias.data.copy_(orig.intermediate.dense.bias.data)
-        
-        if hasattr(orig.output.dense, 'bias') and orig.output.dense.bias is not None:
-            if hasattr(new.ff.wo, 'bias') and new.ff.wo.bias is not None:
-                new.ff.wo.bias.data.copy_(orig.output.dense.bias.data)
-        
-        # Copy layer norm after FFN
-        new.norm2.weight.data.copy_(orig.output.LayerNorm.weight.data)
-        if hasattr(orig.output.LayerNorm, 'bias') and orig.output.LayerNorm.bias is not None:
-            if hasattr(new.norm2, 'bias') and new.norm2.bias is not None:
-                new.norm2.bias.data.copy_(orig.output.LayerNorm.bias.data)
+        # FFN - DNABERT-2 uses mlp with potentially fused gated projections
+        # Standard BERT: intermediate.dense -> output.dense
+        # DNABERT-2 Flash: mlp.fc1 (or Wi) -> mlp.fc2 (or Wo), possibly gated
+        if hasattr(orig, 'mlp'):
+            mlp = orig.mlp
+            
+            # DNABERT-2 uses gated_layers (fused gate+up) + wo structure
+            if hasattr(mlp, 'gated_layers') and hasattr(mlp, 'wo'):
+                # gated_layers is fused: (2 * ff_dim, hidden_size) -> split into gate & up
+                gated_weight = mlp.gated_layers.weight.data  # (2*ff_dim, hidden)
+                gate_weight, up_weight = gated_weight.chunk(2, dim=0)
+                
+                new.ff.wi_0.weight.data.copy_(gate_weight)
+                new.ff.wi_1.weight.data.copy_(up_weight)
+                new.ff.wo.weight.data.copy_(mlp.wo.weight.data)
+                
+                # LayerNorm inside MLP
+                if hasattr(mlp, 'layernorm'):
+                    new.norm2.weight.data.copy_(mlp.layernorm.weight.data)
+                else:
+                    nn.init.ones_(new.norm2.weight)
+                    
+            # Check for gated linear unit (GLU) style - fc1 might be fused gate+up
+            elif hasattr(mlp, 'fc1') and hasattr(mlp, 'fc2'):
+                fc1_weight = mlp.fc1.weight.data  # Could be (2*ff_dim, hidden) for GLU
+                fc2_weight = mlp.fc2.weight.data  # (hidden, ff_dim)
+                
+                # Check if fc1 is fused gate+up (GLU style)
+                if fc1_weight.shape[0] == 2 * fc2_weight.shape[1]:
+                    # Fused: split into gate and up projections
+                    ff_dim = fc1_weight.shape[0] // 2
+                    gate_weight, up_weight = fc1_weight.chunk(2, dim=0)
+                    new.ff.wi_0.weight.data.copy_(gate_weight)
+                    new.ff.wi_1.weight.data.copy_(up_weight)
+                else:
+                    # Not fused - use same weights for both (standard FFN)
+                    new.ff.wi_0.weight.data.copy_(fc1_weight)
+                    new.ff.wi_1.weight.data.copy_(fc1_weight)
+                
+                new.ff.wo.weight.data.copy_(fc2_weight)
+                
+                # MLP layer norm
+                if hasattr(orig, 'norm2'):
+                    new.norm2.weight.data.copy_(orig.norm2.weight.data)
+                else:
+                    nn.init.ones_(new.norm2.weight)
+                    
+            elif hasattr(mlp, 'Wi') and hasattr(mlp, 'Wo'):
+                # Alternative naming convention
+                new.ff.wi_0.weight.data.copy_(mlp.Wi.weight.data)
+                new.ff.wi_1.weight.data.copy_(mlp.Wi.weight.data)
+                new.ff.wo.weight.data.copy_(mlp.Wo.weight.data)
+                nn.init.ones_(new.norm2.weight)
+            else:
+                print(f"    WARNING: Unknown MLP structure in layer {idx}, using random init")
+                nn.init.xavier_uniform_(new.ff.wi_0.weight)
+                nn.init.xavier_uniform_(new.ff.wi_1.weight)
+                nn.init.xavier_uniform_(new.ff.wo.weight)
+                nn.init.ones_(new.norm2.weight)
+        else:
+            # Standard BERT structure (fallback)
+            new.ff.wi_0.weight.data.copy_(orig.intermediate.dense.weight.data)
+            new.ff.wi_1.weight.data.copy_(orig.intermediate.dense.weight.data)
+            new.ff.wo.weight.data.copy_(orig.output.dense.weight.data)
+            new.norm2.weight.data.copy_(orig.output.LayerNorm.weight.data)
     
-    # Copy final encoder norm
-    encoder.final_norm.weight.data.copy_(original_model.encoder.LayerNorm.weight.data)
-    if hasattr(original_model.encoder.LayerNorm, 'bias') and original_model.encoder.LayerNorm.bias is not None:
-        if hasattr(encoder.final_norm, 'bias') and encoder.final_norm.bias is not None:
-            encoder.final_norm.bias.data.copy_(original_model.encoder.LayerNorm.bias.data)
+    # Final encoder layer norm
+    if hasattr(bert.encoder, 'LayerNorm'):
+        encoder.final_norm.weight.data.copy_(bert.encoder.LayerNorm.weight.data)
+    elif hasattr(bert, 'LayerNorm'):
+        encoder.final_norm.weight.data.copy_(bert.LayerNorm.weight.data)
+    else:
+        # No final LN found, init to ones
+        nn.init.ones_(encoder.final_norm.weight)
+    print("    ✓ Encoder weights copied")
     
-    print("    ✓ Encoder weights copied (Wqkv unzipped successfully)")
+    # CRITICAL: Free DNABERT memory BEFORE building decoder
+    print("    Freeing DNABERT memory...")
+    del original_model
+    del bert
+    del original_layers
+    del layer0
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     # Build Decoder
     print(f"\n[4] Building Decoder (layers={decoder_num_layers}, moe={decoder_use_moe})")
@@ -184,7 +257,13 @@ def build_gt5(
     num_copy = min(decoder_num_layers, len(encoder.layers))
     
     for idx in range(num_copy):
-        enc_attn = encoder.layers[idx].self_attn.attention
+        # Encoder uses SparseAttention wrapper - actual weights in .attention
+        if hasattr(encoder.layers[idx].self_attn, 'attention'):
+            enc_attn = encoder.layers[idx].self_attn.attention
+        else:
+            enc_attn = encoder.layers[idx].self_attn
+        
+        # Decoder uses standard Attention (no wrapper)
         dec_attn = decoder.layers[idx].self_attn
         
         dec_attn.q.weight.data.copy_(enc_attn.q.weight.data)
@@ -192,19 +271,7 @@ def build_gt5(
         dec_attn.v.weight.data.copy_(enc_attn.v.weight.data)
         dec_attn.o.weight.data.copy_(enc_attn.o.weight.data)
         
-        # Copy biases if they exist
-        if enc_attn.q.bias is not None and dec_attn.q.bias is not None:
-            dec_attn.q.bias.data.copy_(enc_attn.q.bias.data)
-            dec_attn.k.bias.data.copy_(enc_attn.k.bias.data)
-            dec_attn.v.bias.data.copy_(enc_attn.v.bias.data)
-        
-        if enc_attn.o.bias is not None and dec_attn.o.bias is not None:
-            dec_attn.o.bias.data.copy_(enc_attn.o.bias.data)
-        
         decoder.layers[idx].norm1.weight.data.copy_(encoder.layers[idx].norm1.weight.data)
-        if hasattr(encoder.layers[idx].norm1, 'bias') and encoder.layers[idx].norm1.bias is not None:
-            if hasattr(decoder.layers[idx].norm1, 'bias') and decoder.layers[idx].norm1.bias is not None:
-                decoder.layers[idx].norm1.bias.data.copy_(encoder.layers[idx].norm1.bias.data)
     
     print(f"    ✓ Copied {num_copy} layers")
     
@@ -216,17 +283,6 @@ def build_gt5(
         nn.init.xavier_uniform_(layer.cross_attn.v.weight)
         nn.init.xavier_uniform_(layer.cross_attn.o.weight)
         nn.init.ones_(layer.norm2.weight)
-        
-        # Initialize biases if they exist
-        if layer.cross_attn.q.bias is not None:
-            nn.init.zeros_(layer.cross_attn.q.bias)
-            nn.init.zeros_(layer.cross_attn.k.bias)
-            nn.init.zeros_(layer.cross_attn.v.bias)
-        if layer.cross_attn.o.bias is not None:
-            nn.init.zeros_(layer.cross_attn.o.bias)
-        if hasattr(layer.norm2, 'bias') and layer.norm2.bias is not None:
-            nn.init.zeros_(layer.norm2.bias)
-    
     print("    ✓ Cross-attention initialized")
     
     # Random Init Decoder FFN (or MoE)
@@ -240,11 +296,6 @@ def build_gt5(
                         nn.init.xavier_uniform_(expert.wi_0.weight)
                         nn.init.xavier_uniform_(expert.wi_1.weight)
                         nn.init.xavier_uniform_(expert.wo.weight)
-                        if expert.wi_0.bias is not None:
-                            nn.init.zeros_(expert.wi_0.bias)
-                            nn.init.zeros_(expert.wi_1.bias)
-                        if expert.wo.bias is not None:
-                            nn.init.zeros_(expert.wo.bias)
             if hasattr(layer.ff, 'router'):
                 nn.init.xavier_uniform_(layer.ff.router.weight)
         else:
@@ -252,20 +303,8 @@ def build_gt5(
                 nn.init.xavier_uniform_(layer.ff.wi_0.weight)
                 nn.init.xavier_uniform_(layer.ff.wi_1.weight)
                 nn.init.xavier_uniform_(layer.ff.wo.weight)
-                if layer.ff.wi_0.bias is not None:
-                    nn.init.zeros_(layer.ff.wi_0.bias)
-                    nn.init.zeros_(layer.ff.wi_1.bias)
-                if layer.ff.wo.bias is not None:
-                    nn.init.zeros_(layer.ff.wo.bias)
-        
         nn.init.ones_(layer.norm3.weight)
-        if hasattr(layer.norm3, 'bias') and layer.norm3.bias is not None:
-            nn.init.zeros_(layer.norm3.bias)
-    
     nn.init.ones_(decoder.final_norm.weight)
-    if hasattr(decoder.final_norm, 'bias') and decoder.final_norm.bias is not None:
-        nn.init.zeros_(decoder.final_norm.bias)
-    
     print("    ✓ FFN initialized")
     
     # Build Embeddings and LM Head

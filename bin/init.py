@@ -1,4 +1,3 @@
-
 import argparse
 import sys
 from pathlib import Path
@@ -22,12 +21,12 @@ parser.add_argument("--tie_weights", action="store_true", default=True,
     help="Tie input/output embeddings.")
 parser.add_argument("--no_tie_weights", action="store_false", dest="tie_weights",
     help="Do not tie input/output embeddings.")
-parser.add_argument("--use_moe", action="store_true", default=True,
+parser.add_argument("--use_moe", action="store_true",
     help="Enable Mixture of Experts in Decoder.")
-parser.add_argument("--num_experts", type=int, default=8, 
-    help="Number of experts for MoE.")
-parser.add_argument("--moe_top_k", type=int, default=2, 
-    help="Top-K routing for MoE.")
+parser.add_argument("--num_experts", type=int, default=1,   # Changed from 8 to 1
+    help="Number of experts for MoE. Start with 1 for sparse upcycling.")
+parser.add_argument("--moe_top_k", type=int, default=1,     # Changed from 2 to 1
+    help="Top-K routing for MoE. Use 1 when num_experts=1.")
 args = parser.parse_args()
 
 # Visual separator
