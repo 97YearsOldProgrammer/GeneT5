@@ -12,11 +12,9 @@ args = parser.parse_args()
 # Special Tokens
 # Original DNABERT-v2 have already contain following tokens
 # [UNK] [CLS] [SEP] [PAD] [MASK]
+# [CLS] --> [bos]
+# [SEP] --> [eos]
 
-SPECIAL_TOKENS = [
-    "[bos]",            # Beginning of Sentence
-    "[eos]",            # End of Sentence
-]
 
 # Type Tokens
 TYPE_TOKENS = [
