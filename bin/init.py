@@ -9,8 +9,12 @@ parser.add_argument("--save_dir", type=str, default="./checkpoints/genet5_init",
     help="Directory to save the initialized model weights and config.")
 parser.add_argument("--dnabert_path", type=str, default="zhihan1996/DNABERT-2-117M",
     help="HuggingFace model ID or local path to DNABERT-2.")
-parser.add_argument("--vocab_size", type=int, default=4096, 
-    help="Vocabulary size.")
+parser.add_argument("--vocab_size", type=int, default=None, 
+    help="Vocabulary size. If None, auto-detect from tokenizer.")
+parser.add_argument("--new_tokens", type=str, nargs="*", default=None,
+    help="New tokens to add to tokenizer.")
+parser.add_argument("--new_tokens_file", type=str, default=None,
+    help="Path to file containing new tokens (one per line).")
 parser.add_argument("--block_size", type=int, default=64, 
     help="Block size for BigBird sparse attention.")
 parser.add_argument("--decoder_layers", type=int, default=None, 
@@ -23,11 +27,18 @@ parser.add_argument("--no_tie_weights", action="store_false", dest="tie_weights"
     help="Do not tie input/output embeddings.")
 parser.add_argument("--use_moe", action="store_true",
     help="Enable Mixture of Experts in Decoder.")
-parser.add_argument("--num_experts", type=int, default=1,   # Changed from 8 to 1
+parser.add_argument("--num_experts", type=int, default=1,
     help="Number of experts for MoE. Start with 1 for sparse upcycling.")
-parser.add_argument("--moe_top_k", type=int, default=1,     # Changed from 2 to 1
+parser.add_argument("--moe_top_k", type=int, default=1,
     help="Top-K routing for MoE. Use 1 when num_experts=1.")
 args = parser.parse_args()
+
+# Load tokens from file if provided
+new_tokens_list = args.new_tokens or []
+if args.new_tokens_file:
+    with open(args.new_tokens_file, "r") as f:
+        file_tokens = [line.strip() for line in f if line.strip()]
+    new_tokens_list.extend(file_tokens)
 
 # Visual separator
 print(f"\n{' GeneT5 Initialization ':=^60}")
@@ -43,7 +54,8 @@ saved_path = build_gt5(
         decoder_num_experts = args.num_experts,
         decoder_moe_top_k   = args.moe_top_k,
         vocab_size          = args.vocab_size,
-        tie_weights         = args.tie_weights
+        tie_weights         = args.tie_weights,
+        new_tokens_list     = new_tokens_list if new_tokens_list else None
     )
         
 print(f"\nSUCCESS: Model initialized and saved to:")

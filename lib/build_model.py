@@ -19,10 +19,11 @@ def build_gt5(
     decoder_dropout     = 0.1,
     decoder_use_alibi   = True,
     decoder_use_moe     = False,
-    decoder_num_experts = 1,      # Changed: Start with 1 expert (sparse upcycling)
-    decoder_moe_top_k   = 1,      # Changed: top_k=1 when num_experts=1
-    vocab_size          = 4096,
-    tie_weights         = True
+    decoder_num_experts = 1,
+    decoder_moe_top_k   = 1,
+    vocab_size          = None,
+    tie_weights         = True,
+    new_tokens_list     = None
 ):
     """
     Build GeneT5 from DNABERT-2 and save clean checkpoint.
@@ -42,6 +43,20 @@ def build_gt5(
     # Load Pre-trained Model
     print(f"\n[1] Loading DNABERT-2: {dnabert_model_name}")
     tokenizer      = AutoTokenizer.from_pretrained(dnabert_model_name, trust_remote_code=True)
+    
+    # Expand Tokenizer
+    if new_tokens_list:
+        print(f"\n[1.5] Expanding Tokenizer")
+        print(f"      Original vocab size: {len(tokenizer)}")
+        num_added = tokenizer.add_tokens(new_tokens_list)
+        print(f"      Tokens added: {num_added}")
+        print(f"      New vocab size: {len(tokenizer)}")
+    
+    # Auto-detect vocab size from tokenizer if not specified
+    if vocab_size is None:
+        vocab_size = len(tokenizer)
+        print(f"      Using vocab_size: {vocab_size}")
+    
     original_model = AutoModel.from_pretrained(dnabert_model_name, trust_remote_code=True)
     dna_config     = original_model.config
     
@@ -361,12 +376,11 @@ def build_gt5(
     torch.save(checkpoint, save_path / "pytorch_model.bin")
     print("    ✓ pytorch_model.bin saved")
     
-    # Save tokenizer
+    # Save tokenizer (includes new tokens if added)
     tokenizer.save_pretrained(save_path)
     print("    ✓ tokenizer saved")
     
     # Cleanup
-    del original_model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     
