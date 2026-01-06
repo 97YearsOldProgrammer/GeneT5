@@ -46,6 +46,23 @@ conda install -c conda-forge einops
 ---
 
 
+### Expanding the Tokenizer
+
+The tokenizer from the DNABERT model is not enough for our purpose. Since that was only trained for understanding the relationship of raw DNA Sequences. That satisfied the need of a encoder but not the decoder. For our purpose, we need to append more tokens to the original DNABERT-v2 tokenizer for further fine-tuning. A special case of tokenizer is the type of gene that we want the encoder-decoder capable of predicting. As colelcted from gff file of model species from prokaryotics and eukaryotics. The expansion of type tokens would be below:  
+
+```
+mobile_genetic_element
+origin_of_replication
+
+ncRNA
+rRNA
+tRNA    
+```
+
+
+---
+
+
 ### Dependencies
 
 The first part of getting the nn is copying weights and biases from the pre-trarined model. For achieving that, the CUDA environment is required for accessing the triton packages to get weights and biases from DNABERT-v2 through hugging faces. Here is a full backing receipe for Windows user.  
@@ -86,6 +103,9 @@ For parallelism training, we need optimizer packages DeepSpeed.
 ```zsh
 conda install -c conda-forge deepspeed
 ```
+
+
+---
 
 
 ### Trainning nn

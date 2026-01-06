@@ -4,7 +4,9 @@ from pathlib import Path
 
 from lib.build_model import build_gt5
 
-parser = argparse.ArgumentParser(description="Initialize GeneT5 weights from DNABERT-2 and save to disk.")
+
+parser = argparse.ArgumentParser(
+    description="Initialize GeneT5 weights from DNABERT-2 and save to disk.")
 parser.add_argument("--save_dir", type=str, default="./checkpoints/genet5_init", 
     help="Directory to save the initialized model weights and config.")
 parser.add_argument("--dnabert_path", type=str, default="zhihan1996/DNABERT-2-117M",
@@ -32,6 +34,7 @@ parser.add_argument("--num_experts", type=int, default=1,
 parser.add_argument("--moe_top_k", type=int, default=1,
     help="Top-K routing for MoE. Use 1 when num_experts=1.")
 args = parser.parse_args()
+
 
 # Load tokens from file if provided
 new_tokens_list = args.new_tokens or []
