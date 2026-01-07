@@ -10,5 +10,4 @@
 __pycache__/
 
 # ignore all trainning files
-*.txt
 *.bin

@@ -6,35 +6,26 @@ import json
 from lib import tuning
 
 parser = argparse.ArgumentParser(
-    description="Parse GFF3/FASTA for GeneT5 fine-tuning tasks."
-)
-
-parser.add_argument("--fasta", type=str, required=True,
+    description="Parse GFF3/FASTA for GeneT5 fine-tuning tasks.")
+parser.add_argument("fasta", type=str,
     help="Path to FASTA file (can be multi-chromosome).")
-parser.add_argument("--gff", type=str, required=True,
+parser.add_argument("gff", type=str,
     help="Path to GFF3 annotation file.")
 parser.add_argument("--output_dir", type=str, default="./data/processed",
     help="Output directory for processed datasets.")
-
-# Task selection
 parser.add_argument("--task", type=str, default="both",
     choices=["gene", "rna", "both"],
     help="Which task to prepare: gene prediction, rna classification, or both.")
-
-# Gene prediction options
 parser.add_argument("--window_size", type=int, default=None,
     help="Window size for sliding window (None for full sequence).")
 parser.add_argument("--stride", type=int, default=None,
     help="Stride for sliding window (default: window_size).")
-parser.add_argument("--gene_token", type=str, default="[GENE]",
+parser.add_argument("--gene_token", type=str, default="[ATT]",
     help="Special token for gene prediction task.")
-
-# RNA classification options
 parser.add_argument("--cls_token", type=str, default="[CLS]",
     help="Classification token for RNA task.")
 parser.add_argument("--context_pad", type=int, default=50,
     help="Context padding around RNA features (bp).")
-
 args = parser.parse_args()
 
 

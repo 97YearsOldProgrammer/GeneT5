@@ -1,0 +1,8 @@
+{
+  "ncrna": 0,
+  "trna": 1,
+  "rrna": 2,
+  "tmrna": 3,
+  "srna": 4,
+  "misc_rna": 5
+}

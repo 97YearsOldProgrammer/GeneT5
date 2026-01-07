@@ -261,12 +261,17 @@ def create_gene_prediction_dataset(sequences, features_by_seqid,
 
 
 RNA_CLASSES = {
-    "ncrna":    0,
-    "trna":     1,
-    "rrna":     2,
-    "tmrna":    3,
-    "srna":     4,
-    "misc_rna": 5,
+    "pseudogene":   0,
+    "ncrna":        1,
+    "trna":         2,
+    "rrna":         3,
+    "tmrna":        4,
+    "srna":         5,
+    "misc_rna":     6,
+      
+    # Prokaryotic
+    "origin_of_replication":  7,
+    "mobile_genetic_element": 8,
 }
 
 def extract_rna_features(features):

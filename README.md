@@ -59,6 +59,10 @@ rRNA
 tRNA    
 ```
 
+Run the following cmd to get new tokens that would be append into the original tokenizer. 
+```python3
+python3 bin/tokenizer.py --output ./data/new_tokens.txt
+```
 
 ---
 
