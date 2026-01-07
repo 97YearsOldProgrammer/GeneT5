@@ -1,3 +1,25 @@
+# macOS System Files
+.DS_Store
+.AppleDouble
+.LSOverride
+**/._*
+
+# Python / Pylance
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# VS Code / Pylance Workspace Settings
+.vscode/
+
+
+
+
+
 # ignore all decompressed fasta and gff file
 *.fa
 *.fasta
@@ -8,6 +30,3 @@
 # ignore all pycache
 *.pyc
 __pycache__/
-
-# ignore all trainning files
-*.bin

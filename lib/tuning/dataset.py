@@ -1,16 +1,9 @@
-"""
-PyTorch Dataset classes for GeneT5 fine-tuning tasks.
-"""
 
 import torch
 from torch.utils.data import Dataset
 
-from parser import load_dataset
+from ._parser import load_dataset
 
-
-# =============================================================================
-# Dataset Classes
-# =============================================================================
 
 class GenePredictionDataset(Dataset):
     """Dataset for gene prediction (seq2seq) task."""
@@ -27,25 +20,22 @@ class GenePredictionDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
         
-        # Tokenize input
         input_enc = self.tokenizer(
             sample["input"],
-            max_length      = self.max_input_len,
-            padding         = "max_length",
-            truncation      = True,
-            return_tensors  = "pt",
+            max_length     = self.max_input_len,
+            padding        = "max_length",
+            truncation     = True,
+            return_tensors = "pt",
         )
         
-        # Tokenize target
         target_enc = self.tokenizer(
             sample["target"],
-            max_length      = self.max_target_len,
-            padding         = "max_length",
-            truncation      = True,
-            return_tensors  = "pt",
+            max_length     = self.max_target_len,
+            padding        = "max_length",
+            truncation     = True,
+            return_tensors = "pt",
         )
         
-        # Labels: -100 for padding tokens
         labels = target_enc["input_ids"].squeeze()
         labels[labels == self.tokenizer.pad_token_id] = -100
         
@@ -72,10 +62,10 @@ class RNAClassificationDataset(Dataset):
         
         encoding = self.tokenizer(
             sample["input"],
-            max_length      = self.max_len,
-            padding         = "max_length",
-            truncation      = True,
-            return_tensors  = "pt",
+            max_length     = self.max_len,
+            padding        = "max_length",
+            truncation     = True,
+            return_tensors = "pt",
         )
         
         return {
