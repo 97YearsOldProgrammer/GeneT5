@@ -375,6 +375,8 @@ RNA_CLASSES = {
     "srna":             5,
     "misc_rna":         6,
     "antisense_rna":    7,
+    "rnase_p_rna":      8,
+    "srp_rna":          9,
     
     # prokaryotic
     "origin_of_replication":  7,
