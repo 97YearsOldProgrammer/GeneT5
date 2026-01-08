@@ -367,14 +367,15 @@ def format_stripped_gff_raw(features):
 
 
 RNA_CLASSES = {
-    "pseudogene":   0,
-    "ncrna":        1,
-    "trna":         2,
-    "rrna":         3,
-    "tmrna":        4,
-    "srna":         5,
-    "misc_rna":     6,
-      
+    "pseudogene":       0,
+    "ncrna":            1,
+    "trna":             2,
+    "rrna":             3,
+    "tmrma":            4,
+    "srna":             5,
+    "misc_rna":         6,
+    "antisense_rna":    7,
+    
     # prokaryotic
     "origin_of_replication":  7,
     "mobile_genetic_element": 8,
