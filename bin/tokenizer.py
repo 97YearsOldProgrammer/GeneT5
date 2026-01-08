@@ -39,7 +39,7 @@ TYPE_TOKENS = [
     "tRNA",             # Transfer   RNA
 ]
 
-# Task Specific tokens
+# Task Specific Tokens
 TASK_TOKENS = [
     "[ATT]",            # Annotation
     "[generate]",
@@ -48,12 +48,19 @@ TASK_TOKENS = [
 # Strand tokens
 STRAND_TOKENS = ["+", "-"]
 
+# Text Specific Tokens
+TEXT_TOKENS = [
+    "\t",
+    "\n",
+]
+
 # Build token list
 tokens = []
 tokens.extend(SPECIAL_TOKENS)
 tokens.extend(TYPE_TOKENS)
 tokens.extend(TASK_TOKENS)
 tokens.extend(STRAND_TOKENS)
+tokens.extend(TEXT_TOKENS)
 
 # Add integer tokens (0-999)
 for i in range(1000):
