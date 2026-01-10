@@ -106,10 +106,10 @@ While getting the Pre-trained understanding about Genomic Sequnece. We shall kee
 The cmd to run this is following 
 
 ```python3
-
+python3 bin/init.py --save_dir ../../../e/model/ --new_tokens_file ./data/new_tokens.txt
 ```
 
-To run this script, it kinda required approximately 30GB ram for running this init script.   ~~~~
+To run this script, it kinda required approximately 7GB ram to run this script. So ideally this should be enough to run on a 16RAM labtop.     
 
 
 ---
