@@ -37,12 +37,18 @@ TYPE_TOKENS = [
     "ncRNA",            # Non-coding RNA
     "rRNA",             # Ribosomal  RNA
     "tRNA",             # Transfer   RNA
+    "tmRNA",
+    "sRNA",
+    "misc_RNA",
+    "antisense_RNA",
+    "rnase_p_RNA",
+    "srp_RNA",
 ]
 
 # Task Specific Tokens
 TASK_TOKENS = [
     "[ATT]",            # Annotation
-    "[generate]",
+    "[HIT]",            # Hints for Annotation 
 ]
 
 # Strand tokens

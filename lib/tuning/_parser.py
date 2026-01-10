@@ -371,7 +371,7 @@ RNA_CLASSES = {
     "ncrna":            1,
     "trna":             2,
     "rrna":             3,
-    "tmrma":            4,
+    "tmrna":            4,
     "srna":             5,
     "misc_rna":         6,
     "antisense_rna":    7,
