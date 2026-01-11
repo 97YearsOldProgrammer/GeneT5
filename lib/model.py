@@ -42,6 +42,10 @@ class GeneT5(nn.Module):
         self.embed_dim  = embed_dim
         self.vocab_size = vocab_size
         
+        # Encoder embedding (CRITICAL: Encoder expects hidden_states, not input_ids)
+        self.encoder_embed         = nn.Embedding(vocab_size, embed_dim)
+        self.encoder_embed_dropout = nn.Dropout(decoder_dropout)
+        
         # Encoder
         self.encoder = Encoder(
             num_layers         = encoder_num_layers,
@@ -70,7 +74,7 @@ class GeneT5(nn.Module):
             moe_top_k        = decoder_moe_top_k
         )
         
-        # Embeddings
+        # Decoder embeddings
         self.decoder_embed         = nn.Embedding(vocab_size, embed_dim)
         self.decoder_embed_dropout = nn.Dropout(decoder_dropout)
         
@@ -80,6 +84,29 @@ class GeneT5(nn.Module):
         # Weight tying
         if tie_weights:
             self.lm_head.weight = self.decoder_embed.weight
+    
+    def encode(self, encoder_input_ids, encoder_attention_mask=None):
+        """
+        Encode input sequence.
+        
+        Args:
+            encoder_input_ids:      (B, src_len) input token IDs
+            encoder_attention_mask: (B, src_len) attention mask
+        
+        Returns:
+            encoder_hidden_states: (B, src_len, embed_dim)
+        """
+        # Embed encoder inputs
+        encoder_embeds = self.encoder_embed(encoder_input_ids)
+        encoder_embeds = self.encoder_embed_dropout(encoder_embeds)
+        
+        # Pass through encoder
+        encoder_hidden = self.encoder(
+            encoder_embeds,
+            attention_mask=encoder_attention_mask
+        )
+        
+        return encoder_hidden
     
     def forward(
         self,
@@ -110,9 +137,9 @@ class GeneT5(nn.Module):
         """
         # Encode (or use cached)
         if encoder_hidden_states is None:
-            encoder_hidden_states = self.encoder(
+            encoder_hidden_states = self.encode(
                 encoder_input_ids,
-                attention_mask = encoder_attention_mask
+                encoder_attention_mask
             )
         
         # Embed decoder inputs
@@ -120,13 +147,11 @@ class GeneT5(nn.Module):
         decoder_embeds = self.decoder_embed_dropout(decoder_embeds)
         
         # Decode
-        decoder_output, moe_loss, new_cache = self.decoder(
+        decoder_output, moe_loss = self.decoder(
             hidden_states          = decoder_embeds,
             encoder_hidden_states  = encoder_hidden_states,
             attention_mask         = decoder_attention_mask,
             encoder_attention_mask = encoder_attention_mask,
-            past_key_values        = past_key_values,
-            use_cache              = use_cache
         )
         
         # Project to vocab
@@ -148,7 +173,7 @@ class GeneT5(nn.Module):
         }
         
         if use_cache:
-            outputs["past_key_values"] = new_cache
+            outputs["past_key_values"] = None  # TODO: implement KV cache
         
         return outputs
     
@@ -166,7 +191,7 @@ class GeneT5(nn.Module):
         pad_token_id           = 0
     ):
         """
-        Autoregressive generation with KV-cache
+        Autoregressive generation
         
         Args:
             encoder_input_ids:      (B, src_len)
@@ -187,34 +212,24 @@ class GeneT5(nn.Module):
         batch  = encoder_input_ids.size(0)
         
         # Encode once
-        encoder_hidden = self.encoder(
+        encoder_hidden = self.encode(
             encoder_input_ids,
-            attention_mask = encoder_attention_mask
+            encoder_attention_mask
         )
         
         # Start with BOS
         generated = torch.full((batch, 1), bos_token_id, dtype=torch.long, device=device)
         finished  = torch.zeros(batch, dtype=torch.bool, device=device)
-        cache     = None
         
         for _ in range(max_length):
-            # Only feed last token if using cache
-            if cache is not None:
-                decoder_input = generated[:, -1:]
-            else:
-                decoder_input = generated
-            
             outputs = self.forward(
                 encoder_input_ids      = None,
-                decoder_input_ids      = decoder_input,
+                decoder_input_ids      = generated,
                 encoder_hidden_states  = encoder_hidden,
                 encoder_attention_mask = encoder_attention_mask,
-                past_key_values        = cache,
-                use_cache              = True
             )
             
             logits = outputs["logits"][:, -1, :]
-            cache  = outputs["past_key_values"]
             
             # Temperature
             if temperature != 1.0:
@@ -222,7 +237,7 @@ class GeneT5(nn.Module):
             
             # Top-K
             if top_k > 0:
-                indices_to_remove        = logits < torch.topk(logits, top_k)[0][..., -1, None]
+                indices_to_remove         = logits < torch.topk(logits, top_k)[0][..., -1, None]
                 logits[indices_to_remove] = float('-inf')
             
             # Top-P (nucleus)
@@ -238,8 +253,8 @@ class GeneT5(nn.Module):
                 logits[indices_to_remove] = float('-inf')
             
             # Sample
-            probs     = F.softmax(logits, dim=-1)
-            next_token= torch.multinomial(probs, num_samples=1)
+            probs      = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
             
             # Handle finished sequences
             next_token[finished] = pad_token_id
@@ -254,27 +269,33 @@ class GeneT5(nn.Module):
         return generated
     
     def get_param_stats(self):
-        enc_train  = sum(p.numel() for p in self.encoder.parameters() if p.requires_grad)
-        enc_frozen = sum(p.numel() for p in self.encoder.parameters() if not p.requires_grad)
-        dec_train  = sum(p.numel() for p in self.decoder.parameters() if p.requires_grad)
-        emb_train  = sum(p.numel() for p in self.decoder_embed.parameters() if p.requires_grad)
-        head_train = sum(p.numel() for p in self.lm_head.parameters() if p.requires_grad)
+        enc_emb_train = sum(p.numel() for p in self.encoder_embed.parameters() if p.requires_grad)
+        enc_train     = sum(p.numel() for p in self.encoder.parameters() if p.requires_grad)
+        enc_frozen    = sum(p.numel() for p in self.encoder.parameters() if not p.requires_grad)
+        dec_train     = sum(p.numel() for p in self.decoder.parameters() if p.requires_grad)
+        emb_train     = sum(p.numel() for p in self.decoder_embed.parameters() if p.requires_grad)
+        head_train    = sum(p.numel() for p in self.lm_head.parameters() if p.requires_grad)
         
         return {
-            "encoder_trainable": enc_train,
-            "encoder_frozen":    enc_frozen,
-            "decoder_trainable": dec_train,
-            "embed_trainable":   emb_train,
-            "head_trainable":    head_train,
-            "total_trainable":   enc_train + dec_train + emb_train + head_train,
-            "total_frozen":      enc_frozen
+            "encoder_embed_trainable": enc_emb_train,
+            "encoder_trainable":       enc_train,
+            "encoder_frozen":          enc_frozen,
+            "decoder_trainable":       dec_train,
+            "embed_trainable":         emb_train,
+            "head_trainable":          head_train,
+            "total_trainable":         enc_emb_train + enc_train + dec_train + emb_train + head_train,
+            "total_frozen":            enc_frozen
         }
     
     def freeze_encoder(self):
+        for param in self.encoder_embed.parameters():
+            param.requires_grad = False
         for param in self.encoder.parameters():
             param.requires_grad = False
     
     def unfreeze_encoder(self):
+        for param in self.encoder_embed.parameters():
+            param.requires_grad = True
         for param in self.encoder.parameters():
             param.requires_grad = True
     
@@ -284,6 +305,7 @@ class GeneT5(nn.Module):
         path.parent.mkdir(parents=True, exist_ok=True)
         
         torch.save({
+            "encoder_embed": self.encoder_embed.state_dict(),
             "encoder":       self.encoder.state_dict(),
             "decoder":       self.decoder.state_dict(),
             "decoder_embed": self.decoder_embed.state_dict(),
@@ -294,6 +316,10 @@ class GeneT5(nn.Module):
     def load(self, checkpoint_path, strict=False):
         """Load model state"""
         ckpt = torch.load(checkpoint_path, map_location="cpu")
+        
+        # Handle backwards compatibility (old checkpoints without encoder_embed)
+        if "encoder_embed" in ckpt:
+            self.encoder_embed.load_state_dict(ckpt["encoder_embed"], strict=strict)
         
         self.encoder.load_state_dict(ckpt["encoder"], strict=strict)
         self.decoder.load_state_dict(ckpt["decoder"], strict=strict)
