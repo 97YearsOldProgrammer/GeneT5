@@ -1,5 +1,6 @@
-from .model import GeneT5
-from .build_model import build_gt5
+from .model         import GeneT5
+from .build_model   import build_gt5
+
 from .train import (
     train_epoch,
     train_epoch_seq2seq,
