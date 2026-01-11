@@ -134,6 +134,10 @@ conda install -c conda-forge transformers
 ---
 
 
+### Fine Tuning
+
+
+
 ### Unsupervised pre-trainning
 
 Following the trainning convention of GPT, the first stage of trainning decoder is working on unsupervised pre-trainnning. To let the model capture basic understanding of words and semantic meaning of linguistics. In short, the ideal trainning would be input of DNA Sequence in tokenized format. After encoder transformer, those token would then feed into the decoder for later cross-attention to make autoregressive prediction to generate the whole GFF corpus. Ideally, this task should belongs to story completion in Natural Language Processing. The content of pre-trainning for such gene finder program is stayed inside Gong's mind as secret. But the public parameter for pre-trainnning is copied from public disclosed generative AI company.     

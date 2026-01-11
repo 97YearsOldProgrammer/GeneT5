@@ -255,11 +255,9 @@ def chunk_dataset(samples, tokenizer, max_input_len, max_target_len=None,
     return chunked
 
 
-def preprocess_and_chunk(data_path, tokenizer, output_path,
-                         max_input_len, max_target_len=None, task="gene_prediction"):
-    """
-    Load dataset, chunk, and save preprocessed version.
-    """
+def preprocess_and_chunk(data_path, tokenizer, output_path, max_input_len, max_target_len=None, task="gene_prediction"):
+    """Load dataset, chunk, and save preprocessed version"""
+    
     from ._parser import load_dataset, save_dataset
     
     samples = load_dataset(data_path)
