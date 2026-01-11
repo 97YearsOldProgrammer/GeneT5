@@ -4,9 +4,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import json
 
-from pathlib import Path
-from typing import Optional, Dict, List, Tuple
-
+from pathlib    import Path
+from typing     import Optional, Dict, List, Tuple
 from lib.blocks import Encoder, Decoder
 
 
@@ -86,16 +85,7 @@ class GeneT5(nn.Module):
             self.lm_head.weight = self.decoder_embed.weight
     
     def encode(self, encoder_input_ids, encoder_attention_mask=None):
-        """
-        Encode input sequence.
-        
-        Args:
-            encoder_input_ids:      (B, src_len) input token IDs
-            encoder_attention_mask: (B, src_len) attention mask
-        
-        Returns:
-            encoder_hidden_states: (B, src_len, embed_dim)
-        """
+
         # Embed encoder inputs
         encoder_embeds = self.encoder_embed(encoder_input_ids)
         encoder_embeds = self.encoder_embed_dropout(encoder_embeds)
@@ -119,22 +109,7 @@ class GeneT5(nn.Module):
         past_key_values        = None,
         use_cache              = False
     ):
-        """
-        Forward pass
-        
-        Args:
-            encoder_input_ids:      (B, src_len)
-            decoder_input_ids:      (B, tgt_len)
-            labels:                 (B, tgt_len) for loss computation
-            encoder_attention_mask: (B, src_len)
-            decoder_attention_mask: (B, tgt_len)
-            encoder_hidden_states:  pre-computed encoder output
-            past_key_values:        KV cache for inference
-            use_cache:              whether to return updated cache
-        
-        Returns:
-            dict with logits, loss, moe_loss, past_key_values
-        """
+
         # Encode (or use cached)
         if encoder_hidden_states is None:
             encoder_hidden_states = self.encode(
@@ -190,23 +165,8 @@ class GeneT5(nn.Module):
         eos_token_id           = 2,
         pad_token_id           = 0
     ):
-        """
-        Autoregressive generation
+        """Autoregressive generation"""
         
-        Args:
-            encoder_input_ids:      (B, src_len)
-            encoder_attention_mask: (B, src_len)
-            max_length:             max tokens to generate
-            temperature:            sampling temperature
-            top_k:                  top-k sampling
-            top_p:                  nucleus sampling
-            bos_token_id:           start token
-            eos_token_id:           end token
-            pad_token_id:           pad token
-        
-        Returns:
-            generated_ids: (B, generated_len)
-        """
         self.eval()
         device = encoder_input_ids.device
         batch  = encoder_input_ids.size(0)

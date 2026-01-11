@@ -9,9 +9,10 @@ import torch
 from torch.utils.data import DataLoader
 
 import lib.train as train
-from lib import tuning
-from lib.model import GeneT5
-from lib.tokenizer import GeneTokenizer
+
+from lib            import tuning
+from lib.model      import GeneT5
+from lib.tokenizer  import GeneTokenizer
 
 
 DEFAULTS = {
@@ -33,14 +34,14 @@ DEFAULTS = {
 parser = argparse.ArgumentParser(description="Fine-tune GeneT5")
 
 # data - support multiple paths
-parser.add_argument("--train_data", type=str, required=True, nargs="+",
+parser.add_argument("train_data", type=str, required=True, nargs="+",
     help="Training data paths (jsonl). Can pass multiple for mixed tasks.")
-parser.add_argument("--val_data", type=str, default=None, nargs="*",
+parser.add_argument("val_data", type=str, default=None, nargs="*",
     help="Validation data paths.")
-parser.add_argument("--output_dir", type=str, default="outputs/finetune")
+parser.add_argument("output_dir", type=str, default="outputs/finetune")
 
 # model
-parser.add_argument("--model_path", type=str, required=True)
+parser.add_argument("model_path", type=str, required=True)
 parser.add_argument("--checkpoint", type=str, default=None)
 parser.add_argument("--freeze_encoder", action="store_true")
 
