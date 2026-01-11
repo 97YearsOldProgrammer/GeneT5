@@ -1,16 +1,13 @@
-"""
-Core training functions for GeneT5 fine-tuning.
-Pure functions - no classes, no main entry point.
-"""
 
 import torch
 import torch.nn as nn
 from pathlib import Path
 
 
-# =============================================================================
-# Training Functions
-# =============================================================================
+################################
+#####  Training Functions  #####
+################################
+
 
 def train_epoch(model, dataloader, optimizer, scheduler, device, grad_accum=1):
     """Train for one epoch."""
@@ -67,9 +64,10 @@ def evaluate(model, dataloader, device):
     return {"loss": avg_loss, "accuracy": accuracy}
 
 
-# =============================================================================
-# Checkpoint Functions
-# =============================================================================
+##################################
+#####  Checkpoint Functions  #####
+##################################
+
 
 def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
     """Load model, optimizer, and scheduler states from checkpoint."""
