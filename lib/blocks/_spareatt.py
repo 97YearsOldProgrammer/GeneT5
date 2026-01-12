@@ -502,7 +502,7 @@ if FLEX_ATTENTION_AVAILABLE:
             num_random  = self.num_random_blocks
             is_causal   = self.is_causal
             
-            num_blocks = seq_len // block_size
+            num_blocks = (seq_len + block_size - 1) // block_size
             
             # Precompute Random Block Connections as a Dense Tensor
             random_mask = torch.zeros((num_blocks, num_blocks), dtype=torch.bool, device=device)

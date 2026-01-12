@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 
 import argparse
 import json
@@ -20,7 +19,7 @@ from    lib.tokenizer   import GeneTokenizer
 DEFAULTS = {
     "max_input_len":  4096,
     "max_target_len": 2048,
-    "batch_size":     128,
+    "batch_size":     64,
     "lr":             1e-5,
     "epochs":         3,
     "weight_decay":   0.1,

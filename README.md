@@ -132,4 +132,6 @@ While getting the Pre-trained understanding about Genomic Sequnece. We shall kee
 
 ### Fine Tuning
 
-For letting the model have ideal functionality for proper Ab Inito prediction is fine-tuning on datas from multiple species.  
+For letting the model have ideal functionality for proper Ab Inito prediction is fine-tuning on datas from multiple species. 
+
+Fine-tuning seem like taking 60GB of RAM through Pytorch packages.   
