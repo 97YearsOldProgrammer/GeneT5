@@ -20,9 +20,7 @@ from ._chunking import (
 )
 
 from .dataset import (
-    GenePredictionDataset,
-    RNAClassificationDataset,
-    FineTuneDataset,
+    MixedTaskDataset,
     SmartBatchSampler,
     DynamicPaddingCollator,
 )
@@ -47,9 +45,7 @@ __all__ = [
     "preprocess_and_chunk",
     "estimate_tokens",
     # dataset
-    "GenePredictionDataset",
-    "RNAClassificationDataset",
-    "FineTuneDataset",
+    "MixedTaskDataset",
     "SmartBatchSampler",
     "DynamicPaddingCollator",
 ]
