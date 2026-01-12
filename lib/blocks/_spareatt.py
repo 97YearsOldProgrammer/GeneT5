@@ -21,6 +21,29 @@ class SparseAttentionConfig:
     use_alibi:          bool    = True
 
 
+#############################
+##### BACKEND DETECTION #####
+#############################
+
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except ImportError:
+    TRITON_AVAILABLE = False
+
+try:
+    from torch.nn.attention.flex_attention import (
+        flex_attention, 
+        create_block_mask,
+    )
+    FLEX_ATTENTION_AVAILABLE = True
+except ImportError:
+    FLEX_ATTENTION_AVAILABLE = False
+
+MPS_AVAILABLE = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+
+
 ##############################
 #####  SPARSE ATTENTION  #####
 ##############################
@@ -35,14 +58,39 @@ class SparseAttention(nn.Module):
         self.config     = config
         self.is_causal  = is_causal
         
-        # Select backend
-        if force_backend == "triton" or (force_backend is None and TRITON_AVAILABLE):
+        # Select backend following the same pattern as MoE
+        if force_backend == "triton":
+            if not TRITON_AVAILABLE:
+                raise RuntimeError("Triton not available. Install: pip install triton")
             self.backend = "triton"
             self.attention = TritonSparseAttention(config)
             
-        elif force_backend == "flex" or (force_backend is None and FLEX_ATTENTION_AVAILABLE):
+        elif force_backend == "flex":
+            if not FLEX_ATTENTION_AVAILABLE:
+                raise RuntimeError("FlexAttention not available. Requires PyTorch 2.5+")
             self.backend = "flex"
             self.attention = FlexAttentionSparse(config, is_causal=is_causal)
+            
+        elif force_backend is None:
+            # Auto-select backend based on availability
+            if TRITON_AVAILABLE and torch.cuda.is_available():
+                self.backend = "triton"
+                self.attention = TritonSparseAttention(config)
+            elif FLEX_ATTENTION_AVAILABLE:
+                # FlexAttention works on MPS and other backends
+                self.backend = "flex"
+                self.attention = FlexAttentionSparse(config, is_causal=is_causal)
+            else:
+                # Fallback error message
+                raise RuntimeError(
+                    "No sparse attention backend available. "
+                    "Install either: pip install triton (for CUDA) "
+                    "or upgrade to PyTorch 2.5+ (for FlexAttention on MPS/CPU)"
+                )
+        else:
+            raise ValueError(f"Unknown backend: {force_backend}")
+        
+        print(f"SparseAttention initialized with backend: {self.backend}")
     
     def forward(self, hidden_states, attention_mask=None):
         return self.attention(hidden_states, attention_mask)
@@ -51,15 +99,6 @@ class SparseAttention(nn.Module):
 ##################
 #####  CUDA  #####
 ##################
-
-
-try:
-    import triton
-    import triton.language as tl
-    TRITON_AVAILABLE = True
-except ImportError:
-    TRITON_AVAILABLE = False
-    print("Triton not available. Install with: pip install triton")
 
 
 if TRITON_AVAILABLE:
@@ -386,187 +425,176 @@ class TritonSparseAttention(nn.Module):
 ############################
 
 
-try:
-    from torch.nn.attention.flex_attention import (
-        flex_attention, 
-        create_block_mask,
-    )
-    FLEX_ATTENTION_AVAILABLE = True
-except ImportError:
-    FLEX_ATTENTION_AVAILABLE = False
-    print("FlexAttention not available. Requires PyTorch 2.5+")
+if FLEX_ATTENTION_AVAILABLE:
 
+    class FlexAttentionSparse(nn.Module):
+        """BigBird sparse attention using FlexAttention"""
 
-class FlexAttentionSparse(nn.Module):
-    """BigBird sparse attention using FlexAttention"""
+        def __init__(self, config, is_causal=False):
+            super().__init__()
+            
+            self.config             = config
+            self.embed_dim          = config.embed_dim
+            self.num_heads          = config.num_heads
+            self.head_dim           = config.embed_dim // config.num_heads
+            self.block_size         = config.block_size
+            self.window_size        = config.window_size
+            self.num_global_tokens  = config.num_global_tokens
+            self.num_random_blocks  = config.num_random_blocks
+            self.is_causal          = is_causal
+            
+            # Projections
+            self.q = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
+            self.k = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
+            self.v = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
+            self.o = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
+            
+            self.dropout = nn.Dropout(config.dropout)
+            
+            # ALiBi slopes
+            if config.use_alibi:
+                slopes = self._compute_alibi_slopes(config.num_heads)
+                self.register_buffer('alibi_slopes', slopes)
+            else:
+                self.alibi_slopes = None
+            
+            # Cached masks
+            self._mask_cache = {}
+        
+        @staticmethod
+        def _compute_alibi_slopes(num_heads):
+            """Compute ALiBi slopes"""
+            
+            def get_slopes(n):
+                if n == 1:
+                    return torch.tensor([1.0])
+                base = 2 ** (-2 ** -(math.log2(n) - 3))
+                return torch.tensor([base ** i for i in range(1, n + 1)])
+            
+            if math.log2(num_heads).is_integer():
+                return get_slopes(num_heads)
+            else:
+                closest = 2 ** math.floor(math.log2(num_heads))
+                return torch.cat([
+                    get_slopes(closest),
+                    get_slopes(2 * closest)[0::2][:num_heads - closest]
+                ])
+        
+        def _create_score_mod(self):
+            """Score modification function for FlexAttention"""
+            alibi_slopes = self.alibi_slopes
+            
+            def score_mod(score, batch, head, q_idx, kv_idx):
+                """Apply ALiBi positional bias"""
+                if alibi_slopes is not None:
+                    slope       = alibi_slopes[head]
+                    distance    = torch.abs(q_idx - kv_idx).float()
+                    score       = score - slope * distance
+                return score
+            
+            return score_mod
+        
+        def _create_bigbird_mask_mod(self, seq_len, device):
+            """Create BigBird attention mask for FlexAttention (Vectorized)"""
+            window      = self.window_size
+            num_global  = self.num_global_tokens
+            block_size  = self.block_size
+            num_random  = self.num_random_blocks
+            is_causal   = self.is_causal
+            
+            num_blocks = seq_len // block_size
+            
+            # Precompute Random Block Connections as a Dense Tensor
+            random_mask = torch.zeros((num_blocks, num_blocks), dtype=torch.bool, device=device)
+            
+            for q_block in range(num_blocks):
+                torch.manual_seed(q_block * 31337)
+                available = list(range(num_blocks))
+                if q_block in available:
+                    available.remove(q_block)
+                
+                # Select random blocks
+                if available:
+                    perm = torch.randperm(len(available))[:num_random]
+                    targets = [available[i] for i in perm]
+                    random_mask[q_block, targets] = True
 
-    def __init__(self, config, is_causal=False):
-        super().__init__()
-        
-        if not FLEX_ATTENTION_AVAILABLE:
-            raise RuntimeError("FlexAttention requires PyTorch 2.5+")
-        
-        self.config             = config
-        self.embed_dim          = config.embed_dim
-        self.num_heads          = config.num_heads
-        self.head_dim           = config.embed_dim // config.num_heads
-        self.block_size         = config.block_size
-        self.window_size        = config.window_size
-        self.num_global_tokens  = config.num_global_tokens
-        self.num_random_blocks  = config.num_random_blocks
-        self.is_causal          = is_causal
-        
-        # Projections
-        self.q = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
-        self.k = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
-        self.v = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
-        self.o = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
-        
-        self.dropout = nn.Dropout(config.dropout)
-        
-        # ALiBi slopes
-        if config.use_alibi:
-            slopes = self._compute_alibi_slopes(config.num_heads)
-            self.register_buffer('alibi_slopes', slopes)
-        else:
-            self.alibi_slopes = None
-        
-        # Cached masks
-        self._mask_cache = {}
-    
-    @staticmethod
-    def _compute_alibi_slopes(num_heads):
-        """Compute ALiBi slopes"""
-        
-        def get_slopes(n):
-            if n == 1:
-                return torch.tensor([1.0])
-            base = 2 ** (-2 ** -(math.log2(n) - 3))
-            return torch.tensor([base ** i for i in range(1, n + 1)])
-        
-        if math.log2(num_heads).is_integer():
-            return get_slopes(num_heads)
-        else:
-            closest = 2 ** math.floor(math.log2(num_heads))
-            return torch.cat([
-                get_slopes(closest),
-                get_slopes(2 * closest)[0::2][:num_heads - closest]
-            ])
-    
-    def _create_score_mod(self):
-        """Score modification function for FlexAttention"""
-        alibi_slopes = self.alibi_slopes
-        
-        def score_mod(score, batch, head, q_idx, kv_idx):
-            """Apply ALiBi positional bias"""
-            if alibi_slopes is not None:
-                slope       = alibi_slopes[head]
-                distance    = torch.abs(q_idx - kv_idx).float()
-                score       = score - slope * distance
-            return score
-        
-        return score_mod
-    
-    def _create_bigbird_mask_mod(self, seq_len, device):
-        """Create BigBird attention mask for FlexAttention (Vectorized)"""
-        window      = self.window_size
-        num_global  = self.num_global_tokens
-        block_size  = self.block_size
-        num_random  = self.num_random_blocks
-        is_causal   = self.is_causal
-        
-        num_blocks = seq_len // block_size
-        
-        # Precompute Random Block Connections as a Dense Tensor
-        random_mask = torch.zeros((num_blocks, num_blocks), dtype=torch.bool, device=device)
-        
-        for q_block in range(num_blocks):
-            torch.manual_seed(q_block * 31337)
-            available = list(range(num_blocks))
-            if q_block in available:
-                available.remove(q_block)
+            def mask_mod(b, h, q_idx, kv_idx):
+                """Returns True if q_idx should attend to kv_idx"""
+                
+                # Global attention (First N tokens)
+                is_global = (q_idx < num_global) | (kv_idx < num_global)
+                
+                # Sliding Window attention
+                is_window = (q_idx - kv_idx).abs() <= window
+                
+                # Random attention (Block Lookup)
+                q_block  = q_idx // block_size
+                kv_block = kv_idx // block_size
+                
+                # Instead of iterating over dictionary, use direct tensor indexing
+                is_random = random_mask[q_block, kv_block]
+                
+                mask = is_global | is_window | is_random
+                
+                if is_causal:
+                    mask = mask & (kv_idx <= q_idx)
+                
+                return mask
             
-            # Select random blocks
-            if available:
-                perm = torch.randperm(len(available))[:num_random]
-                targets = [available[i] for i in perm]
-                random_mask[q_block, targets] = True
-
-        def mask_mod(b, h, q_idx, kv_idx):
-            """Returns True if q_idx should attend to kv_idx"""
-            
-            # Global attention (First N tokens)
-            is_global = (q_idx < num_global) | (kv_idx < num_global)
-            
-            # Sliding Window attention
-            is_window = (q_idx - kv_idx).abs() <= window
-            
-            # Random attention (Block Lookup)
-            q_block  = q_idx // block_size
-            kv_block = kv_idx // block_size
-            
-            # Instead of iterating over dictionary, use direct tensor indexing
-            is_random = random_mask[q_block, kv_block]
-            
-            mask = is_global | is_window | is_random
-            
-            if is_causal:
-                mask = mask & (kv_idx <= q_idx)
-            
-            return mask
+            return mask_mod
         
-        return mask_mod
-    
-    def _get_block_mask(self, seq_len, device):
-        """Get or create cached block mask"""
-        cache_key = (seq_len, device)
-        
-        if cache_key not in self._mask_cache:
-            # Pass device to _create_bigbird_mask_mod so the random_mask
-            mask_mod = self._create_bigbird_mask_mod(seq_len, device)
+        def _get_block_mask(self, seq_len, device):
+            """Get or create cached block mask"""
+            cache_key = (seq_len, device)
             
-            # Create block mask for efficient sparse computation
-            block_mask = create_block_mask(
-                mask_mod,
-                B=None,  # Broadcast over batch
-                H=None,  # Broadcast over heads
-                Q_LEN=seq_len,
-                KV_LEN=seq_len,
-                device=device,
-                BLOCK_SIZE=self.block_size,
+            if cache_key not in self._mask_cache:
+                # Pass device to _create_bigbird_mask_mod so the random_mask
+                mask_mod = self._create_bigbird_mask_mod(seq_len, device)
+                
+                # Create block mask for efficient sparse computation
+                block_mask = create_block_mask(
+                    mask_mod,
+                    B=None,  # Broadcast over batch
+                    H=None,  # Broadcast over heads
+                    Q_LEN=seq_len,
+                    KV_LEN=seq_len,
+                    device=device,
+                    BLOCK_SIZE=self.block_size,
+                )
+                
+                self._mask_cache[cache_key] = block_mask
+            
+            return self._mask_cache[cache_key]
+        
+        def forward(self, hidden_states, attention_mask=None):
+            """Forward pass using FlexAttention with BigBird pattern"""
+            B, L, D = hidden_states.shape
+            
+            # Project Q, K, V
+            q = self.q(hidden_states).view(B, L, self.num_heads, self.head_dim)
+            k = self.k(hidden_states).view(B, L, self.num_heads, self.head_dim)
+            v = self.v(hidden_states).view(B, L, self.num_heads, self.head_dim)
+            
+            # Transpose to (B, H, L, D)
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            
+            # Get block mask and score mod
+            block_mask  = self._get_block_mask(L, hidden_states.device)
+            score_mod   = self._create_score_mod()
+            
+            # Apply FlexAttention
+            out = flex_attention(
+                q, k, v,
+                score_mod=score_mod,
+                block_mask=block_mask,
             )
             
-            self._mask_cache[cache_key] = block_mask
-        
-        return self._mask_cache[cache_key]
-    
-    def forward(self, hidden_states, attention_mask=None):
-        """Forward pass using FlexAttention with BigBird pattern"""
-        B, L, D = hidden_states.shape
-        
-        # Project Q, K, V
-        q = self.q(hidden_states).view(B, L, self.num_heads, self.head_dim)
-        k = self.k(hidden_states).view(B, L, self.num_heads, self.head_dim)
-        v = self.v(hidden_states).view(B, L, self.num_heads, self.head_dim)
-        
-        # Transpose to (B, H, L, D)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        
-        # Get block mask and score mod
-        block_mask  = self._get_block_mask(L, hidden_states.device)
-        score_mod   = self._create_score_mod()
-        
-        # Apply FlexAttention
-        out = flex_attention(
-            q, k, v,
-            score_mod=score_mod,
-            block_mask=block_mask,
-        )
-        
-        # Reshape output
-        out = out.transpose(1, 2).reshape(B, L, D)
-        out = self.o(out)
-        out = self.dropout(out)
-        
+            # Reshape output
+            out = out.transpose(1, 2).reshape(B, L, D)
+            out = self.o(out)
+            out = self.dropout(out)
+            
+            return out, None
