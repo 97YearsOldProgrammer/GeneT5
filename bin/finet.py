@@ -9,10 +9,9 @@ import torch
 from torch.utils.data import DataLoader
 
 import lib.train as train
-
-from lib            import tuning
-from lib.model      import GeneT5
-from lib.tokenizer  import GeneTokenizer
+from lib import tuning
+from lib.model import GeneT5
+from lib.tokenizer import GeneTokenizer
 
 
 DEFAULTS = {
@@ -25,7 +24,6 @@ DEFAULTS = {
     "warmup_ratio":   0.1,
     "grad_accum":     1,
     "max_grad_norm":  1.0,
-    "dropout":        0.1,
     "bucket_size":    256,
     "num_workers":    4,
 }
@@ -33,17 +31,17 @@ DEFAULTS = {
 
 parser = argparse.ArgumentParser(description="Fine-tune GeneT5")
 
-# data - support multiple paths
-parser.add_argument("train_data", type=str, required=True, nargs="+",
-    help="Training data paths (jsonl). Can pass multiple for mixed tasks.")
-parser.add_argument("val_data", type=str, default=None, nargs="*",
-    help="Validation data paths.")
-parser.add_argument("output_dir", type=str, default="outputs/finetune")
+# data - multiple jsonl files that get mixed
+parser.add_argument("train_data", type=str, nargs="+",
+    help="Training data paths (jsonl). Multiple files get randomly mixed.")
+parser.add_argument("output_dir", type=str,
+    help="Output directory for checkpoints and final model.")
 
 # model
-parser.add_argument("model_path", type=str, required=True)
-parser.add_argument("--checkpoint", type=str, default=None)
-parser.add_argument("--freeze_encoder", action="store_true")
+parser.add_argument("model_path", type=str,
+    help="Path to pretrained GeneT5 model directory.")
+parser.add_argument("--checkpoint", type=str, default=None,
+    help="Resume from checkpoint path.")
 
 # training params (override defaults)
 parser.add_argument("--epochs", type=int, default=DEFAULTS["epochs"])
@@ -52,8 +50,10 @@ parser.add_argument("--lr", type=float, default=DEFAULTS["lr"])
 parser.add_argument("--max_input_len", type=int, default=DEFAULTS["max_input_len"])
 parser.add_argument("--max_target_len", type=int, default=DEFAULTS["max_target_len"])
 parser.add_argument("--grad_accum", type=int, default=DEFAULTS["grad_accum"])
-parser.add_argument("--seed", type=int, default=42)
-parser.add_argument("--save_every", type=int, default=1)
+parser.add_argument("--seed", type=int, default=42,
+    help="Random seed for reproducibility (shuffling, dropout, etc).")
+parser.add_argument("--save_every", type=int, default=1,
+    help="Save checkpoint every N epochs.")
 args = parser.parse_args()
 
 
@@ -62,7 +62,7 @@ print(f"\n{' GeneT5 Fine-Tuning ':=^60}")
 device = train.get_device()
 print(f"Device: {device}")
 
-# seed
+# seed - ensures reproducible shuffling and initialization
 torch.manual_seed(args.seed)
 random.seed(args.seed)
 if torch.cuda.is_available():
@@ -74,8 +74,8 @@ output_dir.mkdir(parents=True, exist_ok=True)
 
 # load tokenizer
 print(f"\nLoading tokenizer...")
-model_path = Path(args.model_path)
-tokenizer = GeneTokenizer(model_path)
+model_path  = Path(args.model_path)
+tokenizer   = GeneTokenizer(model_path)
 print(f"  Vocab size: {len(tokenizer)}")
 
 
@@ -83,39 +83,33 @@ print(f"  Vocab size: {len(tokenizer)}")
 print(f"\nLoading model...")
 model = GeneT5.from_pretrained(model_path, device="cpu").to(device)
 
-if args.freeze_encoder:
-    model.freeze_encoder()
-    print("  Encoder frozen")
-
 stats = model.get_param_stats()
 print(f"  Trainable: {stats['total_trainable']:,}")
 print(f"  Frozen:    {stats['total_frozen']:,}")
 
 
-# load datasets
-print(f"\nLoading datasets...")
+# load dataset - multiple files get mixed
+print(f"\nLoading training data...")
+print(f"  Files: {args.train_data}")
 
 train_dataset = tuning.MixedTaskDataset(
-    data_paths     = args.train_data,
+    data_paths     = args.train_data,  # list of paths
     tokenizer      = tokenizer,
     max_input_len  = args.max_input_len,
     max_target_len = args.max_target_len,
 )
-print(f"  Train samples: {len(train_dataset)}")
+print(f"  Total samples: {len(train_dataset)}")
 
-val_dataset = None
-if args.val_data:
-    val_dataset = tuning.MixedTaskDataset(
-        data_paths     = args.val_data,
-        tokenizer      = tokenizer,
-        max_input_len  = args.max_input_len,
-        max_target_len = args.max_target_len,
-    )
-    print(f"  Val samples: {len(val_dataset)}")
+# show task distribution
+task_counts = {}
+for sample in train_dataset.samples:
+    task = sample["task"]
+    task_counts[task] = task_counts.get(task, 0) + 1
+print(f"  Task distribution: {task_counts}")
 
 
-# dataloaders with smart batching
-print(f"\nSetting up dataloaders...")
+# dataloader with smart batching
+print(f"\nSetting up dataloader...")
 
 collator = tuning.DynamicPaddingCollator(
     pad_token_id = tokenizer.pad_token_id,
@@ -129,30 +123,13 @@ train_loader = DataLoader(
         batch_size  = args.batch_size,
         bucket_size = DEFAULTS["bucket_size"],
         drop_last   = True,
-        shuffle     = True,
+        shuffle     = True,  # randomly mixes samples from all files
     ),
     collate_fn  = collator,
     num_workers = DEFAULTS["num_workers"],
     pin_memory  = True,
 )
-print(f"  Train batches: {len(train_loader)}")
-
-val_loader = None
-if val_dataset:
-    val_loader = DataLoader(
-        val_dataset,
-        batch_sampler = tuning.SmartBatchSampler(
-            lengths     = val_dataset.lengths,
-            batch_size  = args.batch_size,
-            bucket_size = DEFAULTS["bucket_size"],
-            drop_last   = False,
-            shuffle     = False,
-        ),
-        collate_fn  = collator,
-        num_workers = DEFAULTS["num_workers"],
-        pin_memory  = True,
-    )
-    print(f"  Val batches: {len(val_loader)}")
+print(f"  Total batches: {len(train_loader)}")
 
 
 # optimizer & scheduler
@@ -179,6 +156,7 @@ print(f"  Warmup steps: {warmup_steps}")
 start_epoch = 0
 if args.checkpoint:
     start_epoch = train.load_checkpoint(model, optimizer, scheduler, args.checkpoint, device)
+    print(f"  Resumed from epoch {start_epoch}")
 
 # save config
 config = {**vars(args), "vocab_size": len(tokenizer), "total_steps": total_steps}
@@ -189,7 +167,6 @@ with open(output_dir / "finetune_config.json", "w") as f:
 # training loop
 print(f"\n{'=' * 60}")
 print("Training...")
-best_val_loss = float("inf")
 
 for epoch in range(start_epoch, args.epochs):
     print(f"\nEpoch {epoch + 1}/{args.epochs}")
@@ -199,13 +176,8 @@ for epoch in range(start_epoch, args.epochs):
         model, train_loader, optimizer, scheduler,
         device, args.grad_accum, DEFAULTS["max_grad_norm"]
     )
-    print(f"  Train loss: {train_loss:.4f}")
+    print(f"  Loss: {train_loss:.4f}")
     print(f"  LR: {scheduler.get_last_lr()[0]:.2e}")
-    
-    val_loss = None
-    if val_loader:
-        val_loss = train.evaluate_seq2seq(model, val_loader, device)
-        print(f"  Val loss: {val_loss:.4f}")
     
     # save checkpoint
     if (epoch + 1) % args.save_every == 0:
@@ -213,15 +185,6 @@ for epoch in range(start_epoch, args.epochs):
             model, optimizer, scheduler, epoch + 1,
             output_dir / f"checkpoint_epoch{epoch + 1}.pt", config
         )
-    
-    # save best
-    if val_loss is not None and val_loss < best_val_loss:
-        best_val_loss = val_loss
-        train.save_checkpoint(
-            model, optimizer, scheduler, epoch + 1,
-            output_dir / "best_model.pt", config
-        )
-        print(f"  ✓ New best (val_loss: {best_val_loss:.4f})")
 
 
 # save final
