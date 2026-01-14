@@ -85,7 +85,7 @@ The software require pytorch to build building blocks of nn.
 
 ```zsh
 conda create -n nameyouwannaput
-conda install pytorch torchvision torchaudio -c pytorch -c conda-forge
+conda install pytorch -c conda-forge
 ```
 
 Besides, it require the huggingface transformer model to get access to the DNABERT for their weights and tokenizer.
@@ -106,28 +106,6 @@ For parallelism training, we need optimizer packages DeepSpeed.
 
 ```zsh
 conda install -c conda-forge deepspeed
-```
-
-
----
-
-
-### Trainning nn
-
-The last step is trainning the neural network using given dataset.  
-All the nn is build up by stacking pytorch. So using pytroch package is necessary.  
-
-This is how you can download all package for Apple Silicon.     
-
-```zsh
-conda create -n nameyouwannaput
-conda install pytorch torchvision torchaudio -c pytorch -c conda-forge
-```
-
-Beside, you also need hugging face transformer package to load the pre-trained model for encoder.   
-
-```zsh
-conda install -c conda-forge transformers
 ```
 
 
