@@ -1,19 +1,50 @@
-"""
-Core training functions for GeneT5 fine-tuning.
-Pure functions - no classes, no main entry point.
-"""
 
 import torch
 import torch.nn as nn
 from pathlib import Path
 
 
-# =============================================================================
-# Training Functions
-# =============================================================================
+################################
+#####  Training Functions  #####
+################################
 
-def train_epoch(model, dataloader, optimizer, scheduler, device, grad_accum=1):
-    """Train for one epoch."""
+
+def train_epoch(model, dataloader, optimizer, scheduler, device, grad_accum=1, max_grad_norm=1.0):
+    """Train for one epoch with gradient accumulation."""
+    model.train()
+    total_loss = 0
+    num_steps  = 0
+    
+    optimizer.zero_grad()
+    
+    for step, batch in enumerate(dataloader):
+        batch = {k: v.to(device) for k, v in batch.items()}
+        
+        # Forward pass - handle both dict and object outputs
+        outputs = model(**batch) if not hasattr(model, 'forward_finetune') else model(**batch)
+        
+        if isinstance(outputs, dict):
+            loss = outputs["loss"]
+        else:
+            loss = outputs.loss
+        
+        loss = loss / grad_accum
+        loss.backward()
+        
+        if (step + 1) % grad_accum == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+            num_steps += 1
+        
+        total_loss += loss.item() * grad_accum
+    
+    return total_loss / len(dataloader)
+
+
+def train_epoch_seq2seq(model, dataloader, optimizer, scheduler, device, grad_accum=1, max_grad_norm=1.0):
+    """Train for one epoch - seq2seq specific (encoder-decoder models)."""
     model.train()
     total_loss = 0
     
@@ -22,14 +53,18 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, grad_accum=1):
     for step, batch in enumerate(dataloader):
         batch = {k: v.to(device) for k, v in batch.items()}
         
-        outputs = model(**batch)
-        loss    = outputs["loss"] if isinstance(outputs, dict) else outputs.loss
-        loss    = loss / grad_accum
+        # GeneT5 style forward
+        outputs = model(
+            encoder_input_ids = batch["input_ids"],
+            decoder_input_ids = batch["labels"][:, :-1],
+            labels            = batch["labels"][:, 1:],
+        )
         
+        loss = outputs["loss"] / grad_accum
         loss.backward()
         
         if (step + 1) % grad_accum == 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
@@ -51,11 +86,15 @@ def evaluate(model, dataloader, device):
             batch   = {k: v.to(device) for k, v in batch.items()}
             outputs = model(**batch)
             
-            loss = outputs["loss"] if isinstance(outputs, dict) else outputs.loss
+            if isinstance(outputs, dict):
+                loss = outputs["loss"]
+            else:
+                loss = outputs.loss
+            
             total_loss += loss.item()
             
             # For classification, compute accuracy
-            if "logits" in outputs:
+            if isinstance(outputs, dict) and "logits" in outputs:
                 logits = outputs["logits"]
                 preds  = torch.argmax(logits, dim=-1)
                 correct += (preds == batch["labels"]).sum().item()
@@ -67,13 +106,34 @@ def evaluate(model, dataloader, device):
     return {"loss": avg_loss, "accuracy": accuracy}
 
 
-# =============================================================================
-# Checkpoint Functions
-# =============================================================================
+def evaluate_seq2seq(model, dataloader, device):
+    """Evaluate model on validation set - seq2seq specific."""
+    model.eval()
+    total_loss = 0
+    
+    with torch.no_grad():
+        for batch in dataloader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            
+            outputs = model(
+                encoder_input_ids = batch["input_ids"],
+                decoder_input_ids = batch["labels"][:, :-1],
+                labels            = batch["labels"][:, 1:],
+            )
+            
+            total_loss += outputs["loss"].item()
+    
+    return total_loss / len(dataloader)
 
-def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
+
+##################################
+#####  Checkpoint Functions  #####
+##################################
+
+
+def load_checkpoint(model, optimizer, scheduler, checkpoint_path, device="cpu"):
     """Load model, optimizer, and scheduler states from checkpoint."""
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
     
     model.load_state_dict(checkpoint["model_state_dict"])
     
@@ -89,24 +149,29 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
     return epoch
 
 
-def save_checkpoint(model, optimizer, scheduler, epoch, save_path):
+def save_checkpoint(model, optimizer, scheduler, epoch, save_path, config=None):
     """Save model, optimizer, and scheduler states."""
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
     
-    torch.save({
+    checkpoint = {
         "epoch":                epoch,
         "model_state_dict":     model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
-    }, save_path)
+    }
     
+    if config:
+        checkpoint["config"] = config
+    
+    torch.save(checkpoint, save_path)
     print(f"Saved checkpoint to {save_path}")
 
 
-# =============================================================================
-# Model Setup Functions
-# =============================================================================
+##################################
+#####  Model Setup Functions #####
+##################################
+
 
 def setup_gene_prediction_model(model_path, tokenizer, device):
     """Setup model for gene prediction task."""
@@ -174,7 +239,7 @@ def prepare_tokenizer(model_path, special_tokens=None):
     """Load and prepare tokenizer with special tokens."""
     from transformers import AutoTokenizer
     
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     
     if special_tokens is None:
         special_tokens = ["[GENE]", "[CLS]"]
@@ -188,15 +253,33 @@ def prepare_tokenizer(model_path, special_tokens=None):
 
 
 def prepare_optimizer_scheduler(model, train_loader, lr, weight_decay, 
-                                epochs, grad_accum, warmup_ratio):
+                                epochs, grad_accum, warmup_ratio, scheduler_type="linear"):
     """Prepare optimizer and scheduler."""
     from torch.optim import AdamW
-    from transformers import get_linear_schedule_with_warmup
+    from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
     
     total_steps  = len(train_loader) * epochs // grad_accum
     warmup_steps = int(total_steps * warmup_ratio)
     
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    
+    if scheduler_type == "cosine":
+        scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    else:
+        scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
     
     return optimizer, scheduler
+
+
+##################################
+#####  Utility Functions     #####
+##################################
+
+
+def get_device():
+    """Get best available device."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")

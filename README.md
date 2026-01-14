@@ -19,33 +19,6 @@ Cons:
 ---
 
 
-### Encoder (BERT)
-
-The current stage of planning is not pre-trainning everything from stracth rather accepte a open-source model from hugging face. The choice is DNABert-v2, a pre-trained model that published weights on hugging face. That model is already trained for capture local pattern, motif through trainning. So, it would be the backbone of encoder block. For the first step of design such program is that we need a encoder-decoder transformer model that fine-tuned to *Ab Initio Prediction*.    
-
-*Ab Initio Prediction* is the most basic functionality for such gene finder program. It's require able to generate prediction in form of GFF/GTF in terms of given DNA input sequences.   
-Therefore, theoretically, for achieving this, there have to be a decoder part for generating (to transfer what have already learned) the ideal outputs.  
-
-While getting the Pre-trained understanding about Genomic Sequnece. We shall keep the weights and bias for both decoder as the following components:
-
-| Component                   | Action          | Reason
-| :-------------------------: | :-----------:   | :---- 
-| **Encoder Self-Attention**  | **Copy**        | It already knows how to find context in the input.
-| **Decoder Self-Attention**  | **Copy**        | It can reuse the Encoder's logic for finding context.
-| **Cross-Attention**         | **Random Init** | This is the "new" connection that links input to output.
-| **Layer Norms**             | **Copy**        | Keeps the math stable from the start.
-| **Output Head**             | **Copy/Init**   | Usually initialized from the Input Embeddings (Shared).
-
-For initializing the model, downloading weights and biases from the DNABERT, the eniops packages are required for processing the model.   
-
-```zsh
-conda install -c conda-forge einops
-```
-
-
----
-
-
 ### Expanding the Tokenizer
 
 The tokenizer from the DNABERT model is not enough for our purpose. Since that was only trained for understanding the relationship of raw DNA Sequences. That satisfied the need of a encoder but not the decoder. For our purpose, we need to append more tokens to the original DNABERT-v2 tokenizer for further fine-tuning. A special case of tokenizer is the type of gene that we want the encoder-decoder capable of predicting. As colelcted from gff file of model species from prokaryotics and eukaryotics. The expansion of type tokens would be below:  
@@ -108,34 +81,35 @@ For parallelism training, we need optimizer packages DeepSpeed.
 conda install -c conda-forge deepspeed
 ```
 
+For not CUDA user, the trainning script also support MPS through PyTorch packages. For that purpose, the only required package would be pytorch.   
+
 
 ---
 
 
 ### Unsupervised pre-trainning
 
-Following the trainning convention of GPT, the first stage of trainning decoder is working on unsupervised pre-trainnning. To let the model capture basic understanding of words and semantic meaning of linguistics. In short, the ideal trainning would be input of DNA Sequence in tokenized format. After encoder transformer, those token would then feed into the decoder for later cross-attention to make autoregressive prediction to generate the whole GFF corpus. Ideally, this task should belongs to story completion in Natural Language Processing. The content of pre-trainning for such gene finder program is stayed inside Gong's mind as secret. But the public parameter for pre-trainnning is copied from public disclosed generative AI company.     
+We take the action of warm-start for utilizing weights and biases that already trained by DNABERT-v2 for skipping the pre-trainning for traditional T5 Model. The current stage of planning is not pre-trainning everything from stracth rather accepte a open-source model from hugging face. The choice is DNABert-v2, a pre-trained model that published weights on hugging face. That model is already trained for capture local pattern, motif through trainning. So, it would be the backbone of encoder block. For the first step of design such program is that we need a encoder-decoder transformer model that fine-tuned to *Ab Initio Prediction*.    
 
-| Parameter             | Concise Data       | Detailed Description
-| :-------------------: | :----------------: | :-------------------
-| **Optimizer**         | Adam               | Uses the Adam optimizer with specific hyperparameters for large-scale stability.
-| **Batch Size**        | 32k → 3.2M tokens  | Started at 32,000 tokens and gradually ramped up to 3.2 million tokens to stabilize early training.
-| **Learning Rate**     | 0.6 × 10⁻⁴         | The peak learning rate specifically tuned for the 175B parameter model size.
-| **LR Warmup**         | First 375M tokens  | A linear warmup period over the first 375 million tokens to prevent gradient divergence.
-| **LR Decay**          | Cosine to 10%      | Uses a cosine decay schedule, reducing the rate to 10% of its peak over 260 billion tokens.
-| **Weight Decay**      | 0.1                | Regularization term applied to the weights to prevent overfitting and improve generalization.
-| **Gradient Clipping** | 1.0                | Global norm clipping at 1.0 to handle high-variance gradients and ensure training stability.
+*Ab Initio Prediction* is the most basic functionality for such gene finder program. It's require able to generate prediction in form of GFF/GTF in terms of given DNA input sequences.   
+Therefore, theoretically, for achieving this, there have to be a decoder part for generating (to transfer what have already learned) the ideal outputs.  
 
-Since Gemini 3 pro and Claude don't have public disclosed for pre-trainning parameter and methodology. We just applied GPT-3 175B Model trainning parameter right away. Furthermore, there would be documentation on what kinda of species data we used to pre-train the model.  
+While getting the Pre-trained understanding about Genomic Sequnece. We shall keep the weights and bias for both decoder as the following components:
 
-For Prokaryotics:    
+| Component                   | Action          | Reason
+| :-------------------------: | :-----------:   | :---- 
+| **Encoder Self-Attention**  | **Copy**        | It already knows how to find context in the input.
+| **Decoder Self-Attention**  | **Copy**        | It can reuse the Encoder's logic for finding context.
+| **Cross-Attention**         | **Random Init** | This is the "new" connection that links input to output.
+| **Layer Norms**             | **Copy**        | Keeps the math stable from the start.
+| **Output Head**             | **Copy/Init**   | Usually initialized from the Input Embeddings (Shared).
 
-|  Species  |  Source   | Data
-| :-------: | :-------: | :---
-| E.Coli    |  NCBI     | GFF + FASTA
-|
 
-For Eukaryotics:  
+---
 
-|  Species  |  Chromosome 
-| :-------: | :----------
+
+### Fine Tuning
+
+For letting the model have ideal functionality for proper Ab Inito prediction is fine-tuning on datas from multiple species. 
+
+Fine-tuning seem like taking 60GB of RAM through Pytorch packages.   

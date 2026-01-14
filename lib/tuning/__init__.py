@@ -19,6 +19,12 @@ from ._chunking import (
     estimate_tokens,
 )
 
+from .dataset import (
+    MixedTaskDataset,
+    SmartBatchSampler,
+    DynamicPaddingCollator,
+)
+
 
 __all__ = [
     # parser
@@ -38,4 +44,8 @@ __all__ = [
     "chunk_classification_sample",
     "preprocess_and_chunk",
     "estimate_tokens",
+    # dataset
+    "MixedTaskDataset",
+    "SmartBatchSampler",
+    "DynamicPaddingCollator",
 ]

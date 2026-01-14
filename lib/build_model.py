@@ -29,11 +29,12 @@ def build_gt5(
     Build GeneT5 from DNABERT-2 and save clean checkpoint.
     
     Weight Transfer:
+        Encoder Embedding       -> COPY from DNABERT-2
         Encoder Self-Attention  -> COPY from DNABERT-2
         Decoder Self-Attention  -> COPY from Encoder
         Cross-Attention         -> RANDOM INIT
         Layer Norms             -> COPY
-        Embeddings              -> RANDOM INIT
+        Decoder Embedding       -> RANDOM INIT (or share with encoder)
         Output Head             -> TIED or RANDOM INIT
     """
     print("=" * 60)
@@ -80,8 +81,37 @@ def build_gt5(
     print(f"      use_alibi:       {decoder_use_alibi}")
     print(f"      use_moe:         {decoder_use_moe}")
     
+    # DNABERT-2's AutoModel returns BertModel directly (no .bert wrapper)
+    # Could be original_model.encoder or original_model.bert.encoder depending on version
+    if hasattr(original_model, 'bert'):
+        bert = original_model.bert
+    else:
+        bert = original_model
+    
+    # Extract encoder embedding from DNABERT-2
+    print("\n[2] Extracting Encoder Embedding from DNABERT-2")
+    encoder_embed = nn.Embedding(vocab_size, dna_config.hidden_size)
+    
+    if hasattr(bert, 'embeddings') and hasattr(bert.embeddings, 'word_embeddings'):
+        orig_embed = bert.embeddings.word_embeddings.weight.data
+        orig_vocab_size = orig_embed.shape[0]
+        
+        # Copy original embeddings
+        copy_size = min(orig_vocab_size, vocab_size)
+        encoder_embed.weight.data[:copy_size].copy_(orig_embed[:copy_size])
+        
+        # Random init for new tokens
+        if vocab_size > orig_vocab_size:
+            nn.init.normal_(encoder_embed.weight.data[orig_vocab_size:], mean=0.0, std=0.02)
+            print(f"    ✓ Copied {copy_size} embeddings, random init for {vocab_size - orig_vocab_size} new tokens")
+        else:
+            print(f"    ✓ Copied {copy_size} embeddings")
+    else:
+        nn.init.normal_(encoder_embed.weight, mean=0.0, std=0.02)
+        print("    ! No embedding found in DNABERT-2, using random init")
+    
     # Build Encoder
-    print(f"\n[2] Building BigBird Encoder (block_size={block_size})")
+    print(f"\n[3] Building BigBird Encoder (block_size={block_size})")
     encoder = Encoder(
         num_layers         = dna_config.num_hidden_layers,
         embed_dim          = dna_config.hidden_size,
@@ -96,14 +126,7 @@ def build_gt5(
     )
     
     # Transfer Encoder Weights
-    print("\n[3] Transferring Encoder Weights from DNABERT-2")
-    
-    # DNABERT-2's AutoModel returns BertModel directly (no .bert wrapper)
-    # Could be original_model.encoder or original_model.bert.encoder depending on version
-    if hasattr(original_model, 'bert'):
-        bert = original_model.bert
-    else:
-        bert = original_model
+    print("\n[4] Transferring Encoder Weights from DNABERT-2")
     
     original_layers = bert.encoder.layer
     
@@ -253,7 +276,7 @@ def build_gt5(
         torch.cuda.empty_cache()
     
     # Build Decoder
-    print(f"\n[4] Building Decoder (layers={decoder_num_layers}, moe={decoder_use_moe})")
+    print(f"\n[5] Building Decoder (layers={decoder_num_layers}, moe={decoder_use_moe})")
     decoder = Decoder(
         num_layers       = decoder_num_layers,
         embed_dim        = dna_config.hidden_size,
@@ -268,7 +291,7 @@ def build_gt5(
     )
     
     # Transfer Decoder Self-Attention from Encoder
-    print("\n[5] Transferring Decoder Self-Attention from Encoder")
+    print("\n[6] Transferring Decoder Self-Attention from Encoder")
     num_copy = min(decoder_num_layers, len(encoder.layers))
     
     for idx in range(num_copy):
@@ -291,7 +314,7 @@ def build_gt5(
     print(f"    ✓ Copied {num_copy} layers")
     
     # Random Init Cross-Attention
-    print("\n[6] Random Init Cross-Attention")
+    print("\n[7] Random Init Cross-Attention")
     for layer in decoder.layers:
         nn.init.xavier_uniform_(layer.cross_attn.q.weight)
         nn.init.xavier_uniform_(layer.cross_attn.k.weight)
@@ -301,7 +324,7 @@ def build_gt5(
     print("    ✓ Cross-attention initialized")
     
     # Random Init Decoder FFN (or MoE)
-    print("\n[7] Random Init Decoder FFN")
+    print("\n[8] Random Init Decoder FFN")
     for layer in decoder.layers:
         if decoder_use_moe:
             # MoE has different structure
@@ -322,8 +345,8 @@ def build_gt5(
     nn.init.ones_(decoder.final_norm.weight)
     print("    ✓ FFN initialized")
     
-    # Build Embeddings and LM Head
-    print("\n[8] Building Embeddings and LM Head")
+    # Build Decoder Embeddings and LM Head
+    print("\n[9] Building Decoder Embeddings and LM Head")
     decoder_embed = nn.Embedding(vocab_size, dna_config.hidden_size)
     lm_head       = nn.Linear(dna_config.hidden_size, vocab_size, bias=False)
     
@@ -331,13 +354,13 @@ def build_gt5(
     
     if tie_weights:
         lm_head.weight = decoder_embed.weight
-        print("    ✓ Weights tied (embed = lm_head)")
+        print("    ✓ Weights tied (decoder_embed = lm_head)")
     else:
         nn.init.xavier_uniform_(lm_head.weight)
         print("    ✓ Separate weights initialized")
     
     # Save Checkpoint
-    print(f"\n[9] Saving Checkpoint to {save_dir}")
+    print(f"\n[10] Saving Checkpoint to {save_dir}")
     save_path = Path(save_dir)
     save_path.mkdir(parents=True, exist_ok=True)
     
@@ -366,8 +389,9 @@ def build_gt5(
         json.dump(config, f, indent=2)
     print("    ✓ config.json saved")
     
-    # Save weights
+    # Save weights (now includes encoder_embed)
     checkpoint = {
+        "encoder_embed": encoder_embed.state_dict(),
         "encoder":       encoder.state_dict(),
         "decoder":       decoder.state_dict(),
         "decoder_embed": decoder_embed.state_dict(),
@@ -385,7 +409,8 @@ def build_gt5(
         torch.cuda.empty_cache()
     
     # Stats
-    total_params = sum(p.numel() for p in encoder.parameters())
+    total_params = sum(p.numel() for p in encoder_embed.parameters())
+    total_params += sum(p.numel() for p in encoder.parameters())
     total_params += sum(p.numel() for p in decoder.parameters())
     total_params += sum(p.numel() for p in decoder_embed.parameters())
     total_params += sum(p.numel() for p in lm_head.parameters())
