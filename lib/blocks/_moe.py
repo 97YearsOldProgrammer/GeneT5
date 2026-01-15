@@ -173,51 +173,78 @@ class TritonExpertDispatch(nn.Module):
     
     def __init__(self, num_experts, capacity_factor=1.25):
         super().__init__()
-        self.num_experts     = num_experts
+        self.num_experts = num_experts
         self.capacity_factor = capacity_factor
     
     def forward(self, x, expert_ids, expert_weights):
-        num_tokens, embed_dim = x.shape
-        capacity              = int((num_tokens / self.num_experts) * self.capacity_factor)
-        capacity              = max(capacity, 1)
-        device                = x.device
+
+        num_tokens, embed_dim   = x.shape
+        device                  = x.device
+        dtype                   = x.dtype
         
-        positions     = torch.zeros(num_tokens, dtype=torch.int32, device=device)
-        expert_counts = torch.zeros(self.num_experts, dtype=torch.int32, device=device)
-        BLOCK_SIZE    = 256
-        grid          = (triton.cdiv(num_tokens, BLOCK_SIZE),)
+        # Calculate capacity per expert
+        capacity = int((num_tokens / self.num_experts) * self.capacity_factor)
+        capacity = max(capacity, 1)
         
-        expert_position_kernel[grid](
-            expert_ids, positions, expert_counts,
-            num_tokens, self.num_experts,
-            BLOCK_SIZE=BLOCK_SIZE,
-        )
+        expert_ids  = expert_ids.contiguous()
+        expert_ids  = expert_ids.clamp(0, self.num_experts - 1)
+        positions   = torch.zeros(num_tokens, dtype=torch.long, device=device)
         
-        positions      = positions.long()
-        expert_counts  = expert_counts.long()
-        valid_mask     = positions < capacity
-        tokens_dropped = (~valid_mask).sum().item()
+        # Sort by expert to efficiently compute positions
+        sort_indices        = torch.argsort(expert_ids, stable=True)
+        sorted_expert_ids   = expert_ids[sort_indices]
         
+        # Compute position within each expert group using cumsum trick
+        if num_tokens > 0:
+            # Create segment boundaries
+            segment_start       = torch.zeros(num_tokens, dtype=torch.bool, device=device)
+            segment_start[0]    = True
+            if num_tokens > 1:
+                segment_start[1:] = sorted_expert_ids[1:] != sorted_expert_ids[:-1]
+            
+            # Cumsum with reset at segment boundaries
+            ones    = torch.ones(num_tokens, device=device, dtype=torch.long)
+            cumsum = torch.cumsum(ones, dim=0)
+            
+            # Calculate offset to subtract for each segment
+            segment_offsets = cumsum * segment_start.long()
+            segment_base    = torch.cummax(segment_offsets, dim=0)[0]
+            
+            # Position within segment is: cumsum - segment_base
+            sorted_positions = cumsum - segment_base
+            
+            # Unsort to get original positions
+            positions[sort_indices] = sorted_positions
+        
+        # Determine valid tokens (within capacity)
+        valid_mask      = positions < capacity
+        tokens_dropped  = (~valid_mask).sum().item()
+        
+        # Initialize output tensors
         dispatched_x = torch.zeros(
             self.num_experts, capacity, embed_dim,
-            dtype=x.dtype, device=device
+            dtype=dtype, device=device
         )
         combine_weights = torch.zeros(
             self.num_experts, capacity,
-            dtype=x.dtype, device=device
+            dtype=dtype, device=device
         )
         token_indices = torch.full(
             (self.num_experts, capacity), -1,
             dtype=torch.long, device=device
         )
         
-        valid_tokens    = torch.where(valid_mask)[0]
-        valid_experts   = expert_ids[valid_mask]
-        valid_positions = positions[valid_mask]
+        # Only process valid tokens
+        valid_tokens = torch.where(valid_mask)[0]
         
-        dispatched_x[valid_experts, valid_positions]    = x[valid_tokens]
-        combine_weights[valid_experts, valid_positions] = expert_weights[valid_tokens]
-        token_indices[valid_experts, valid_positions]   = valid_tokens
+        if valid_tokens.numel() > 0:
+            valid_experts   = expert_ids[valid_mask]
+            valid_positions = positions[valid_mask]
+            
+            # Scatter tokens to their expert slots
+            dispatched_x[valid_experts, valid_positions]    = x[valid_tokens]
+            combine_weights[valid_experts, valid_positions] = expert_weights[valid_tokens]
+            token_indices[valid_experts, valid_positions]   = valid_tokens
         
         return dispatched_x, combine_weights, token_indices, tokens_dropped
 
