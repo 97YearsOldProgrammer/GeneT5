@@ -203,7 +203,7 @@ class ALiBi(nn.Module):
         
         # Precompute bias for max_seq_len
         alibi_bias = self._build_alibi_bias(max_seq_len, slopes)
-        self.register_buffer('alibi_bias', alibi_bias)
+        self.register_buffer('alibi_bias', alibi_bias, persistent=False)
     
     @staticmethod
     def _get_slopes(num_heads):
