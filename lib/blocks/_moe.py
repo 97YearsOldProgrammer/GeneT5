@@ -81,7 +81,7 @@ def grouped_gemm_kernel(
                     mask=mask_m, other=0.0
                 )
                 w_row = tl.load(
-                    W_ptr + expert_ids * stride_w_expert + 
+                    W_ptr + expert_ids[:, None] * stride_w_expert + 
                     offs_n[None, :] * stride_w_out + 
                     (k_start + k_idx) * stride_w_in,
                     mask=mask_m[:, None] & mask_n[None, :],
