@@ -40,7 +40,7 @@ class GeneT5(nn.Module):
         self.embed_dim  = embed_dim
         self.vocab_size = vocab_size
         
-        # Encoder embedding (CRITICAL: Encoder expects hidden_states, not input_ids)
+        # Encoder embedding
         self.encoder_embed         = nn.Embedding(vocab_size, embed_dim)
         self.encoder_embed_dropout = nn.Dropout(decoder_dropout)
         
