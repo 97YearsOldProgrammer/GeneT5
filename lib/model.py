@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -117,8 +116,13 @@ class GeneT5(nn.Module):
                 encoder_attention_mask
             )
         
+        # Replace invalid indices (-100 or out of vocab) with pad token
+        decoder_input_ids_safe = decoder_input_ids.clone()
+        decoder_input_ids_safe[decoder_input_ids_safe < 0] = 0
+        decoder_input_ids_safe[decoder_input_ids_safe >= self.vocab_size] = 0
+        
         # Embed decoder inputs
-        decoder_embeds = self.decoder_embed(decoder_input_ids)
+        decoder_embeds = self.decoder_embed(decoder_input_ids_safe)
         decoder_embeds = self.decoder_embed_dropout(decoder_embeds)
         
         # Decode
