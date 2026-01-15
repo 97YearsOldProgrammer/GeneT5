@@ -1,21 +1,20 @@
-
 import argparse
 import json
 import random
 import sys
 from pathlib import Path
 
-import  torch
-from    torch.utils.data import DataLoader
+import torch
+from torch.utils.data import DataLoader
 
 
-import  lib.train       as     train
-from    lib             import tuning
-from    lib.model       import GeneT5
-from    lib.tokenizer   import GeneTokenizer
+from lib import train as lib_train
+from lib import tuning
+from lib.model      import GeneT5
+from lib.tokenizer  import GeneTokenizer
 
 
-# Trainning Parameter for Saving Space
+# Training Parameters
 DEFAULTS = {
     "max_input_len":  4096,
     "max_target_len": 2048,
@@ -31,7 +30,6 @@ DEFAULTS = {
 }
 
 
-# Require a Wrapper for multi parallel working
 def main():
     parser = argparse.ArgumentParser(description="Fine-tune GeneT5")
 
@@ -58,7 +56,6 @@ def main():
         help="Random seed for reproducibility (shuffling, dropout, etc).")
     parser.add_argument("--save_every", type=int, default=1,
         help="Save checkpoint every N epochs.")
-    # Add num_workers arg so you can tune it easily
     parser.add_argument("--num_workers", type=int, default=DEFAULTS["num_workers"],
         help="Number of dataloader workers.")
 
@@ -66,10 +63,10 @@ def main():
 
     # setup
     print(f"\n{' GeneT5 Fine-Tuning ':=^60}")
-    device = train.get_device()
+    device = lib_train.get_device()
     print(f"Device: {device}")
 
-    # seed - ensures reproducible shuffling and initialization
+    # seed
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     if torch.cuda.is_available():
@@ -86,14 +83,13 @@ def main():
 
     # load model
     print(f"\nLoading model...")
-    # Ensure model loads on CPU first to save GPU memory during init
     model = GeneT5.from_pretrained(model_path, device="cpu").to(device)
 
     stats = model.get_param_stats()
     print(f"  Trainable: {stats['total_trainable']:,}")
     print(f"  Frozen:    {stats['total_frozen']:,}")
 
-    # load dataset - multiple files get mixed
+    # load dataset
     print(f"\nLoading training data...")
     print(f"  Files: {args.train_data}")
 
@@ -130,9 +126,8 @@ def main():
             shuffle     = True,
         ),
         collate_fn  = collator,
-        num_workers = args.num_workers, # Use the argument
+        num_workers = args.num_workers,
         pin_memory  = True,
-        # persistent_workers=True can help speed up epochs on Mac if RAM allows
         persistent_workers = (args.num_workers > 0), 
     )
     print(f"  Total batches: {len(train_loader)}")
@@ -160,7 +155,7 @@ def main():
     # resume checkpoint
     start_epoch = 0
     if args.checkpoint:
-        start_epoch = train.load_checkpoint(model, optimizer, scheduler, args.checkpoint, device)
+        start_epoch = lib_train.load_checkpoint(model, optimizer, scheduler, args.checkpoint, device)
         print(f"  Resumed from epoch {start_epoch}")
 
     # save config
@@ -176,7 +171,7 @@ def main():
         print(f"\nEpoch {epoch + 1}/{args.epochs}")
         print("-" * 40)
         
-        train_loss = train.train_epoch_seq2seq(
+        train_loss = lib_train.train_epoch_seq2seq(
             model, train_loader, optimizer, scheduler,
             device, args.grad_accum, DEFAULTS["max_grad_norm"]
         )
@@ -185,14 +180,14 @@ def main():
         
         # save checkpoint
         if (epoch + 1) % args.save_every == 0:
-            train.save_checkpoint(
+            lib_train.save_checkpoint(
                 model, optimizer, scheduler, epoch + 1,
                 output_dir / f"checkpoint_epoch{epoch + 1}.pt", config
             )
 
     # save final
     print(f"\nSaving final model...")
-    train.save_checkpoint(model, optimizer, scheduler, args.epochs, output_dir / "final_model.pt", config)
+    lib_train.save_checkpoint(model, optimizer, scheduler, args.epochs, output_dir / "final_model.pt", config)
     model.save(output_dir / "pytorch_model.bin")
     tokenizer.save_pretrained(output_dir)
 
