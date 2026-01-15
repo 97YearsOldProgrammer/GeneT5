@@ -24,7 +24,7 @@ DEFAULTS = {
     "epochs":         3,
     "weight_decay":   0.1,
     "warmup_ratio":   0.1,
-    "grad_accum":     128,
+    "grad_accum":     64,
     "max_grad_norm":  1.0,
     "bucket_size":    256,
     "num_workers":    8,
