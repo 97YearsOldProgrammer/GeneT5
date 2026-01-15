@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 from pathlib import Path
@@ -107,7 +106,12 @@ def evaluate(model, dataloader, device):
 
 
 def evaluate_seq2seq(model, dataloader, device):
-    """Evaluate model on validation set - seq2seq specific."""
+    """
+    Evaluate model on validation set - seq2seq specific.
+    
+    Returns:
+        float: Average validation loss
+    """
     model.eval()
     total_loss = 0
     
@@ -123,7 +127,9 @@ def evaluate_seq2seq(model, dataloader, device):
             
             total_loss += outputs["loss"].item()
     
-    return total_loss / len(dataloader)
+    avg_loss = total_loss / len(dataloader)
+    model.train()  # Put model back in training mode
+    return avg_loss
 
 
 ##################################
@@ -132,7 +138,12 @@ def evaluate_seq2seq(model, dataloader, device):
 
 
 def load_checkpoint(model, optimizer, scheduler, checkpoint_path, device="cpu"):
-    """Load model, optimizer, and scheduler states from checkpoint."""
+    """
+    Load model, optimizer, and scheduler states from checkpoint.
+    
+    Returns:
+        dict: Checkpoint metadata including epoch and best_val_loss
+    """
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -144,9 +155,15 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path, device="cpu"):
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
     
     epoch = checkpoint.get("epoch", 0)
+    best_val_loss = checkpoint.get("config", {}).get("best_val_loss", float('inf'))
     
     print(f"Loaded checkpoint from {checkpoint_path} (epoch {epoch})")
-    return epoch
+    
+    return {
+        "epoch": epoch,
+        "best_val_loss": best_val_loss,
+        "config": checkpoint.get("config", {})
+    }
 
 
 def save_checkpoint(model, optimizer, scheduler, epoch, save_path, config=None):
@@ -165,7 +182,6 @@ def save_checkpoint(model, optimizer, scheduler, epoch, save_path, config=None):
         checkpoint["config"] = config
     
     torch.save(checkpoint, save_path)
-    print(f"Saved checkpoint to {save_path}")
 
 
 ##################################
@@ -255,8 +271,8 @@ def prepare_tokenizer(model_path, special_tokens=None):
 def prepare_optimizer_scheduler(model, train_loader, lr, weight_decay, 
                                 epochs, grad_accum, warmup_ratio, scheduler_type="linear"):
     """Prepare optimizer and scheduler."""
-    from torch.optim import AdamW
-    from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
+    from torch.optim    import AdamW
+    from transformers   import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
     
     total_steps  = len(train_loader) * epochs // grad_accum
     warmup_steps = int(total_steps * warmup_ratio)
@@ -277,7 +293,7 @@ def prepare_optimizer_scheduler(model, train_loader, lr, weight_decay,
 
 
 def get_device():
-    """Get best available device."""
+    """Get best available device"""
     if torch.cuda.is_available():
         return torch.device("cuda")
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():

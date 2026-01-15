@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 
 
 from lib import train as lib_train
@@ -27,6 +27,7 @@ DEFAULTS = {
     "max_grad_norm":  1.0,
     "bucket_size":    256,
     "num_workers":    8,
+    "val_split":      0.2,
 }
 
 
@@ -52,14 +53,22 @@ def main():
     parser.add_argument("--max_input_len", type=int, default=DEFAULTS["max_input_len"])
     parser.add_argument("--max_target_len", type=int, default=DEFAULTS["max_target_len"])
     parser.add_argument("--grad_accum", type=int, default=DEFAULTS["grad_accum"])
+    parser.add_argument("--val_split", type=float, default=DEFAULTS["val_split"],
+        help="Fraction of data to use for validation (0.0-1.0). Default: 0.2 (20%)")
     parser.add_argument("--seed", type=int, default=42,
         help="Random seed for reproducibility (shuffling, dropout, etc).")
     parser.add_argument("--save_every", type=int, default=1,
         help="Save checkpoint every N epochs.")
     parser.add_argument("--num_workers", type=int, default=DEFAULTS["num_workers"],
         help="Number of dataloader workers.")
+    parser.add_argument("--early_stopping", type=int, default=None,
+        help="Stop training if validation loss doesn't improve for N epochs.")
 
     args = parser.parse_args()
+
+    # Validate val_split
+    if not 0.0 <= args.val_split < 1.0:
+        raise ValueError(f"val_split must be between 0.0 and 1.0, got {args.val_split}")
 
     # setup
     print(f"\n{' GeneT5 Fine-Tuning ':=^60}")
@@ -93,33 +102,53 @@ def main():
     print(f"\nLoading training data...")
     print(f"  Files: {args.train_data}")
 
-    train_dataset = tuning.MixedTaskDataset(
+    full_dataset = tuning.MixedTaskDataset(
         data_paths     = args.train_data,
         tokenizer      = tokenizer,
         max_input_len  = args.max_input_len,
         max_target_len = args.max_target_len,
     )
-    print(f"  Total samples: {len(train_dataset)}")
+    print(f"  Total samples: {len(full_dataset)}")
 
     # show task distribution
     task_counts = {}
-    for sample in train_dataset.samples:
+    for sample in full_dataset.samples:
         task = sample["task"]
         task_counts[task] = task_counts.get(task, 0) + 1
     print(f"  Task distribution: {task_counts}")
 
+    # Split into train/val
+    if args.val_split > 0:
+        val_size = int(len(full_dataset) * args.val_split)
+        train_size = len(full_dataset) - val_size
+        
+        # Use generator for reproducible split
+        generator = torch.Generator().manual_seed(args.seed)
+        train_dataset, val_dataset = random_split(
+            full_dataset, [train_size, val_size], generator=generator
+        )
+        
+        print(f"\n  Split:")
+        print(f"    Train samples: {len(train_dataset)} ({100*(1-args.val_split):.1f}%)")
+        print(f"    Val samples:   {len(val_dataset)} ({100*args.val_split:.1f}%)")
+    else:
+        train_dataset = full_dataset
+        val_dataset = None
+        print(f"  No validation split (val_split=0)")
+
     # dataloader with smart batching
-    print(f"\nSetting up dataloader...")
+    print(f"\nSetting up dataloaders...")
 
     collator = tuning.DynamicPaddingCollator(
         pad_token_id = tokenizer.pad_token_id,
         label_pad    = -100,
     )
 
+    # Train loader
     train_loader = DataLoader(
         train_dataset,
         batch_sampler = tuning.SmartBatchSampler(
-            lengths     = train_dataset.lengths,
+            lengths     = [full_dataset.lengths[i] for i in train_dataset.indices],
             batch_size  = args.batch_size,
             bucket_size = DEFAULTS["bucket_size"],
             drop_last   = True,
@@ -130,7 +159,26 @@ def main():
         pin_memory  = True,
         persistent_workers = (args.num_workers > 0), 
     )
-    print(f"  Total batches: {len(train_loader)}")
+    print(f"  Train batches: {len(train_loader)}")
+
+    # Validation loader
+    val_loader = None
+    if val_dataset is not None:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_sampler = tuning.SmartBatchSampler(
+                lengths     = [full_dataset.lengths[i] for i in val_dataset.indices],
+                batch_size  = args.batch_size,
+                bucket_size = DEFAULTS["bucket_size"],
+                drop_last   = False,  # Don't drop incomplete batches for validation
+                shuffle     = False,  # Don't shuffle validation
+            ),
+            collate_fn  = collator,
+            num_workers = args.num_workers,
+            pin_memory  = True,
+            persistent_workers = (args.num_workers > 0),
+        )
+        print(f"  Val batches:   {len(val_loader)}")
 
     # optimizer & scheduler
     print(f"\nSetting up optimizer...")
@@ -154,40 +202,90 @@ def main():
 
     # resume checkpoint
     start_epoch = 0
+    best_val_loss = float('inf')
+    patience_counter = 0
+    
     if args.checkpoint:
-        start_epoch = lib_train.load_checkpoint(model, optimizer, scheduler, args.checkpoint, device)
+        checkpoint_data = lib_train.load_checkpoint(
+            model, optimizer, scheduler, args.checkpoint, device
+        )
+        start_epoch = checkpoint_data["epoch"]
+        best_val_loss = checkpoint_data.get("best_val_loss", float('inf'))
         print(f"  Resumed from epoch {start_epoch}")
+        print(f"  Best val loss so far: {best_val_loss:.4f}")
 
     # save config
-    config = {**vars(args), "vocab_size": len(tokenizer), "total_steps": total_steps}
+    config = {
+        **vars(args), 
+        "vocab_size": len(tokenizer), 
+        "total_steps": total_steps,
+        "train_samples": len(train_dataset),
+        "val_samples": len(val_dataset) if val_dataset else 0,
+    }
     with open(output_dir / "finetune_config.json", "w") as f:
         json.dump(config, f, indent=2)
 
     # training loop
     print(f"\n{'=' * 60}")
     print("Training...")
+    print(f"{'=' * 60}")
 
     for epoch in range(start_epoch, args.epochs):
         print(f"\nEpoch {epoch + 1}/{args.epochs}")
         print("-" * 40)
         
+        # Train
         train_loss = lib_train.train_epoch_seq2seq(
             model, train_loader, optimizer, scheduler,
             device, args.grad_accum, DEFAULTS["max_grad_norm"]
         )
-        print(f"  Loss: {train_loss:.4f}")
-        print(f"  LR: {scheduler.get_last_lr()[0]:.2e}")
         
-        # save checkpoint
+        # Validate
+        val_loss = None
+        if val_loader is not None:
+            val_loss = lib_train.evaluate_seq2seq(model, val_loader, device)
+            print(f"  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
+            
+            # Check if this is the best model
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                
+                # Save best model
+                print(f"  ✓ New best validation loss! Saving best_model.pt")
+                lib_train.save_checkpoint(
+                    model, optimizer, scheduler, epoch + 1,
+                    output_dir / "best_model.pt", 
+                    {**config, "best_val_loss": best_val_loss, "best_epoch": epoch + 1}
+                )
+            else:
+                patience_counter += 1
+                print(f"  No improvement ({patience_counter}/{args.early_stopping if args.early_stopping else '∞'})")
+                
+                # Early stopping
+                if args.early_stopping and patience_counter >= args.early_stopping:
+                    print(f"\n  Early stopping triggered! No improvement for {args.early_stopping} epochs.")
+                    break
+        else:
+            print(f"  Train Loss: {train_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
+        
+        # Save periodic checkpoint (always overwrites same file)
         if (epoch + 1) % args.save_every == 0:
             lib_train.save_checkpoint(
                 model, optimizer, scheduler, epoch + 1,
-                output_dir / f"checkpoint_epoch{epoch + 1}.pt", config
+                output_dir / "checkpoint_latest.pt", 
+                {**config, "best_val_loss": best_val_loss}
             )
+            print(f"  Saved checkpoint_latest.pt")
 
     # save final
-    print(f"\nSaving final model...")
-    lib_train.save_checkpoint(model, optimizer, scheduler, args.epochs, output_dir / "final_model.pt", config)
+    print(f"\n{'=' * 60}")
+    print(f"Saving final model...")
+    lib_train.save_checkpoint(
+        model, optimizer, scheduler, args.epochs, 
+        output_dir / "final_model.pt", 
+        {**config, "best_val_loss": best_val_loss}
+    )
     model.save(output_dir / "pytorch_model.bin")
     tokenizer.save_pretrained(output_dir)
 
@@ -198,7 +296,13 @@ def main():
         json.dump(model_config, f, indent=2)
 
     print(f"\n{'=' * 60}")
-    print(f"✓ Fine-tuning complete! Output: {output_dir}")
+    print(f"✓ Fine-tuning complete!")
+    print(f"  Output: {output_dir}")
+    if val_loader is not None:
+        print(f"  Best Val Loss: {best_val_loss:.4f}")
+        print(f"  Best model saved as: best_model.pt")
+    print(f"  Final model saved as: final_model.pt")
+    print(f"  Latest checkpoint: checkpoint_latest.pt")
     print(f"{'=' * 60}")
 
 if __name__ == "__main__":
