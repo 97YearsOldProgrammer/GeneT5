@@ -12,7 +12,12 @@ import torch.distributed    as dist
 import triton
 import triton.language as tl
 
-import deepspeed
+# Check if deepspeed is available
+try:
+    import deepspeed
+    DEEPSPEED_AVAILABLE = True
+except ImportError:
+    DEEPSPEED_AVAILABLE = False
 
 
 ##################
@@ -64,8 +69,12 @@ def grouped_gemm_kernel(
     mask_m = offs_m < total_tokens
     mask_n = offs_n < out_dim
     
+    # Load expert IDs with bounds checking - use 0 as safe default
     expert_ids = tl.load(expert_ids_ptr + offs_m, mask=mask_m, other=0)
-    acc        = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    # Clamp expert_ids to valid range
+    expert_ids = tl.minimum(tl.maximum(expert_ids, 0), num_experts - 1)
+    
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     
     for k_start in range(0, in_dim, BLOCK_K):
         k_offs  = k_start + offs_k
@@ -123,6 +132,9 @@ class TritonGroupedGEMM(torch.autograd.Function):
         num_experts, out_dim, _ = weight.shape
         output                  = torch.empty(num_tokens, out_dim, device=x.device, dtype=x.dtype)
         
+        # Clamp expert_ids to valid range before use
+        expert_ids = expert_ids.clamp(0, num_experts - 1)
+        
         BLOCK_M, BLOCK_N, BLOCK_K = 32, 64, 32
         grid = (
             triton.cdiv(num_tokens, BLOCK_M),
@@ -139,21 +151,25 @@ class TritonGroupedGEMM(torch.autograd.Function):
         )
         
         ctx.save_for_backward(x, weight, expert_ids)
+        ctx.num_experts = num_experts
         return output
     
     @staticmethod
     def backward(ctx, grad_output):
         x, weight, expert_ids = ctx.saved_tensors
-        num_experts           = weight.shape[0]
+        num_experts           = ctx.num_experts
         
-        selected_weights = weight[expert_ids]
+        # Ensure expert_ids are valid before indexing
+        expert_ids_clamped = expert_ids.clamp(0, num_experts - 1)
+        
+        selected_weights = weight[expert_ids_clamped]
         grad_x           = torch.einsum('no,nod->nd', grad_output, selected_weights)
         
         grad_weight      = torch.zeros_like(weight)
         grad_contribution = torch.einsum('no,nd->nod', grad_output, x)
         
         for i in range(num_experts):
-            mask = expert_ids == i
+            mask = expert_ids_clamped == i
             if mask.any():
                 grad_weight[i] = grad_contribution[mask].sum(dim=0)
         
@@ -177,48 +193,85 @@ class TritonExpertDispatch(nn.Module):
         self.capacity_factor = capacity_factor
     
     def forward(self, x, expert_ids, expert_weights):
-
-        num_tokens, embed_dim   = x.shape
-        device                  = x.device
-        dtype                   = x.dtype
+        num_tokens, embed_dim = x.shape
+        device                = x.device
+        dtype                 = x.dtype
         
-        # Calculate capacity per expert
-        capacity = int((num_tokens / self.num_experts) * self.capacity_factor)
+        # Handle empty input
+        if num_tokens == 0:
+            capacity = 1
+            dispatched_x = torch.zeros(
+                self.num_experts, capacity, embed_dim,
+                dtype=dtype, device=device
+            )
+            combine_weights = torch.zeros(
+                self.num_experts, capacity,
+                dtype=dtype, device=device
+            )
+            token_indices = torch.full(
+                (self.num_experts, capacity), -1,
+                dtype=torch.long, device=device
+            )
+            return dispatched_x, combine_weights, token_indices, 0
+        
+        # Calculate capacity per expert - ensure minimum capacity
+        capacity = int(math.ceil((num_tokens / self.num_experts) * self.capacity_factor))
         capacity = max(capacity, 1)
         
-        expert_ids  = expert_ids.contiguous()
-        expert_ids  = expert_ids.clamp(0, self.num_experts - 1)
-        positions   = torch.zeros(num_tokens, dtype=torch.long, device=device)
+        # Clamp expert_ids to valid range BEFORE any operations
+        expert_ids = expert_ids.contiguous()
+        expert_ids = expert_ids.clamp(0, self.num_experts - 1)
         
-        # Sort by expert to efficiently compute positions
-        sort_indices        = torch.argsort(expert_ids, stable=True)
-        sorted_expert_ids   = expert_ids[sort_indices]
+        # Initialize positions tensor
+        positions = torch.zeros(num_tokens, dtype=torch.long, device=device)
         
-        # Compute position within each expert group using cumsum trick
-        if num_tokens > 0:
+        # Use a simpler, more robust position calculation using scatter
+        # Count tokens per expert and compute positions
+        expert_counts = torch.zeros(self.num_experts, dtype=torch.long, device=device)
+        
+        # Sort tokens by expert for efficient processing
+        sort_indices = torch.argsort(expert_ids, stable=True)
+        sorted_expert_ids = expert_ids[sort_indices]
+        
+        # Find boundaries between expert groups
+        # Use a safer method that handles edge cases
+        if num_tokens == 1:
+            # Single token case
+            positions[0] = 0
+        else:
             # Create segment boundaries
-            segment_start       = torch.zeros(num_tokens, dtype=torch.bool, device=device)
-            segment_start[0]    = True
-            if num_tokens > 1:
-                segment_start[1:] = sorted_expert_ids[1:] != sorted_expert_ids[:-1]
+            segment_boundaries = torch.zeros(num_tokens, dtype=torch.bool, device=device)
+            segment_boundaries[0] = True
+            segment_boundaries[1:] = sorted_expert_ids[1:] != sorted_expert_ids[:-1]
             
-            # Cumsum with reset at segment boundaries
-            ones    = torch.ones(num_tokens, device=device, dtype=torch.long)
-            cumsum = torch.cumsum(ones, dim=0)
+            # Compute positions within each segment using cumsum
+            # Create a ones tensor
+            ones = torch.ones(num_tokens, dtype=torch.long, device=device)
             
-            # Calculate offset to subtract for each segment
-            segment_offsets = cumsum * segment_start.long()
-            segment_base    = torch.cummax(segment_offsets, dim=0)[0]
+            # Cumulative sum gives us raw position (1-indexed)
+            raw_cumsum = torch.cumsum(ones, dim=0)
             
-            # Position within segment is: cumsum - segment_base
-            sorted_positions = cumsum - segment_base
+            # Get the cumsum value at each segment start
+            # Use masked_fill and cummax to propagate segment start values
+            segment_starts_cumsum = torch.where(
+                segment_boundaries,
+                raw_cumsum,
+                torch.zeros_like(raw_cumsum)
+            )
+            
+            # Propagate the segment start cumsum values forward
+            segment_base = torch.cummax(segment_starts_cumsum, dim=0)[0]
+            
+            # Position within segment is (raw_cumsum - segment_base)
+            # This gives 0-indexed positions within each segment
+            sorted_positions = raw_cumsum - segment_base
             
             # Unsort to get original positions
             positions[sort_indices] = sorted_positions
         
         # Determine valid tokens (within capacity)
-        valid_mask      = positions < capacity
-        tokens_dropped  = (~valid_mask).sum().item()
+        valid_mask = positions < capacity
+        tokens_dropped = (~valid_mask).sum().item()
         
         # Initialize output tensors
         dispatched_x = torch.zeros(
@@ -235,16 +288,19 @@ class TritonExpertDispatch(nn.Module):
         )
         
         # Only process valid tokens
-        valid_tokens = torch.where(valid_mask)[0]
+        valid_token_indices = torch.where(valid_mask)[0]
         
-        if valid_tokens.numel() > 0:
-            valid_experts   = expert_ids[valid_mask]
+        if valid_token_indices.numel() > 0:
+            valid_experts = expert_ids[valid_mask]
             valid_positions = positions[valid_mask]
             
+            # Additional safety: clamp positions to be within capacity
+            valid_positions = valid_positions.clamp(0, capacity - 1)
+            
             # Scatter tokens to their expert slots
-            dispatched_x[valid_experts, valid_positions]    = x[valid_tokens]
-            combine_weights[valid_experts, valid_positions] = expert_weights[valid_tokens]
-            token_indices[valid_experts, valid_positions]   = valid_tokens
+            dispatched_x[valid_experts, valid_positions] = x[valid_token_indices]
+            combine_weights[valid_experts, valid_positions] = expert_weights[valid_mask]
+            token_indices[valid_experts, valid_positions] = valid_token_indices
         
         return dispatched_x, combine_weights, token_indices, tokens_dropped
 
@@ -323,8 +379,10 @@ class MoE(nn.Module):
         else:
             self._init_local_experts(config)
         
+        # Use higher capacity factor for stability
+        effective_capacity_factor = max(config.capacity_factor, 1.5)
         self.dispatcher = TritonExpertDispatch(
-            config.num_experts, config.capacity_factor
+            config.num_experts, effective_capacity_factor
         )
     
     def _init_local_experts(self, config):
@@ -366,13 +424,23 @@ class MoE(nn.Module):
     def forward(self, x):
         batch_size, seq_len, embed_dim = x.shape
         num_tokens                     = batch_size * seq_len
-        x_flat                         = x.view(num_tokens, embed_dim)
+        
+        # Handle empty input
+        if num_tokens == 0:
+            return x, torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        
+        x_flat = x.view(num_tokens, embed_dim)
         
         router_logits = self.gate(x_flat)
         router_probs  = F.softmax(router_logits, dim=-1)
         
         top_k_probs, top_k_indices = torch.topk(router_probs, self.top_k, dim=-1)
-        top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+        
+        # Ensure top_k_indices are within valid range
+        top_k_indices = top_k_indices.clamp(0, self.num_experts - 1)
+        
+        # Normalize probabilities
+        top_k_probs = top_k_probs / (top_k_probs.sum(dim=-1, keepdim=True) + 1e-8)
         
         if self.use_deepspeed and dist.is_initialized():
             output, tokens_dropped = self._deepspeed_forward(
@@ -394,46 +462,63 @@ class MoE(nn.Module):
         total_dropped         = 0
         
         for k in range(self.top_k):
-            expert_ids     = top_k_indices[:, k]
-            expert_weights = top_k_probs[:, k]
+            expert_ids     = top_k_indices[:, k].contiguous()
+            expert_weights = top_k_probs[:, k].contiguous()
+            
+            # Ensure expert_ids are valid
+            expert_ids = expert_ids.clamp(0, self.num_experts - 1)
             
             dispatched_x, combine_weights, token_indices, dropped = \
                 self.dispatcher(x_flat, expert_ids, expert_weights)
             total_dropped += dropped
             
+            # Get capacity from dispatched tensor
+            capacity = dispatched_x.shape[1]
+            
+            # Create expert indices for the flattened dispatched tensor
+            flat_expert_ids = torch.arange(
+                self.num_experts, device=x_flat.device
+            ).repeat_interleave(capacity)
+            
+            # Process through expert weights
             gate_out = triton_grouped_gemm(
                 dispatched_x.view(-1, embed_dim),
                 self.expert_wi_gate,
-                torch.arange(self.num_experts, device=x_flat.device).repeat_interleave(
-                    dispatched_x.shape[1]
-                )
-            ).view(self.num_experts, -1, self.config.ff_dim)
+                flat_expert_ids
+            ).view(self.num_experts, capacity, self.config.ff_dim)
             gate_out = F.silu(gate_out)
             
             up_out = triton_grouped_gemm(
                 dispatched_x.view(-1, embed_dim),
                 self.expert_wi_up,
-                torch.arange(self.num_experts, device=x_flat.device).repeat_interleave(
-                    dispatched_x.shape[1]
-                )
-            ).view(self.num_experts, -1, self.config.ff_dim)
+                flat_expert_ids
+            ).view(self.num_experts, capacity, self.config.ff_dim)
             
             hidden = self.dropout(gate_out * up_out)
             
             expert_out = triton_grouped_gemm(
                 hidden.view(-1, self.config.ff_dim),
                 self.expert_wo,
-                torch.arange(self.num_experts, device=x_flat.device).repeat_interleave(
-                    hidden.shape[1]
-                )
-            ).view(self.num_experts, -1, embed_dim)
+                flat_expert_ids
+            ).view(self.num_experts, capacity, embed_dim)
             
+            # Gather outputs back to original token positions
             for e in range(self.num_experts):
-                valid_mask    = token_indices[e] >= 0
+                valid_mask = token_indices[e] >= 0
+                if not valid_mask.any():
+                    continue
+                    
                 valid_tokens  = token_indices[e][valid_mask]
                 valid_weights = combine_weights[e][valid_mask].unsqueeze(-1)
-                valid_outputs = expert_out[e, :valid_mask.sum()]
                 
+                # Get the number of valid outputs
+                num_valid = valid_mask.sum().item()
+                valid_outputs = expert_out[e, :num_valid]
+                
+                # Ensure valid_tokens are within bounds
+                valid_tokens = valid_tokens.clamp(0, num_tokens - 1)
+                
+                # Use index_add_ safely
                 output.index_add_(0, valid_tokens, valid_outputs * valid_weights)
         
         return output, total_dropped
@@ -446,7 +531,7 @@ class MoE(nn.Module):
         dtype                 = x_flat.dtype
         
         expert_to_rank  = torch.arange(self.num_experts, device=device) % world_size
-        primary_experts = top_k_indices[:, 0]
+        primary_experts = top_k_indices[:, 0].clamp(0, self.num_experts - 1)
         dest_ranks      = expert_to_rank[primary_experts]
         
         send_counts = torch.zeros(world_size, dtype=torch.long, device=device)
@@ -510,8 +595,15 @@ class MoE(nn.Module):
     
     def _compute_aux_loss(self, router_logits, router_probs, top_k_indices):
         num_tokens  = router_logits.shape[0]
-        expert_mask = F.one_hot(top_k_indices, self.num_experts).float().sum(dim=1)
-        f           = expert_mask.sum(dim=0) / (num_tokens * self.top_k)
+        
+        if num_tokens == 0:
+            return torch.tensor(0.0, device=router_logits.device, dtype=router_logits.dtype)
+        
+        # Clamp indices before one_hot
+        top_k_indices_clamped = top_k_indices.clamp(0, self.num_experts - 1)
+        
+        expert_mask = F.one_hot(top_k_indices_clamped, self.num_experts).float().sum(dim=1)
+        f           = expert_mask.sum(dim=0) / (num_tokens * self.top_k + 1e-8)
         P           = router_probs.mean(dim=0)
         
         load_balance_loss = self.num_experts * (f * P).sum()
