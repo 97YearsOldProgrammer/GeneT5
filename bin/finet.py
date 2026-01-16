@@ -98,10 +98,6 @@ def main():
     print(f"  Trainable: {stats['total_trainable']:,}")
     print(f"  Frozen:    {stats['total_frozen']:,}")
 
-    # Compile model for speed
-    print(f"  Compiling model for speed...")
-    model = torch.compile(model)
-
     # load dataset
     print(f"\nLoading training data...")
     print(f"  Files: {args.train_data}")
