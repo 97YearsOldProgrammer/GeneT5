@@ -14,20 +14,25 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, grad_accum=1, m
     total_loss = 0
     num_steps  = 0
     
+    # Auto-detect BF16 support
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    
     optimizer.zero_grad()
     
     for step, batch in enumerate(dataloader):
         batch = {k: v.to(device) for k, v in batch.items()}
         
-        # Forward pass - handle both dict and object outputs
-        outputs = model(**batch) if not hasattr(model, 'forward_finetune') else model(**batch)
+        # Forward pass with autocast
+        with torch.autocast(device_type="cuda", dtype=dtype):
+            outputs = model(**batch) if not hasattr(model, 'forward_finetune') else model(**batch)
+            
+            if isinstance(outputs, dict):
+                loss = outputs["loss"]
+            else:
+                loss = outputs.loss
+            
+            loss = loss / grad_accum
         
-        if isinstance(outputs, dict):
-            loss = outputs["loss"]
-        else:
-            loss = outputs.loss
-        
-        loss = loss / grad_accum
         loss.backward()
         
         if (step + 1) % grad_accum == 0:
@@ -47,19 +52,24 @@ def train_epoch_seq2seq(model, dataloader, optimizer, scheduler, device, grad_ac
     model.train()
     total_loss = 0
     
+    # Auto-detect BF16 support
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    
     optimizer.zero_grad()
     
     for step, batch in enumerate(dataloader):
         batch = {k: v.to(device) for k, v in batch.items()}
         
-        # GeneT5 style forward
-        outputs = model(
-            encoder_input_ids = batch["input_ids"],
-            decoder_input_ids = batch["labels"][:, :-1],
-            labels            = batch["labels"][:, 1:],
-        )
+        # Forward pass with autocast
+        with torch.autocast(device_type="cuda", dtype=dtype):
+            outputs = model(
+                encoder_input_ids = batch["input_ids"],
+                decoder_input_ids = batch["labels"][:, :-1],
+                labels            = batch["labels"][:, 1:],
+            )
+            
+            loss = outputs["loss"] / grad_accum
         
-        loss = outputs["loss"] / grad_accum
         loss.backward()
         
         if (step + 1) % grad_accum == 0:
@@ -80,15 +90,20 @@ def evaluate(model, dataloader, device):
     correct    = 0
     total      = 0
     
+    # Auto-detect BF16 support
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    
     with torch.no_grad():
         for batch in dataloader:
             batch   = {k: v.to(device) for k, v in batch.items()}
-            outputs = model(**batch)
             
-            if isinstance(outputs, dict):
-                loss = outputs["loss"]
-            else:
-                loss = outputs.loss
+            with torch.autocast(device_type="cuda", dtype=dtype):
+                outputs = model(**batch)
+                
+                if isinstance(outputs, dict):
+                    loss = outputs["loss"]
+                else:
+                    loss = outputs.loss
             
             total_loss += loss.item()
             
@@ -115,20 +130,24 @@ def evaluate_seq2seq(model, dataloader, device):
     model.eval()
     total_loss = 0
     
+    # Auto-detect BF16 support
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    
     with torch.no_grad():
         for batch in dataloader:
             batch = {k: v.to(device) for k, v in batch.items()}
             
-            outputs = model(
-                encoder_input_ids = batch["input_ids"],
-                decoder_input_ids = batch["labels"][:, :-1],
-                labels            = batch["labels"][:, 1:],
-            )
+            with torch.autocast(device_type="cuda", dtype=dtype):
+                outputs = model(
+                    encoder_input_ids = batch["input_ids"],
+                    decoder_input_ids = batch["labels"][:, :-1],
+                    labels            = batch["labels"][:, 1:],
+                )
             
             total_loss += outputs["loss"].item()
     
     avg_loss = total_loss / len(dataloader)
-    model.train()  # Put model back in training mode
+    model.train()
     return avg_loss
 
 

@@ -5,7 +5,8 @@ import sys
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data   import DataLoader, random_split
+from transformers       import get_cosine_schedule_with_warmup
 
 
 from lib import train as lib_train
@@ -19,7 +20,7 @@ DEFAULTS = {
     "max_input_len":  4096,
     "max_target_len": 2048,
     "batch_size":     4,
-    "lr":             1e-5,
+    "lr":             1e-4,
     "epochs":         3,
     "weight_decay":   0.1,
     "warmup_ratio":   0.1,
@@ -90,13 +91,17 @@ def main():
     tokenizer   = GeneTokenizer(model_path)
     print(f"  Vocab size: {len(tokenizer)}")
 
-    # load model
+    # load model with BF16
     print(f"\nLoading model...")
-    model = GeneT5.from_pretrained(model_path, device="cpu").to(device)
+    model = GeneT5.from_pretrained(model_path, device="cpu").to(torch.bfloat16).to(device)
 
     stats = model.get_param_stats()
     print(f"  Trainable: {stats['total_trainable']:,}")
     print(f"  Frozen:    {stats['total_frozen']:,}")
+
+    # Compile model for speed
+    print(f"  Compiling model for speed...")
+    model = torch.compile(model)
 
     # load dataset
     print(f"\nLoading training data...")
@@ -170,8 +175,8 @@ def main():
                 lengths     = [full_dataset.lengths[i] for i in val_dataset.indices],
                 batch_size  = args.batch_size,
                 bucket_size = DEFAULTS["bucket_size"],
-                drop_last   = False,  # Don't drop incomplete batches for validation
-                shuffle     = False,  # Don't shuffle validation
+                drop_last   = False,
+                shuffle     = False,
             ),
             collate_fn  = collator,
             num_workers = args.num_workers,
@@ -193,8 +198,10 @@ def main():
     total_steps  = len(train_loader) * args.epochs // args.grad_accum
     warmup_steps = int(total_steps * DEFAULTS["warmup_ratio"])
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=total_steps, eta_min=args.lr * 0.1
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, 
+        num_warmup_steps=warmup_steps, 
+        num_training_steps=total_steps
     )
 
     print(f"  Total steps:  {total_steps}")
