@@ -93,8 +93,7 @@ def main():
 
     # load model with BF16
     print(f"\nLoading model...")
-    model = GeneT5.from_pretrained(model_path, device="cpu").to(torch.bfloat16).to(device)
-
+    model = GeneT5.from_pretrained(model_path, device=device)
     stats = model.get_param_stats()
     print(f"  Trainable: {stats['total_trainable']:,}")
     print(f"  Frozen:    {stats['total_frozen']:,}")
