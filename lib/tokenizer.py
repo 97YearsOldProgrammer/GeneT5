@@ -1,6 +1,5 @@
-
 import json
-from pathlib    import Path
+from pathlib import Path
 from tokenizers import Tokenizer
 import torch
 
@@ -12,17 +11,30 @@ class GeneTokenizer:
         path = Path(tokenizer_dir)
         
         # Load core tokenizer
-        self.tokenizer = Tokenizer.from_file(str(path / "tokenizer.json"))
+        tokenizer_file = path / "tokenizer.json"
+        if not tokenizer_file.exists():
+            raise FileNotFoundError(f"tokenizer.json not found at {tokenizer_file}")
         
-        # Load special tokens
-        with open(path / "special_tokens_map.json") as f:
-            special = json.load(f)
+        self.tokenizer = Tokenizer.from_file(str(tokenizer_file))
         
-        self.pad_token = special.get("pad_token", {}).get("content", "[PAD]")
-        self.cls_token = special.get("cls_token", {}).get("content", "[CLS]")
-        self.sep_token = special.get("sep_token", {}).get("content", "[SEP]")
-        self.unk_token = special.get("unk_token", {}).get("content", "[UNK]")
-        self.mask_token = special.get("mask_token", {}).get("content", "[MASK]")
+        # Read tokenizer.json to get special tokens from added_tokens
+        with open(tokenizer_file) as f:
+            tokenizer_data = json.load(f)
+        
+        # Build a map of special tokens from added_tokens
+        added_tokens = tokenizer_data.get("added_tokens", [])
+        special_tokens = {
+            token["content"]: token["id"] 
+            for token in added_tokens 
+            if token.get("special", False)
+        }
+        
+        # Find special tokens by their content
+        self.pad_token = self._find_special_token(special_tokens, ["[PAD]", "<pad>"], "[PAD]")
+        self.cls_token = self._find_special_token(special_tokens, ["[CLS]", "<cls>", "<s>"], "[CLS]")
+        self.sep_token = self._find_special_token(special_tokens, ["[SEP]", "<sep>", "</s>"], "[SEP]")
+        self.unk_token = self._find_special_token(special_tokens, ["[UNK]", "<unk>"], "[UNK]")
+        self.mask_token = self._find_special_token(special_tokens, ["[MASK]", "<mask>"], "[MASK]")
         
         # Get IDs
         self.pad_token_id = self.tokenizer.token_to_id(self.pad_token)
@@ -30,9 +42,25 @@ class GeneTokenizer:
         self.sep_token_id = self.tokenizer.token_to_id(self.sep_token)
         self.unk_token_id = self.tokenizer.token_to_id(self.unk_token)
         
+        # Validate that we found the tokens
+        if self.pad_token_id is None:
+            raise ValueError(f"Could not find pad_token '{self.pad_token}' in vocabulary")
+        if self.cls_token_id is None:
+            raise ValueError(f"Could not find cls_token '{self.cls_token}' in vocabulary")
+        if self.sep_token_id is None:
+            raise ValueError(f"Could not find sep_token '{self.sep_token}' in vocabulary")
+        
         # BOS/EOS (often same as CLS/SEP)
         self.bos_token_id = self.cls_token_id
         self.eos_token_id = self.sep_token_id
+    
+    def _find_special_token(self, special_tokens, candidates, default):
+        """Find first matching token from candidates in special tokens map."""
+        for candidate in candidates:
+            if candidate in special_tokens:
+                return candidate
+        # Return default if nothing found
+        return default
     
     def __len__(self):
         return self.tokenizer.get_vocab_size()
