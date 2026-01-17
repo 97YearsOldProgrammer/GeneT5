@@ -219,7 +219,7 @@ def should_chunk_annotation(features, max_lines, max_tokens=2000):
     if len(features) > max_lines:
         return True
     
-    estimated_tokens = estimate_gff_tokens([f["raw_line"] for f in features])
+    estimated_tokens = estimate_gff_tokens([f.get("raw_line", "") for f in features])
     return estimated_tokens > max_tokens
 
 
@@ -257,8 +257,142 @@ def validate_chunks(chunks, original_features):
     }
 
 
+#######################################
+#####  Gene Hierarchy Functions   #####
+#######################################
+
+
+def build_gene_hierarchy(features):
+    """
+    Build gene hierarchy from GFF features.
+    Groups features by gene ID, handling the gene -> mRNA -> exon/CDS structure.
+    
+    Returns dict: {gene_id: [list of all child features including gene itself]}
+    """
+    genes      = {}
+    id_to_gene = {}
+    
+    # first pass: find all gene-level features and create mapping
+    for feat in features:
+        feat_type = feat["type"].lower()
+        attrs     = feat["attributes"]
+        feat_id   = attrs.get("ID", "")
+        
+        if feat_type == "gene":
+            gene_id = feat_id
+            if gene_id not in genes:
+                genes[gene_id] = []
+            genes[gene_id].append(feat)
+            id_to_gene[feat_id] = gene_id
+    
+    # second pass: find mRNA/transcript and map to parent gene
+    for feat in features:
+        feat_type = feat["type"].lower()
+        attrs     = feat["attributes"]
+        feat_id   = attrs.get("ID", "")
+        parent    = attrs.get("Parent", "")
+        
+        if feat_type in {"mrna", "transcript"}:
+            if parent in id_to_gene:
+                gene_id = id_to_gene[parent]
+            elif parent in genes:
+                gene_id = parent
+            else:
+                gene_id = parent if parent else feat_id
+                if gene_id not in genes:
+                    genes[gene_id] = []
+            
+            genes[gene_id].append(feat)
+            id_to_gene[feat_id] = gene_id
+    
+    # third pass: add exon/CDS/UTR features to their parent's gene
+    for feat in features:
+        feat_type = feat["type"].lower()
+        attrs     = feat["attributes"]
+        parent    = attrs.get("Parent", "")
+        
+        if feat_type in {"exon", "cds", "five_prime_utr", "three_prime_utr", "utr", "intron"}:
+            if parent in id_to_gene:
+                gene_id = id_to_gene[parent]
+                genes[gene_id].append(feat)
+            elif parent:
+                # parent might be the gene itself
+                for gid in genes:
+                    if parent == gid or parent.endswith(gid.split(":")[-1] if ":" in gid else gid):
+                        genes[gid].append(feat)
+                        break
+    
+    return genes
+
+
+def group_features_by_gene_simple(features):
+    """
+    Simple grouping: group all features that share the same gene ID.
+    Works by finding Parent chains back to gene-level features.
+    """
+    try:
+        from ._parser import GENE_FEATURE_TYPES
+    except ImportError:
+        from _parser import GENE_FEATURE_TYPES
+    
+    # filter to gene-related features only
+    gene_features = [
+        f for f in features
+        if f["type"] in GENE_FEATURE_TYPES or f["type"].lower() in GENE_FEATURE_TYPES
+    ]
+    
+    if not gene_features:
+        return {}
+    
+    # build ID -> feature mapping
+    id_map     = {}
+    parent_map = {}
+    
+    for feat in gene_features:
+        feat_id = feat["attributes"].get("ID", "")
+        parent  = feat["attributes"].get("Parent", "")
+        
+        if feat_id:
+            id_map[feat_id] = feat
+        if parent:
+            parent_map[feat_id] = parent
+    
+    # find root gene for each feature
+    def find_root(feat_id, visited=None):
+        if visited is None:
+            visited = set()
+        if feat_id in visited:
+            return feat_id
+        visited.add(feat_id)
+        
+        parent = parent_map.get(feat_id)
+        if parent and parent in id_map:
+            return find_root(parent, visited)
+        return feat_id
+    
+    # group by root gene
+    groups = {}
+    for feat in gene_features:
+        feat_id = feat["attributes"].get("ID", "")
+        parent  = feat["attributes"].get("Parent", "")
+        
+        # find the root gene ID
+        if feat_id:
+            root = find_root(feat_id)
+        elif parent:
+            root = find_root(parent)
+        else:
+            continue
+        
+        if root not in groups:
+            groups[root] = []
+        groups[root].append(feat)
+    
+    return groups
+
+
 #######################
-#####  Chunking   #####
+#####  Main Entry #####
 #######################
 
 
@@ -266,9 +400,14 @@ def create_gene_prediction_dataset_with_chunking(sequences, features_by_seqid, w
                                                   stride=None, gene_token="[ATT]", bos_token="<BOS>",
                                                   eos_token="<EOS>", context_pad=0, 
                                                   max_gff_lines=400, overlap_bp=50, overlap_lines=20):
-    from ._parser import GENE_FEATURE_TYPES, format_annotation_target
+    try:
+        from ._parser import GENE_FEATURE_TYPES, format_annotation_target, anti
+    except ImportError:
+        from _parser import GENE_FEATURE_TYPES, format_annotation_target, anti
     
-    dataset = []
+    dataset       = []
+    total_genes   = 0
+    chunked_genes = 0
     
     if stride is None and window_size is not None:
         stride = window_size // 2
@@ -276,79 +415,89 @@ def create_gene_prediction_dataset_with_chunking(sequences, features_by_seqid, w
     for seqid, sequence in sequences.items():
         features = features_by_seqid.get(seqid, [])
         
-        gene_features = [
-            f for f in features 
-            if f["type"] in GENE_FEATURE_TYPES or f["type"].lower() in GENE_FEATURE_TYPES
-        ]
-        
-        if not gene_features:
+        if not features:
             continue
         
-        if window_size is not None:
-            chunks = chunk_sequence_with_overlap(
-                sequence=sequence,
-                features=gene_features,
-                window_size=window_size,
-                stride=stride,
-                respect_gene_boundaries=True
-            )
-        else:
-            if should_chunk_annotation(gene_features, max_gff_lines):
-                gff_chunks = chunk_gff_with_overlap(gene_features, max_gff_lines, overlap_lines)
-                chunks     = []
-                
-                for gff_chunk in gff_chunks:
-                    if not gff_chunk:
-                        continue
-                    
-                    min_start = min(f["start"] for f in gff_chunk)
-                    max_end   = max(f["end"] for f in gff_chunk)
-                    
-                    seq_start = max(0, min_start - 1 - context_pad)
-                    seq_end   = min(len(sequence), max_end + context_pad)
-                    
-                    chunk_seq = sequence[seq_start:seq_end]
-                    
-                    adjusted_features = []
-                    for f in gff_chunk:
-                        adj_f          = f.copy()
-                        adj_f["start"] = f["start"] - seq_start
-                        adj_f["end"]   = f["end"] - seq_start
-                        adjusted_features.append(adj_f)
-                    
-                    chunks.append((seq_start, seq_end, chunk_seq, adjusted_features))
-            else:
-                chunks = [(0, len(sequence), sequence, gene_features)]
+        # group features by gene (using Parent hierarchy)
+        gene_groups = group_features_by_gene_simple(features)
         
-        for chunk_idx, (start, end, chunk_seq, chunk_features) in enumerate(chunks):
-            if not chunk_features:
+        if not gene_groups:
+            continue
+        
+        total_genes += len(gene_groups)
+        
+        for gene_id, group_feats in gene_groups.items():
+            if not group_feats:
                 continue
             
-            input_text  = f"{gene_token} {chunk_seq}"
-            target_text = format_annotation_target(
-                chunk_features, gene_token, bos_token, eos_token
-            )
+            # get gene span
+            min_start = min(f["start"] for f in group_feats)
+            max_end   = max(f["end"] for f in group_feats)
+            strand    = group_feats[0]["strand"]
             
-            parent_id = None
-            if chunk_features:
-                parent_id = chunk_features[0]["attributes"].get(
-                    "Parent", 
-                    chunk_features[0]["attributes"].get("ID", f"{seqid}_chunk{chunk_idx}")
+            # extract sequence with context padding
+            seq_start = max(0, min_start - 1 - context_pad)
+            seq_end   = min(len(sequence), max_end + context_pad)
+            chunk_seq = sequence[seq_start:seq_end]
+            
+            # reverse complement if minus strand
+            if strand == "-":
+                chunk_seq = anti(chunk_seq)
+            
+            # adjust feature coordinates relative to extracted sequence
+            adjusted_features = []
+            for f in group_feats:
+                adj_f          = f.copy()
+                adj_f["start"] = f["start"] - seq_start
+                adj_f["end"]   = f["end"] - seq_start
+                adjusted_features.append(adj_f)
+            
+            # check if this gene needs chunking (very large genes)
+            if window_size is not None and len(chunk_seq) > window_size:
+                # use sliding window for very large genes
+                chunks = chunk_sequence_with_overlap(
+                    sequence=chunk_seq,
+                    features=adjusted_features,
+                    window_size=window_size,
+                    stride=stride,
+                    respect_gene_boundaries=False
                 )
+                chunked_genes += 1
+            elif should_chunk_annotation(adjusted_features, max_gff_lines):
+                # chunk by GFF lines if too many features
+                gff_chunks = chunk_gff_with_overlap(adjusted_features, max_gff_lines, overlap_lines)
+                chunks     = [(0, len(chunk_seq), chunk_seq, gc) for gc in gff_chunks]
+                chunked_genes += 1
+            else:
+                # single chunk for this gene
+                chunks = [(0, len(chunk_seq), chunk_seq, adjusted_features)]
             
-            sample = {
-                "seqid":        seqid,
-                "parent_id":    parent_id,
-                "start":        start,
-                "end":          end,
-                "chunk_idx":    chunk_idx,
-                "input":        input_text,
-                "target":       target_text,
-                "num_features": len(chunk_features),
-                "is_chunked":   len(chunks) > 1
-            }
-            
-            dataset.append(sample)
+            # create samples for each chunk
+            for chunk_idx, (c_start, c_end, c_seq, c_feats) in enumerate(chunks):
+                if not c_feats:
+                    continue
+                
+                input_text  = f"{gene_token} {c_seq}"
+                target_text = format_annotation_target(c_feats, gene_token, bos_token, eos_token)
+                
+                sample = {
+                    "seqid":        seqid,
+                    "parent_id":    gene_id,
+                    "start":        min_start + c_start,
+                    "end":          min_start + c_end,
+                    "strand":       strand,
+                    "chunk_idx":    chunk_idx,
+                    "input":        input_text,
+                    "target":       target_text,
+                    "num_features": len(c_feats),
+                    "is_chunked":   len(chunks) > 1
+                }
+                
+                dataset.append(sample)
     
-    print(f"  Created {len(dataset)} gene prediction samples (with chunking)")
+    print(f"  Found {total_genes} genes across {len(sequences)} sequence(s)")
+    print(f"  Created {len(dataset)} gene prediction samples")
+    if chunked_genes > 0:
+        print(f"  Chunked {chunked_genes} large genes")
+    
     return dataset

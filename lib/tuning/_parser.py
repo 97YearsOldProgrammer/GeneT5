@@ -13,6 +13,7 @@ def anti(seq):
     return anti_seq
 
 
+
 #######################
 #####  Constants  #####
 #######################
@@ -21,6 +22,7 @@ def anti(seq):
 GENE_FEATURE_TYPES = {
     "gene", "exon", "intron", "CDS", "cds",
     "five_prime_UTR", "three_prime_UTR", "utr5", "utr3",
+    "mRNA", "mrna", "transcript",
 }
 
 RNA_CLASSES = {
@@ -66,6 +68,10 @@ def get_filepointer(filename):
 
 
 def parse_fasta(fasta_path):
+    """
+    Parse FASTA file, handling multi-chromosome genomes.
+    The seqid is the first word after '>' in the header.
+    """
     sequences   = {}
     current_id  = None
     current_seq = []
@@ -80,6 +86,7 @@ def parse_fasta(fasta_path):
             if current_id is not None:
                 sequences[current_id] = ''.join(current_seq)
             
+            # extract seqid: first word after '>'
             header      = line[1:].split()[0]
             current_id  = header
             current_seq = []
@@ -94,6 +101,10 @@ def parse_fasta(fasta_path):
 
 
 def parse_gff(gff_path):
+    """
+    Parse GFF3 file.
+    Column 1 (seqid) is used to match with FASTA sequences.
+    """
     features = []
     
     fp = get_filepointer(gff_path)
@@ -133,6 +144,7 @@ def parse_gff(gff_path):
 
 
 def group_features_by_seqid(features):
+    """Group features by their seqid (chromosome/contig)."""
     grouped = {}
     for feat in features:
         seqid = feat["seqid"]
@@ -143,6 +155,7 @@ def group_features_by_seqid(features):
 
 
 def group_features_by_parent(features):
+    """Group features by their Parent attribute."""
     grouped = {}
     orphans = []
     
@@ -180,6 +193,10 @@ def format_annotation_target(features, gene_token="[ATT]", bos_token="<BOS>", eo
 
 def create_gene_prediction_dataset(sequences, features_by_seqid, gene_token="[ATT]",
                                     bos_token="<BOS>", eos_token="<EOS>", context_pad=0):
+    """
+    Create gene prediction dataset by grouping features by parent ID.
+    Each gene (with its exons, CDS, etc.) becomes one sample.
+    """
     dataset = []
     
     for seqid, sequence in sequences.items():
