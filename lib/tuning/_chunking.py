@@ -1,270 +1,555 @@
+import json
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any
 
 
-def anti(seq):
-    """Reverse complement of DNA sequence."""
-    comp = str.maketrans('ACGTRYMKBDHVNacgtrymkbdhvn', 'TGCAYRKMVHDBNtgcayrkmvhdbn')
-    anti = seq.translate(comp)[::-1]
-    return anti
+################################
+#####  Constants           #####
+################################
 
 
-def estimate_tokens(tokenizer, text):
-    """Get token count without padding."""
-    return len(tokenizer.encode(text, add_special_tokens=False))
+# Default chunking parameters
+DEFAULT_WINDOW_SIZE     = 10000      # bp
+DEFAULT_STRIDE          = 5000       # bp (50% overlap)
+DEFAULT_OVERLAP_TOKENS  = 50         # tokens for GFF overlap
+DEFAULT_MAX_GFF_LINES   = 400        # ~2000 tokens target limit
 
 
-def parse_stripped_gff(gff_text):
-    """Parse stripped GFF format back into feature list."""
-    features = []
+################################
+#####  Tokenizer Functions #####
+################################
+
+
+def load_tokenizer_config(tokenizer_path: str) -> Dict[str, Any]:
+    """
+    Load tokenizer configuration from file.
     
-    for line in gff_text.strip().split("\n"):
-        line = line.strip()
-        if not line or line.startswith("<"):
-            continue
+    Args:
+        tokenizer_path: Path to tokenizer.json or directory containing it
         
-        parts = line.split("\t")
-        if len(parts) < 4:
-            continue
+    Returns:
+        Tokenizer config dictionary
+    """
+    path = Path(tokenizer_path)
+    
+    if path.is_dir():
+        config_file = path / "tokenizer.json"
+    else:
+        config_file = path
+    
+    if not config_file.exists():
+        raise FileNotFoundError(f"Tokenizer config not found: {config_file}")
+    
+    with open(config_file, 'r') as f:
+        return json.load(f)
+
+
+def get_existing_tokens(tokenizer_config: Dict[str, Any]) -> set:
+    """
+    Extract all existing tokens from tokenizer config.
+    
+    Args:
+        tokenizer_config: Loaded tokenizer configuration
         
-        feat = {
-            "type":   parts[0],
-            "start":  int(parts[1]),
-            "end":    int(parts[2]),
-            "strand": parts[3],
-            "phase":  parts[4] if len(parts) > 4 else ".",
+    Returns:
+        Set of existing token strings
+    """
+    tokens = set()
+    
+    # Check vocab in model
+    if "model" in tokenizer_config and "vocab" in tokenizer_config["model"]:
+        vocab = tokenizer_config["model"]["vocab"]
+        if isinstance(vocab, dict):
+            tokens.update(vocab.keys())
+        elif isinstance(vocab, list):
+            tokens.update(vocab)
+    
+    # Check added_tokens
+    if "added_tokens" in tokenizer_config:
+        for token_info in tokenizer_config["added_tokens"]:
+            if isinstance(token_info, dict) and "content" in token_info:
+                tokens.add(token_info["content"])
+            elif isinstance(token_info, str):
+                tokens.add(token_info)
+    
+    return tokens
+
+
+def find_missing_rna_tokens(
+    tokenizer_config: Dict[str, Any],
+    rna_classes: Dict[str, int]
+) -> List[str]:
+    """
+    Find RNA class tokens missing from tokenizer vocabulary.
+    
+    Args:
+        tokenizer_config: Loaded tokenizer configuration
+        rna_classes: Dictionary of RNA class names to IDs
+        
+    Returns:
+        List of missing token strings
+    """
+    existing = get_existing_tokens(tokenizer_config)
+    missing = []
+    
+    for rna_type in rna_classes.keys():
+        # Check various token formats
+        token_variants = [
+            rna_type,
+            rna_type.lower(),
+            rna_type.upper(),
+            f"[{rna_type}]",
+            f"[{rna_type.upper()}]",
+        ]
+        
+        found = any(t in existing for t in token_variants)
+        if not found:
+            missing.append(rna_type.lower())
+    
+    return missing
+
+
+def append_tokens_to_config(
+    tokenizer_config: Dict[str, Any],
+    new_tokens: List[str],
+    output_path: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Append new tokens to tokenizer configuration.
+    
+    Args:
+        tokenizer_config: Loaded tokenizer configuration
+        new_tokens: List of new tokens to add
+        output_path: Optional path to save updated config
+        
+    Returns:
+        Updated tokenizer configuration
+    """
+    if not new_tokens:
+        return tokenizer_config
+    
+    # Get current max ID
+    max_id = 0
+    if "added_tokens" in tokenizer_config:
+        for token_info in tokenizer_config["added_tokens"]:
+            if isinstance(token_info, dict) and "id" in token_info:
+                max_id = max(max_id, token_info["id"])
+    
+    if "model" in tokenizer_config and "vocab" in tokenizer_config["model"]:
+        vocab = tokenizer_config["model"]["vocab"]
+        if isinstance(vocab, dict):
+            max_id = max(max_id, max(vocab.values()) if vocab else 0)
+    
+    # Add new tokens
+    if "added_tokens" not in tokenizer_config:
+        tokenizer_config["added_tokens"] = []
+    
+    for i, token in enumerate(new_tokens):
+        new_id = max_id + 1 + i
+        token_entry = {
+            "id":         new_id,
+            "content":    token,
+            "single_word": False,
+            "lstrip":     False,
+            "rstrip":     False,
+            "normalized": False,
+            "special":    False
         }
-        features.append(feat)
+        tokenizer_config["added_tokens"].append(token_entry)
     
-    return features
-
-
-def format_features_to_gff(features):
-    """Convert feature list back to stripped GFF format."""
-    lines = []
+    # Save if output path provided
+    if output_path:
+        output_file = Path(output_path)
+        if output_file.is_dir():
+            output_file = output_file / "tokenizer.json"
+        
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_file, 'w') as f:
+            json.dump(tokenizer_config, f, indent=2)
+        print(f"  Saved updated tokenizer to {output_file}")
     
-    for feat in sorted(features, key=lambda x: x["start"]):
-        phase = feat["phase"] if feat["phase"] != "." else "."
-        line  = "\t".join([
-            feat["type"],
-            str(feat["start"]),
-            str(feat["end"]),
-            feat["strand"],
-            str(phase),
-        ])
-        lines.append(line)
-    
-    return "\n".join(lines)
+    return tokenizer_config
 
 
-def find_chunk_boundary(features, max_pos, min_pos=0):
+def update_tokenizer_with_rna_classes(
+    tokenizer_path: str,
+    rna_classes: Dict[str, int],
+    output_path: Optional[str] = None
+) -> Tuple[Dict[str, Any], List[str]]:
     """
-    Find a good position to split based on feature boundaries.
-    Returns position after the last complete feature before max_pos.
+    Check tokenizer config and append missing RNA tokens.
+    
+    Args:
+        tokenizer_path: Path to tokenizer config
+        rna_classes: Dictionary of RNA class names
+        output_path: Optional path for updated config
+        
+    Returns:
+        Tuple of (updated config, list of added tokens)
     """
-    # sort by end position
-    sorted_feats = sorted(features, key=lambda x: x["end"])
+    print(f"  Loading tokenizer from {tokenizer_path}")
+    config = load_tokenizer_config(tokenizer_path)
     
-    best_end = min_pos
-    for feat in sorted_feats:
-        if feat["end"] <= max_pos:
-            best_end = feat["end"]
-        else:
-            break
+    existing = get_existing_tokens(config)
+    print(f"  Found {len(existing)} existing tokens")
     
-    return best_end
+    missing = find_missing_rna_tokens(config, rna_classes)
+    
+    if missing:
+        print(f"  Missing RNA tokens: {missing}")
+        config = append_tokens_to_config(config, missing, output_path)
+        print(f"  Added {len(missing)} new tokens")
+    else:
+        print(f"  All RNA tokens already present")
+    
+    return config, missing
 
 
-def extract_dna_from_input(input_text, gene_token="[GENE]", bos_token="<BOS>", eos_token="<EOS>"):
-    """Extract raw DNA sequence from formatted input."""
-    text = input_text
-    text = text.replace(bos_token, "").replace(eos_token, "")
-    text = text.replace(gene_token, "").strip()
-    return text
+################################
+#####  Chunking Functions  #####
+################################
+
+def estimate_tokens(text: str, chars_per_token: float = 4.0) -> int:
+    """Estimate token count from character count."""
+    return int(len(text) / chars_per_token)
 
 
-def extract_gff_from_target(target_text, bos_token="<BOS>", eos_token="<EOS>"):
-    """Extract GFF content from formatted target."""
-    text = target_text
-    text = text.replace(bos_token, "").replace(eos_token, "")
-    return text.strip()
+def estimate_gff_tokens(gff_lines: List[str], tokens_per_line: float = 5.0) -> int:
+    """Estimate token count for GFF annotation lines."""
+    return int(len(gff_lines) * tokens_per_line)
 
 
-def chunk_gene_prediction_sample(sample, tokenizer, max_input_len, max_target_len,
-                                  gene_token="[GENE]", bos_token="<BOS>", eos_token="<EOS>"):
+def find_gene_boundaries(
+    features: List[Dict],
+    start_bp: int,
+    end_bp: int
+) -> Tuple[int, int]:
     """
-    Chunk a single gene prediction sample if it exceeds token limits.
-    Returns list of chunked samples.
+    Find safe chunk boundaries that don't split genes.
+    
+    Args:
+        features: List of features in region
+        start_bp: Proposed start position (bp)
+        end_bp: Proposed end position (bp)
+        
+    Returns:
+        Tuple of (adjusted_start, adjusted_end) that don't split genes
     """
-    input_text  = sample["input"]
-    target_text = sample["target"]
+    # Find all gene-level features in region
+    gene_features = [
+        f for f in features 
+        if f["type"].lower() in {"gene", "mrna", "transcript"}
+    ]
     
-    # check if chunking needed
-    input_tokens  = estimate_tokens(tokenizer, input_text)
-    target_tokens = estimate_tokens(tokenizer, target_text)
+    adjusted_start = start_bp
+    adjusted_end = end_bp
     
-    if input_tokens <= max_input_len and target_tokens <= max_target_len:
-        return [sample]
-    
-    # extract components
-    dna_seq  = extract_dna_from_input(input_text, gene_token, bos_token, eos_token)
-    gff_text = extract_gff_from_target(target_text, bos_token, eos_token)
-    features = parse_stripped_gff(gff_text)
-    
-    if not features:
-        return [sample]
-    
-    # estimate overhead tokens
-    overhead      = f"{bos_token} {gene_token}  {eos_token}"
-    overhead_toks = estimate_tokens(tokenizer, overhead)
-    
-    # available tokens for DNA
-    avail_dna_tokens = max_input_len - overhead_toks - 10  # small buffer
-    
-    # estimate chars per token (rough)
-    dna_tokens    = estimate_tokens(tokenizer, dna_seq)
-    chars_per_tok = len(dna_seq) / max(dna_tokens, 1)
-    
-    # target chunk size in base pairs
-    chunk_bp = int(avail_dna_tokens * chars_per_tok)
-    
-    chunks     = []
-    seq_len    = len(dna_seq)
-    chunk_idx  = 0
-    current_bp = 0
-    
-    while current_bp < seq_len:
-        # find boundary
-        target_end = min(current_bp + chunk_bp, seq_len)
+    for gene in gene_features:
+        gene_start = gene["start"]
+        gene_end = gene["end"]
         
-        # get features in this region
-        region_feats = [f for f in features if f["start"] > current_bp]
+        # If chunk start is inside a gene, move it before the gene
+        if gene_start < adjusted_start < gene_end:
+            adjusted_start = gene_start
         
-        if region_feats and target_end < seq_len:
-            # find natural boundary
-            boundary = find_chunk_boundary(region_feats, target_end, current_bp)
-            if boundary > current_bp:
-                target_end = boundary
+        # If chunk end is inside a gene, extend to include whole gene
+        if gene_start < adjusted_end < gene_end:
+            adjusted_end = gene_end
+    
+    return adjusted_start, adjusted_end
+
+
+def chunk_sequence_with_overlap(
+    sequence: str,
+    features: List[Dict],
+    window_size: int = DEFAULT_WINDOW_SIZE,
+    stride: int = DEFAULT_STRIDE,
+    respect_gene_boundaries: bool = True
+) -> List[Tuple[int, int, str, List[Dict]]]:
+    """
+    Chunk sequence with sliding window overlap.
+    
+    Avoids chopping genes in half by adjusting boundaries.
+    
+    Args:
+        sequence: DNA sequence string
+        features: List of features for this sequence
+        window_size: Size of each chunk in bp
+        stride: Step size between chunks in bp
+        respect_gene_boundaries: Whether to adjust boundaries to not split genes
         
-        # extract chunk
-        chunk_dna = dna_seq[current_bp:target_end]
+    Returns:
+        List of tuples: (start_bp, end_bp, sequence_chunk, features_in_chunk)
+    """
+    seq_len = len(sequence)
+    chunks = []
+    
+    if seq_len <= window_size:
+        # Sequence fits in one chunk
+        chunk_features = [f for f in features if f["start"] >= 1 and f["end"] <= seq_len]
+        return [(0, seq_len, sequence, chunk_features)]
+    
+    start = 0
+    while start < seq_len:
+        end = min(start + window_size, seq_len)
         
-        # get features for this chunk (adjust coordinates)
-        chunk_feats = []
-        for f in features:
-            if f["start"] > current_bp and f["end"] <= target_end:
-                adj_feat = f.copy()
-                adj_feat["start"] = f["start"] - current_bp
-                adj_feat["end"]   = f["end"] - current_bp
-                chunk_feats.append(adj_feat)
-        
-        # only create chunk if it has features
-        if chunk_feats:
-            chunk_gff   = format_features_to_gff(chunk_feats)
-            chunk_input = f"{bos_token} {gene_token} {chunk_dna} {eos_token}"
-            chunk_target = f"{bos_token}\n{chunk_gff}\n{eos_token}"
+        # Adjust boundaries to not split genes
+        if respect_gene_boundaries and features:
+            adjusted_start, adjusted_end = find_gene_boundaries(features, start, end)
             
-            chunk_sample = {
-                "parent_id": f"{sample.get('parent_id', 'unk')}_chunk{chunk_idx}",
-                "seqid":     sample.get("seqid", ""),
-                "start":     sample.get("start", 0) + current_bp,
-                "end":       sample.get("start", 0) + target_end,
-                "strand":    sample.get("strand", "+"),
-                "input":     chunk_input,
-                "target":    chunk_target,
-            }
-            chunks.append(chunk_sample)
-            chunk_idx += 1
+            # Don't let adjustment grow chunk too much
+            if adjusted_end - adjusted_start <= window_size * 1.5:
+                start, end = adjusted_start, adjusted_end
         
-        current_bp = target_end
+        # Extract sequence chunk (0-indexed)
+        chunk_seq = sequence[start:end]
         
-        # safety check
-        if target_end == current_bp and current_bp < seq_len:
-            current_bp += chunk_bp // 2
-    
-    return chunks if chunks else [sample]
-
-
-def chunk_classification_sample(sample, tokenizer, max_len, cls_token="[CLS]"):
-    """
-    Chunk a classification sample if needed.
-    For classification, we keep the same label for all chunks.
-    """
-    input_text = sample["input"]
-    
-    input_tokens = estimate_tokens(tokenizer, input_text)
-    
-    if input_tokens <= max_len:
-        return [sample]
-    
-    # extract DNA
-    dna_seq = input_text.replace(cls_token, "").strip()
-    
-    # estimate chunk size
-    overhead_toks = estimate_tokens(tokenizer, f"{cls_token} ")
-    avail_tokens  = max_len - overhead_toks - 5
-    
-    dna_tokens    = estimate_tokens(tokenizer, dna_seq)
-    chars_per_tok = len(dna_seq) / max(dna_tokens, 1)
-    chunk_bp      = int(avail_tokens * chars_per_tok)
-    
-    chunks    = []
-    seq_len   = len(dna_seq)
-    chunk_idx = 0
-    
-    for start in range(0, seq_len, chunk_bp):
-        end       = min(start + chunk_bp, seq_len)
-        chunk_dna = dna_seq[start:end]
+        # Find features within chunk (GFF is 1-indexed)
+        chunk_features = [
+            f for f in features
+            if f["start"] >= start + 1 and f["end"] <= end
+        ]
         
-        chunk_sample = {
-            "seqid":     sample.get("seqid", ""),
-            "start":     sample.get("start", 0) + start,
-            "end":       sample.get("start", 0) + end,
-            "strand":    sample.get("strand", "+"),
-            "input":     f"{cls_token} {chunk_dna}",
-            "label":     sample["label"],
-            "label_str": sample.get("label_str", ""),
-            "chunk_idx": chunk_idx,
-        }
-        chunks.append(chunk_sample)
-        chunk_idx += 1
+        chunks.append((start, end, chunk_seq, chunk_features))
+        
+        # Move to next chunk
+        start += stride
+        
+        # Stop if we've covered the whole sequence
+        if end >= seq_len:
+            break
     
     return chunks
 
 
-def chunk_dataset(samples, tokenizer, max_input_len, max_target_len=None,
-                  task="gene_prediction", gene_token="[GENE]", cls_token="[CLS]",
-                  bos_token="<BOS>", eos_token="<EOS>"):
+def chunk_gff_with_overlap(
+    features: List[Dict],
+    max_lines: int = DEFAULT_MAX_GFF_LINES,
+    overlap_lines: int = 20
+) -> List[List[Dict]]:
     """
-    Chunk all samples in dataset that exceed token limits.
+    Chunk GFF features with overlap to avoid information loss.
     
-    task: "gene_prediction" or "classification"
+    Args:
+        features: List of feature dictionaries
+        max_lines: Maximum lines per chunk
+        overlap_lines: Number of lines to overlap between chunks
+        
+    Returns:
+        List of feature chunks
     """
-    chunked = []
+    if len(features) <= max_lines:
+        return [features]
     
-    for sample in samples:
-        if task == "gene_prediction":
-            chunks = chunk_gene_prediction_sample(
-                sample, tokenizer, max_input_len, max_target_len or 1024,
-                gene_token, bos_token, eos_token
+    chunks = []
+    start = 0
+    
+    while start < len(features):
+        end = min(start + max_lines, len(features))
+        chunk = features[start:end]
+        chunks.append(chunk)
+        
+        # Move forward with overlap
+        start = end - overlap_lines
+        
+        if end >= len(features):
+            break
+    
+    return chunks
+
+
+def should_chunk_annotation(
+    features: List[Dict],
+    max_lines: int = DEFAULT_MAX_GFF_LINES,
+    max_tokens: int = 2000
+) -> bool:
+    """Check if annotation needs chunking."""
+    if len(features) > max_lines:
+        return True
+    
+    estimated_tokens = estimate_gff_tokens([f["raw_line"] for f in features])
+    return estimated_tokens > max_tokens
+
+
+################################
+#####  Validation          #####
+################################
+
+def validate_chunks(chunks: List[Tuple], original_features: List[Dict]) -> Dict[str, Any]:
+    """
+    Validate that chunking didn't lose any features.
+    
+    Args:
+        chunks: List of chunk tuples from chunk_sequence_with_overlap
+        original_features: Original list of features
+        
+    Returns:
+        Validation report dict
+    """
+    all_chunk_features = []
+    for _, _, _, chunk_features in chunks:
+        all_chunk_features.extend(chunk_features)
+    
+    # Remove duplicates (from overlap)
+    unique_features = {
+        (f["seqid"], f["start"], f["end"], f["type"]) 
+        for f in all_chunk_features
+    }
+    
+    original_set = {
+        (f["seqid"], f["start"], f["end"], f["type"]) 
+        for f in original_features
+    }
+    
+    missing = original_set - unique_features
+    extra = unique_features - original_set
+    
+    return {
+        "num_chunks":       len(chunks),
+        "original_count":   len(original_features),
+        "chunk_count":      len(all_chunk_features),
+        "unique_count":     len(unique_features),
+        "missing":          len(missing),
+        "missing_features": list(missing)[:10],
+        "valid":            len(missing) == 0
+    }
+
+
+################################
+#####  Advanced Chunking   #####
+################################
+
+def create_gene_prediction_dataset_with_chunking(
+    sequences: Dict[str, str],
+    features_by_seqid: Dict[str, List[Dict]],
+    window_size: int = None,
+    stride: int = None,
+    gene_token: str = "[ATT]",
+    bos_token: str = "<BOS>",
+    eos_token: str = "<EOS>",
+    context_pad: int = 0,
+    max_gff_lines: int = DEFAULT_MAX_GFF_LINES,
+    overlap_bp: int = 50,
+    overlap_lines: int = 20
+) -> List[Dict]:
+    """
+    Create gene prediction dataset with advanced chunking support.
+    
+    This function handles very long sequences by breaking them into overlapping
+    windows, and handles annotations with many features by chunking the GFF.
+    
+    Args:
+        sequences: Dict of seqid -> sequence
+        features_by_seqid: Dict of seqid -> features
+        window_size: Sliding window size (None for whole sequence)
+        stride: Sliding window stride (None = window_size)
+        gene_token: Special token for annotation task
+        bos_token: Beginning of sequence token
+        eos_token: End of sequence token
+        context_pad: Context padding around features (bp)
+        max_gff_lines: Maximum GFF lines per sample before chunking
+        overlap_bp: Overlap in bp for sequence chunking
+        overlap_lines: Overlap in lines for GFF chunking
+        
+    Returns:
+        List of dataset samples
+    """
+    from ._parser import GENE_FEATURE_TYPES, format_annotation_target
+    
+    dataset = []
+    
+    # Default stride
+    if stride is None and window_size is not None:
+        stride = window_size // 2  # 50% overlap by default
+    
+    for seqid, sequence in sequences.items():
+        features = features_by_seqid.get(seqid, [])
+        
+        # Filter to gene-related features
+        gene_features = [
+            f for f in features 
+            if f["type"] in GENE_FEATURE_TYPES or f["type"].lower() in GENE_FEATURE_TYPES
+        ]
+        
+        if not gene_features:
+            continue
+        
+        # Determine if we need to chunk
+        if window_size is not None:
+            # Use sliding window chunking
+            chunks = chunk_sequence_with_overlap(
+                sequence=sequence,
+                features=gene_features,
+                window_size=window_size,
+                stride=stride,
+                respect_gene_boundaries=True
             )
         else:
-            chunks = chunk_classification_sample(
-                sample, tokenizer, max_input_len, cls_token
+            # Check if we need to chunk based on GFF size
+            if should_chunk_annotation(gene_features, max_gff_lines):
+                # Chunk the GFF and find corresponding sequence regions
+                gff_chunks = chunk_gff_with_overlap(gene_features, max_gff_lines, overlap_lines)
+                chunks = []
+                
+                for gff_chunk in gff_chunks:
+                    if not gff_chunk:
+                        continue
+                    
+                    # Find sequence region for this GFF chunk
+                    min_start = min(f["start"] for f in gff_chunk)
+                    max_end = max(f["end"] for f in gff_chunk)
+                    
+                    # Add context padding
+                    seq_start = max(0, min_start - 1 - context_pad)
+                    seq_end = min(len(sequence), max_end + context_pad)
+                    
+                    chunk_seq = sequence[seq_start:seq_end]
+                    
+                    # Adjust feature coordinates relative to chunk
+                    adjusted_features = []
+                    for f in gff_chunk:
+                        adj_f = f.copy()
+                        adj_f["start"] = f["start"] - seq_start
+                        adj_f["end"] = f["end"] - seq_start
+                        adjusted_features.append(adj_f)
+                    
+                    chunks.append((seq_start, seq_end, chunk_seq, adjusted_features))
+            else:
+                # Single chunk for whole sequence
+                chunks = [(0, len(sequence), sequence, gene_features)]
+        
+        # Create samples from chunks
+        for chunk_idx, (start, end, chunk_seq, chunk_features) in enumerate(chunks):
+            if not chunk_features:
+                continue
+            
+            # Format input and target
+            input_text = f"{gene_token} {chunk_seq}"
+            target_text = format_annotation_target(
+                chunk_features, gene_token, bos_token, eos_token
             )
-        chunked.extend(chunks)
+            
+            # Group by parent for hierarchical info
+            parent_id = None
+            if chunk_features:
+                parent_id = chunk_features[0]["attributes"].get(
+                    "Parent", 
+                    chunk_features[0]["attributes"].get("ID", f"{seqid}_chunk{chunk_idx}")
+                )
+            
+            sample = {
+                "seqid":        seqid,
+                "parent_id":    parent_id,
+                "start":        start,
+                "end":          end,
+                "chunk_idx":    chunk_idx,
+                "input":        input_text,
+                "target":       target_text,
+                "num_features": len(chunk_features),
+                "is_chunked":   len(chunks) > 1
+            }
+            
+            dataset.append(sample)
     
-    return chunked
-
-
-def preprocess_and_chunk(data_path, tokenizer, output_path, max_input_len, max_target_len=None, task="gene_prediction"):
-    """Load dataset, chunk, and save preprocessed version"""
-    
-    from ._parser import load_dataset, save_dataset
-    
-    samples = load_dataset(data_path)
-    chunked = chunk_dataset(
-        samples, tokenizer, max_input_len, max_target_len, task
-    )
-    save_dataset(chunked, output_path)
-    
-    print(f"Preprocessed {len(samples)} -> {len(chunked)} samples")
-    return chunked
+    print(f"  Created {len(dataset)} gene prediction samples (with chunking)")
+    return dataset

@@ -1,6 +1,5 @@
 import torch
 import random
-
 from pathlib            import Path
 from torch.utils.data   import Dataset, Sampler
 from ._parser           import load_dataset

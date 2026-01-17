@@ -1,472 +1,422 @@
-import re
 import json
-import gzip
-import sys
-from pathlib     import Path
-from contextlib  import closing
-from collections import defaultdict
+import re
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any
 
 
 
 def anti(seq):
     """Reverse complement of DNA sequence."""
     comp = str.maketrans('ACGTRYMKBDHVNacgtrymkbdhvn', 'TGCAYRKMVHDBNtgcayrkmvhdbn')
-    anti = seq.translate(comp)[::-1]
-    return anti
+    anti_seq = seq.translate(comp)[::-1]
+    return anti_seq
 
 
 
-#####################
-#####  Utility  #####
-#####################
+#######################
+#####  Constants  #####
+#######################
 
 
-def getfp(filename):
+# Gene feature types for annotation task
+GENE_FEATURE_TYPES = {
+    "gene", "exon", "intron", "CDS", "cds",
+    "five_prime_UTR", "three_prime_UTR", "utr5", "utr3",
+}
 
-    if filename.endswith('.gz'):
-        return gzip.open(filename, 'rt', encoding='ISO-8859-1')
-    elif filename == '-':
-        return sys.stdin
-    return open(filename)
+# RNA classes for classification task
+RNA_CLASSES = {
+    "pseudogene":               0,
+    "ncrna":                    1,
+    "trna":                     2,
+    "rrna":                     3,
+    "tmrna":                    4,
+    "srna":                     5,
+    "misc_rna":                 6,
+    "antisense_rna":            7,
+    "rnase_p_rna":              8,
+    "srp_rna":                  9,
+    "snorna":                   10,
+    "snrna":                    11,
+    "transposable_element":     12,
+    "origin_of_replication":    13,
+    "mobile_genetic_element":   14,
+}
 
-def read_fasta(filename):
+# RNA feature types to extract from GFF
+RNA_FEATURE_TYPES = {
+    "pseudogene", "ncRNA", "ncrna", "tRNA", "trna", 
+    "rRNA", "rrna", "tmRNA", "tmrna", "sRNA", "srna",
+    "misc_RNA", "misc_rna", "antisense_RNA", "antisense_rna",
+    "RNase_P_RNA", "rnase_p_rna", "SRP_RNA", "srp_rna",
+    "snoRNA", "snorna", "snRNA", "snrna",
+    "transposable_element", "origin_of_replication", 
+    "mobile_genetic_element"
+}
 
-    name = None
-    seqs = []
+
+################################
+#####  Parsing Functions   #####
+################################
+
+
+def parse_fasta(fasta_path: str) -> Dict[str, str]:
+    """
+    Parse FASTA file into dictionary of sequences.
     
-    fp = getfp(filename)
-    
-    for line in fp:
-        line = line.rstrip()
-        if line.startswith('>'):
-            if len(seqs) > 0:
-                seq = ''.join(seqs)
-                yield(name, seq)
-                name = line[1:].split()[0]
-                seqs = []
-            else:
-                name = line[1:].split()[0]
-        else:
-            seqs.append(line)
-    
-    if name:
-        yield(name, ''.join(seqs))
-    fp.close()
-
-def parse_fasta(filename):
-    
-    fp = getfp(filename)
-    
-    chms = {}
-    chm  = None
-    seq  = []
-    
-    with closing(fp):
-        for line in fp:
-            line = line.strip()
-            if line.startswith('>'):
-                if chm is not None:
-                    chms[chm] = ''.join(seq)
-                chm = line[1:].split()[0]
-                seq = []
-            else:
-                seq.append(line.upper())
+    Args:
+        fasta_path: Path to FASTA file
         
-        if chm is not None:
-            chms[chm] = ''.join(seq)
+    Returns:
+        Dict mapping sequence ID to sequence string
+    """
+    sequences = {}
+    current_id = None
+    current_seq = []
     
-    return chms
-
-def parse_att(att):
-
-    attributes = {}
+    with open(fasta_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            
+            if line.startswith('>'):
+                # Save previous sequence
+                if current_id is not None:
+                    sequences[current_id] = ''.join(current_seq)
+                
+                # Parse new header
+                header = line[1:].split()[0]
+                current_id = header
+                current_seq = []
+            else:
+                current_seq.append(line.upper())
+        
+        # Save last sequence
+        if current_id is not None:
+            sequences[current_id] = ''.join(current_seq)
     
-    if not att or att == ".":
-        return attributes
-    
-    for stuff in att.split(";"):
-        stuff = stuff.strip()
-        if not stuff:
-            continue
-        if "=" in stuff:
-            key, value = stuff.split("=", 1)
-        elif " " in stuff:
-            key, value = stuff.split(" ", 1)
-        else:
-            key, value = stuff, ""
-        attributes[key.strip()] = value.strip()
-    
-    return attributes
+    return sequences
 
-def parse_gff(filename):
 
-    fp       = getfp(filename)
+def parse_gff(gff_path: str) -> List[Dict[str, Any]]:
+    """
+    Parse GFF3 file into list of feature dictionaries.
+    
+    Args:
+        gff_path: Path to GFF3 file
+        
+    Returns:
+        List of feature dictionaries with keys:
+        seqid, source, type, start, end, score, strand, phase, attributes
+    """
     features = []
     
-    with closing(fp):
-        for line in fp:
+    with open(gff_path, 'r') as f:
+        for line in f:
             line = line.strip()
             
-            if not line or line.startswith("#"):
+            # Skip comments and empty lines
+            if not line or line.startswith('#'):
                 continue
             
-            parts = line.split("\t")
-            
-            if len(parts) == 8:
-                parts.append(".")
-            elif len(parts) != 9:
+            parts = line.split('\t')
+            if len(parts) < 9:
                 continue
             
-            seqid, source, ftype, start, end, score, strand, phase, attrs = parts
+            # Parse attributes
+            attrs = {}
+            for attr in parts[8].split(';'):
+                if '=' in attr:
+                    key, value = attr.split('=', 1)
+                    attrs[key.strip()] = value.strip()
             
             feature = {
-                "seqid":      seqid,
-                "source":     source,
-                "type":       ftype.lower(),
-                "start":      int(start),
-                "end":        int(end),
-                "score":      None if score == "." else float(score),
-                "strand":     strand,
-                "phase":      "." if phase == "." else int(phase),
-                "attributes": parse_att(attrs),
+                "seqid":      parts[0],
+                "source":     parts[1],
+                "type":       parts[2],
+                "start":      int(parts[3]),
+                "end":        int(parts[4]),
+                "score":      parts[5],
+                "strand":     parts[6],
+                "phase":      parts[7],
+                "attributes": attrs,
+                "raw_line":   line
             }
+            
             features.append(feature)
     
     return features
 
-def group_features_by_seqid(features):
 
-    grouped = defaultdict(list)
+def group_features_by_seqid(features: List[Dict]) -> Dict[str, List[Dict]]:
+    """Group features by their sequence ID."""
+    grouped = {}
     for feat in features:
-        grouped[feat["seqid"]].append(feat)
-    return dict(grouped)
+        seqid = feat["seqid"]
+        if seqid not in grouped:
+            grouped[seqid] = []
+        grouped[seqid].append(feat)
+    return grouped
 
-def get_parent_id(feat):
 
-    attrs = feat["attributes"]
-    if "Parent" in attrs:
-        return attrs["Parent"].split(",")[0]
-    if "ID" in attrs:
-        return attrs["ID"]
-    return None
-
-def group_features_by_parent(features, filter_types=None):
-
-    grouped = defaultdict(list)
+def group_features_by_parent(features: List[Dict]) -> Dict[str, List[Dict]]:
+    """Group features by their parent ID for hierarchical annotation."""
+    grouped = {}
+    orphans = []
     
     for feat in features:
-        if filter_types and feat["type"] not in filter_types:
-            continue
-        
-        parent_id = get_parent_id(feat)
-        if parent_id is None:
-            continue
-        
-        grouped[parent_id].append(feat)
+        parent = feat["attributes"].get("Parent", feat["attributes"].get("ID"))
+        if parent:
+            if parent not in grouped:
+                grouped[parent] = []
+            grouped[parent].append(feat)
+        else:
+            orphans.append(feat)
     
-    return dict(grouped)
+    return grouped, orphans
 
 
-#######################
-#####  Ab initio  #####
-#######################
+################################
+#####  Dataset Creation    #####
+################################
 
 
-GENE_FEATURE_TYPES = {
-    "exon", "intron", "cds",
-    "five_prime_utr", "three_prime_utr",
-    "start_codon", "stop_codon",
-}
-
-def format_stripped_gff(features, offset=0):
-
+def format_annotation_target(
+    features: List[Dict],
+    gene_token: str = "[ATT]",
+    bos_token: str = "<BOS>",
+    eos_token: str = "<EOS>"
+) -> str:
+    """
+    Format features into annotation target string.
+    
+    Format: <BOS> type strand start end <tab> type strand start end ... <EOS>
+    """
+    if not features:
+        return f"{bos_token}{eos_token}"
+    
     lines = []
     for feat in sorted(features, key=lambda x: x["start"]):
-        # adjust coords relative to extracted region
-        rel_start = feat["start"] - offset
-        rel_end   = feat["end"] - offset
-        
-        phase = feat["phase"] if feat["phase"] != "." else "."
-        
-        line = "\t".join([
-            feat["type"],
-            str(rel_start),
-            str(rel_end),
-            feat["strand"],
-            str(phase),
-        ])
-        lines.append(line)
+        ftype = feat["type"].lower()
+        strand = feat["strand"]
+        start = feat["start"]
+        end = feat["end"]
+        lines.append(f"{ftype}\t{strand}\t{start}\t{end}")
     
-    return "\n".join(lines)
+    return f"{bos_token}\n" + "\n".join(lines) + f"\n{eos_token}"
 
-def create_gene_prediction_dataset(sequences, features_by_seqid,
-                                   window_size=None, stride=None,
-                                   gene_token="[GENE]", bos_token="<BOS>",
-                                   eos_token="<EOS>", context_pad=0):
 
+def create_gene_prediction_dataset(
+    sequences: Dict[str, str],
+    features_by_seqid: Dict[str, List[Dict]],
+    gene_token: str = "[ATT]",
+    bos_token: str = "<BOS>",
+    eos_token: str = "<EOS>",
+    context_pad: int = 0
+) -> List[Dict]:
+    """
+    Create gene prediction dataset (basic version without chunking).
+    
+    Args:
+        sequences: Dict of seqid -> sequence
+        features_by_seqid: Dict of seqid -> features
+        gene_token: Special token for annotation task
+        bos_token: Beginning of sequence token
+        eos_token: End of sequence token
+        context_pad: Context padding around features (bp)
+        
+    Returns:
+        List of dataset samples
+    """
     dataset = []
     
-    for seqid, seq in sequences.items():
-        if seqid not in features_by_seqid:
+    for seqid, sequence in sequences.items():
+        features = features_by_seqid.get(seqid, [])
+        
+        # Filter to gene-related features
+        gene_features = [
+            f for f in features 
+            if f["type"] in GENE_FEATURE_TYPES or f["type"].lower() in GENE_FEATURE_TYPES
+        ]
+        
+        if not gene_features:
             continue
         
-        feats = features_by_seqid[seqid]
-        
-        # group features by parent (transcript/gene level)
-        grouped = group_features_by_parent(feats, filter_types=GENE_FEATURE_TYPES)
-        
-        # also collect gene-level features for span reference
-        gene_spans = {}
-        for feat in feats:
-            if feat["type"] == "gene":
-                gene_id = feat["attributes"].get("ID")
-                if gene_id:
-                    gene_spans[gene_id] = (feat["start"], feat["end"], feat["strand"])
+        # Group by parent for hierarchical processing
+        grouped, orphans = group_features_by_parent(gene_features)
         
         for parent_id, group_feats in grouped.items():
             if not group_feats:
                 continue
             
-            # sort by position
-            group_feats = sorted(group_feats, key=lambda x: x["start"])
+            # Get span
+            min_start = min(f["start"] for f in group_feats)
+            max_end = max(f["end"] for f in group_feats)
+            strand = group_feats[0]["strand"]
             
-            # get span from features
-            span_start = min(f["start"] for f in group_feats)
-            span_end   = max(f["end"] for f in group_feats)
-            strand     = group_feats[0]["strand"]
+            # Extract sequence with padding
+            seq_start = max(0, min_start - 1 - context_pad)
+            seq_end = min(len(sequence), max_end + context_pad)
             
-            # check if we have gene-level span
-            if parent_id in gene_spans:
-                span_start, span_end, strand = gene_spans[parent_id]
+            chunk_seq = sequence[seq_start:seq_end]
             
-            # apply context padding
-            ext_start = max(1, span_start - context_pad)
-            ext_end   = min(len(seq), span_end + context_pad)
-            
-            # extract sequence (0-based slicing)
-            dna_seq = seq[ext_start - 1 : ext_end]
-            
-            # handle reverse strand
+            # Handle reverse strand
             if strand == "-":
-                dna_seq = anti(dna_seq)
+                chunk_seq = anti(chunk_seq)
             
-            # format stripped gff (coords relative to ext_start)
-            target_gff = format_stripped_gff(group_feats, offset=ext_start - 1)
+            # Adjust feature coordinates
+            adjusted_features = []
+            for f in group_feats:
+                adj_f = f.copy()
+                adj_f["start"] = f["start"] - seq_start
+                adj_f["end"] = f["end"] - seq_start
+                adjusted_features.append(adj_f)
             
-            # build input with tokens
-            input_seq = f"{bos_token} {gene_token} {dna_seq} {eos_token}"
-            target    = f"{bos_token}\n{target_gff}\n{eos_token}"
+            # Format input and target
+            input_text = f"{gene_token} {chunk_seq}"
+            target_text = format_annotation_target(
+                adjusted_features, gene_token, bos_token, eos_token
+            )
             
-            dataset.append({
-                "parent_id": parent_id,
-                "seqid":     seqid,
-                "start":     span_start,
-                "end":       span_end,
-                "strand":    strand,
-                "input":     input_seq,
-                "target":    target,
-            })
+            sample = {
+                "seqid":        seqid,
+                "parent_id":    parent_id,
+                "start":        min_start,
+                "end":          max_end,
+                "strand":       strand,
+                "input":        input_text,
+                "target":       target_text,
+                "num_features": len(group_feats)
+            }
+            
+            dataset.append(sample)
     
-    # windowed mode for large genomes
-    if window_size is not None:
-        dataset = create_windowed_dataset(
-            sequences, features_by_seqid,
-            window_size, stride,
-            gene_token, bos_token, eos_token
-        )
-    
+    print(f"  Created {len(dataset)} gene prediction samples")
     return dataset
 
-def create_windowed_dataset(sequences, features_by_seqid,
-                            window_size, stride,
-                            gene_token, bos_token, eos_token):
 
-    dataset = []
-    step    = stride or window_size
+def create_rna_classification_dataset(
+    sequences: Dict[str, str],
+    features_by_seqid: Dict[str, List[Dict]],
+    cls_token: str = "[CLS]",
+    context_pad: int = 50,
+    include_ncrna: bool = False,
+    rna_classes: Dict[str, int] = None
+) -> List[Dict]:
+    """
+    Create RNA classification dataset.
     
-    for seqid, seq in sequences.items():
-        if seqid not in features_by_seqid:
-            continue
+    Args:
+        sequences: Dict of seqid -> sequence
+        features_by_seqid: Dict of seqid -> features
+        cls_token: Classification token
+        context_pad: Context padding around RNA features (bp)
+        include_ncrna: Whether to include generic ncRNA class
+        rna_classes: Custom RNA classes dict (uses default if None)
         
-        feats   = features_by_seqid[seqid]
-        seq_len = len(seq)
+    Returns:
+        List of dataset samples
+    """
+    if rna_classes is None:
+        rna_classes = RNA_CLASSES
+    
+    dataset = []
+    skipped_ncrna = 0
+    
+    for seqid, sequence in sequences.items():
+        features = features_by_seqid.get(seqid, [])
         
-        # group features by parent first
-        grouped = group_features_by_parent(feats, filter_types=GENE_FEATURE_TYPES)
-        
-        for win_start in range(0, seq_len, step):
-            win_end   = min(win_start + window_size, seq_len)
-            win_seq   = seq[win_start:win_end]
+        for feat in features:
+            feat_type = feat["type"]
+            feat_type_lower = feat_type.lower()
             
-            # gff uses 1-based coords
-            gff_start = win_start + 1
-            gff_end   = win_end
-            
-            # collect complete transcripts within window
-            win_groups = {}
-            
-            for parent_id, group_feats in grouped.items():
-                # check if all features of this group fall within window
-                group_start = min(f["start"] for f in group_feats)
-                group_end   = max(f["end"] for f in group_feats)
-                
-                if group_start >= gff_start and group_end <= gff_end:
-                    # adjust coords relative to window
-                    adjusted = []
-                    for f in group_feats:
-                        adj        = f.copy()
-                        adj["start"] = f["start"] - win_start
-                        adj["end"]   = f["end"] - win_start
-                        adjusted.append(adj)
-                    win_groups[parent_id] = adjusted
-            
-            if not win_groups:
+            # Check if it's an RNA feature
+            if feat_type not in RNA_FEATURE_TYPES and feat_type_lower not in RNA_FEATURE_TYPES:
                 continue
             
-            # format all groups in window
-            all_feats = []
-            for grp in win_groups.values():
-                all_feats.extend(grp)
+            # Skip ncRNA if configured
+            if not include_ncrna and feat_type_lower in {"ncrna", "ncrna"}:
+                skipped_ncrna += 1
+                continue
             
-            target_gff = format_stripped_gff_raw(all_feats)
+            # Determine class label
+            label = None
+            label_str = None
             
-            input_seq = f"{bos_token} {gene_token} {win_seq} {eos_token}"
-            target    = f"{bos_token}\n{target_gff}\n{eos_token}"
+            for class_name, class_id in rna_classes.items():
+                if feat_type_lower == class_name.lower():
+                    label = class_id
+                    label_str = class_name
+                    break
             
-            dataset.append({
-                "seqid":  seqid,
-                "start":  gff_start,
-                "end":    gff_end,
-                "input":  input_seq,
-                "target": target,
-            })
-    
-    return dataset
-
-def format_stripped_gff_raw(features):
-
-    lines = []
-    for feat in sorted(features, key=lambda x: x["start"]):
-        phase = feat["phase"] if feat["phase"] != "." else "."
-        
-        line = "\t".join([
-            feat["type"],
-            str(feat["start"]),
-            str(feat["end"]),
-            feat["strand"],
-            str(phase),
-        ])
-        lines.append(line)
-    
-    return "\n".join(lines)
-
-
-############################
-#####  Classification  #####
-############################
-
-
-RNA_CLASSES = {
-    "pseudogene":       0,
-    "ncrna":            1,
-    "trna":             2,
-    "rrna":             3,
-    "tmrma":            4,
-    "srna":             5,
-    "misc_rna":         6,
-    "antisense_rna":    7,
-    "rnase_p_rna":      8,
-    "srp_rna":          9,
-    
-    # prokaryotic
-    "origin_of_replication":  7,
-    "mobile_genetic_element": 8,
-}
-
-def extract_rna_features(features):
-
-    rna_types = set(RNA_CLASSES.keys())
-    rna_feats = []
-    
-    for feat in features:
-        ftype = feat["type"]
-        
-        # direct match
-        if ftype in rna_types:
-            rna_feats.append(feat)
-            continue
-        
-        # check for ncrna subtype
-        if ftype == "ncrna" or "ncrna" in ftype:
-            rna_feats.append(feat)
-    
-    return rna_feats
-
-def create_rna_classification_dataset(sequences, features_by_seqid,
-                                      cls_token="[CLS]", context_pad=0):
-
-    dataset = []
-    
-    for seqid, seq in sequences.items():
-        if seqid not in features_by_seqid:
-            continue
-        
-        rna_feats = extract_rna_features(features_by_seqid[seqid])
-        
-        for feat in rna_feats:
-            # convert to 0-based for slicing
+            if label is None:
+                # Try partial match
+                for class_name, class_id in rna_classes.items():
+                    if class_name.lower() in feat_type_lower or feat_type_lower in class_name.lower():
+                        label = class_id
+                        label_str = class_name
+                        break
+            
+            if label is None:
+                print(f"  Warning: Unknown RNA type '{feat_type}', skipping")
+                continue
+            
+            # Extract sequence with context
             start = max(0, feat["start"] - 1 - context_pad)
-            end   = min(len(seq), feat["end"] + context_pad)
+            end = min(len(sequence), feat["end"] + context_pad)
+            rna_seq = sequence[start:end]
             
-            dna_seq = seq[start:end]
-            
-            # handle reverse strand
+            # Handle reverse strand
             if feat["strand"] == "-":
-                dna_seq = anti(dna_seq)
+                rna_seq = anti(rna_seq)
             
-            # determine label
-            ftype = feat["type"]
-            if ftype in RNA_CLASSES:
-                label = RNA_CLASSES[ftype]
-            else:
-                label = RNA_CLASSES.get("ncrna", 0)
+            # Format input
+            input_text = f"{cls_token} {rna_seq}"
             
-            input_seq = f"{cls_token} {dna_seq}"
+            sample = {
+                "seqid":        seqid,
+                "feature_id":   feat["attributes"].get("ID", f"{seqid}_{feat['start']}"),
+                "start":        feat["start"],
+                "end":          feat["end"],
+                "strand":       feat["strand"],
+                "input":        input_text,
+                "label":        label,
+                "label_str":    label_str,
+                "original_type": feat_type
+            }
             
-            dataset.append({
-                "seqid":     seqid,
-                "start":     feat["start"],
-                "end":       feat["end"],
-                "strand":    feat["strand"],
-                "input":     input_seq,
-                "label":     label,
-                "label_str": ftype,
-            })
+            dataset.append(sample)
     
+    if skipped_ncrna > 0:
+        print(f"  Skipped {skipped_ncrna} ncRNA features (include_ncrna=False)")
+    
+    print(f"  Created {len(dataset)} RNA classification samples")
     return dataset
 
 
-####################
-#####  Output  #####
-####################
+################################
+#####  I/O Functions       #####
+################################
 
 
-def save_dataset(dataset, output_path):
-
+def save_dataset(dataset: List[Dict], output_path: str) -> None:
+    """Save dataset to JSONL file."""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
-    with open(output_path, "w") as f:
-        for item in dataset:
-            f.write(json.dumps(item) + "\n")
+    with open(output_path, 'w') as f:
+        for sample in dataset:
+            f.write(json.dumps(sample) + '\n')
     
-    print(f"Saved {len(dataset)} samples to {output_path}")
+    print(f"  Saved {len(dataset)} samples to {output_path}")
 
 
-def load_dataset(data_path):
-
-    samples = []
-    with open(data_path, "r") as f:
+def load_dataset(input_path: str) -> List[Dict]:
+    """Load dataset from JSONL file."""
+    dataset = []
+    with open(input_path, 'r') as f:
         for line in f:
-            samples.append(json.loads(line))
-    return samples
+            if line.strip():
+                dataset.append(json.loads(line))
+    return dataset
