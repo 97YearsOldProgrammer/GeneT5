@@ -20,7 +20,7 @@ def anti(seq):
 
 
 GENE_FEATURE_TYPES = {
-    "gene", "exon", "intron", "CDS", "cds",
+    "exon", "intron", "CDS", "cds",
     "five_prime_UTR", "three_prime_UTR", "utr5", "utr3",
 }
 
