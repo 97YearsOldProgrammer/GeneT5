@@ -6,12 +6,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
 
-
 def anti(seq):
     comp     = str.maketrans('ACGTRYMKBDHVNacgtrymkbdhvn', 'TGCAYRKMVHDBNtgcayrkmvhdbn')
     anti_seq = seq.translate(comp)[::-1]
     return anti_seq
-
 
 
 #######################
@@ -190,17 +188,37 @@ def format_annotation_target(features, gene_token="[ATT]", bos_token="<BOS>", eo
     return f"{bos_token}\n" + "\n".join(lines) + f"\n{eos_token}"
 
 
+def build_transcript_to_gene_map(features):
+    """
+    Build a map of transcript/mRNA ID -> gene ID.
+    This allows resolving exon/CDS parents to their gene.
+    """
+    parent_map = {}
+    for f in features:
+        ftype = f["type"].lower()
+        if ftype in {"mrna", "transcript", "guide_rna", "lnc_rna", "ncrna"}:
+            t_id     = f["attributes"].get("ID")
+            g_parent = f["attributes"].get("Parent")
+            if t_id and g_parent:
+                parent_map[t_id] = g_parent
+    return parent_map
+
+
 def create_gene_prediction_dataset(sequences, features_by_seqid, gene_token="[ATT]",
                                     bos_token="<BOS>", eos_token="<EOS>", context_pad=0):
     """
-    Create gene prediction dataset by grouping features by parent ID.
-    Each gene (with its exons, CDS, etc.) becomes one sample.
+    Create gene prediction dataset by grouping features by Gene ID.
+    Resolves transcript->gene relationships to ensure CDS and exons stay together.
     """
     dataset = []
     
     for seqid, sequence in sequences.items():
         features = features_by_seqid.get(seqid, [])
         
+        # 1. build transcript -> gene map from ALL features (before filtering)
+        parent_map = build_transcript_to_gene_map(features)
+        
+        # 2. filter for features we want to predict (exon, CDS, etc.)
         gene_features = [
             f for f in features 
             if f["type"] in GENE_FEATURE_TYPES or f["type"].lower() in GENE_FEATURE_TYPES
@@ -209,9 +227,21 @@ def create_gene_prediction_dataset(sequences, features_by_seqid, gene_token="[AT
         if not gene_features:
             continue
         
-        grouped, orphans = group_features_by_parent(gene_features)
+        # 3. group features by gene ID (resolving through transcript if needed)
+        grouped = {}
+        for feat in gene_features:
+            direct_parent = feat["attributes"].get("Parent", feat["attributes"].get("ID"))
+            
+            # resolve to gene ID if parent is a transcript
+            group_id = parent_map.get(direct_parent, direct_parent)
+            
+            if group_id:
+                if group_id not in grouped:
+                    grouped[group_id] = []
+                grouped[group_id].append(feat)
         
-        for parent_id, group_feats in grouped.items():
+        # 4. create samples from groups
+        for group_id, group_feats in grouped.items():
             if not group_feats:
                 continue
             
@@ -241,7 +271,7 @@ def create_gene_prediction_dataset(sequences, features_by_seqid, gene_token="[AT
             
             sample = {
                 "seqid":        seqid,
-                "parent_id":    parent_id,
+                "parent_id":    group_id,
                 "start":        min_start,
                 "end":          max_end,
                 "strand":       strand,

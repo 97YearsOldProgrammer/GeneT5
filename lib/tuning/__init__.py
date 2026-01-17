@@ -4,6 +4,7 @@ from ._parser import (
     parse_gff,
     group_features_by_seqid,
     group_features_by_parent,
+    build_transcript_to_gene_map,
     format_annotation_target,
     create_gene_prediction_dataset,
     create_rna_classification_dataset,
@@ -28,6 +29,7 @@ from ._chunking import (
     should_chunk_annotation,
     validate_chunks,
     build_gene_hierarchy,
+    build_transcript_to_gene_map,
     group_features_by_gene_simple,
     create_gene_prediction_dataset_with_chunking,
 )

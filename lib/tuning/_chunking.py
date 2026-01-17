@@ -325,17 +325,36 @@ def build_gene_hierarchy(features):
     return genes
 
 
+def build_transcript_to_gene_map(features):
+    """
+    Build a map of transcript/mRNA ID -> gene ID.
+    This allows resolving exon/CDS parents to their gene.
+    """
+    parent_map = {}
+    for f in features:
+        ftype = f["type"].lower()
+        if ftype in {"mrna", "transcript", "guide_rna", "lnc_rna", "ncrna"}:
+            t_id     = f["attributes"].get("ID")
+            g_parent = f["attributes"].get("Parent")
+            if t_id and g_parent:
+                parent_map[t_id] = g_parent
+    return parent_map
+
+
 def group_features_by_gene_simple(features):
     """
-    Simple grouping: group all features that share the same gene ID.
-    Works by finding Parent chains back to gene-level features.
+    Group features by gene ID, resolving transcript->gene relationships.
+    Ensures exons and CDS from the same gene stay together.
     """
     try:
         from ._parser import GENE_FEATURE_TYPES
     except ImportError:
         from _parser import GENE_FEATURE_TYPES
     
-    # filter to gene-related features only
+    # 1. build transcript -> gene map from ALL features
+    parent_map = build_transcript_to_gene_map(features)
+    
+    # 2. filter to gene-related features only
     gene_features = [
         f for f in features
         if f["type"] in GENE_FEATURE_TYPES or f["type"].lower() in GENE_FEATURE_TYPES
@@ -344,49 +363,18 @@ def group_features_by_gene_simple(features):
     if not gene_features:
         return {}
     
-    # build ID -> feature mapping
-    id_map     = {}
-    parent_map = {}
-    
-    for feat in gene_features:
-        feat_id = feat["attributes"].get("ID", "")
-        parent  = feat["attributes"].get("Parent", "")
-        
-        if feat_id:
-            id_map[feat_id] = feat
-        if parent:
-            parent_map[feat_id] = parent
-    
-    # find root gene for each feature
-    def find_root(feat_id, visited=None):
-        if visited is None:
-            visited = set()
-        if feat_id in visited:
-            return feat_id
-        visited.add(feat_id)
-        
-        parent = parent_map.get(feat_id)
-        if parent and parent in id_map:
-            return find_root(parent, visited)
-        return feat_id
-    
-    # group by root gene
+    # 3. group by gene ID (resolving through transcript if needed)
     groups = {}
     for feat in gene_features:
-        feat_id = feat["attributes"].get("ID", "")
-        parent  = feat["attributes"].get("Parent", "")
+        direct_parent = feat["attributes"].get("Parent", feat["attributes"].get("ID"))
         
-        # find the root gene ID
-        if feat_id:
-            root = find_root(feat_id)
-        elif parent:
-            root = find_root(parent)
-        else:
-            continue
+        # resolve to gene ID if parent is a transcript
+        group_id = parent_map.get(direct_parent, direct_parent)
         
-        if root not in groups:
-            groups[root] = []
-        groups[root].append(feat)
+        if group_id:
+            if group_id not in groups:
+                groups[group_id] = []
+            groups[group_id].append(feat)
     
     return groups
 
