@@ -50,6 +50,113 @@ RNA_FEATURE_TYPES = {
     "mobile_genetic_element"
 }
 
+# ============================================================
+# NEW: Biological region support for Ensembl GFF
+# ============================================================
+
+# Known biological_region types extracted from logic_name
+# These map logic_name values to classification labels
+BIOLOGICAL_REGION_TYPES = {
+    "intron":   "intron",
+    "promoter": "promoter",
+    # Add more as discovered
+}
+
+
+def extract_biological_region_type(feature):
+    """
+    Extract the actual feature type from biological_region's logic_name attribute.
+    
+    Ensembl GFF uses 'biological_region' as a generic type, with the actual
+    type stored in the logic_name attribute.
+    
+    Example attribute: logic_name=intron -> returns "intron"
+    Example attribute: logic_name=promoter -> returns "promoter"
+    
+    Returns:
+        tuple: (extracted_type, is_known)
+               extracted_type: the logic_name value or None if not found
+               is_known: True if the type is in BIOLOGICAL_REGION_TYPES
+    """
+    attrs = feature.get("attributes", {})
+    logic_name = attrs.get("logic_name")
+    
+    if logic_name:
+        logic_name_lower = logic_name.lower()
+        is_known = logic_name_lower in BIOLOGICAL_REGION_TYPES
+        return logic_name_lower, is_known
+    
+    return None, False
+
+
+def discover_biological_region_types(features):
+    """
+    Scan features and discover all biological_region types from logic_name.
+    
+    Returns:
+        dict: {logic_name: count} for all biological_region features
+    """
+    discovered = {}
+    
+    for feat in features:
+        if feat["type"].lower() == "biological_region":
+            extracted_type, _ = extract_biological_region_type(feat)
+            if extracted_type:
+                discovered[extracted_type] = discovered.get(extracted_type, 0) + 1
+    
+    return discovered
+
+
+def report_biological_region_types(features, known_rna_classes=None):
+    """
+    Report discovered biological_region types and categorize them.
+    
+    Args:
+        features: List of parsed GFF features
+        known_rna_classes: Dict of known RNA classes (for checking coverage)
+    
+    Returns:
+        dict: {
+            'known': {type: count},      # Types in BIOLOGICAL_REGION_TYPES
+            'unknown': {type: count},    # Types NOT in BIOLOGICAL_REGION_TYPES
+            'in_rna_classes': {type: count},  # Unknown but present in rna_classes
+            'needs_token': {type: count}      # Truly new types needing tokens
+        }
+    """
+    if known_rna_classes is None:
+        known_rna_classes = RNA_CLASSES
+    
+    discovered = discover_biological_region_types(features)
+    
+    result = {
+        'known': {},
+        'unknown': {},
+        'in_rna_classes': {},
+        'needs_token': {}
+    }
+    
+    known_rna_lower = {k.lower() for k in known_rna_classes.keys()}
+    
+    for typ, count in discovered.items():
+        typ_lower = typ.lower()
+        
+        if typ_lower in BIOLOGICAL_REGION_TYPES:
+            result['known'][typ] = count
+        else:
+            result['unknown'][typ] = count
+            
+            # Check if it's already in RNA classes
+            if typ_lower in known_rna_lower:
+                result['in_rna_classes'][typ] = count
+            else:
+                result['needs_token'][typ] = count
+    
+    return result
+
+# ============================================================
+# END NEW SECTION
+# ============================================================
+
 
 ################################
 #####  Parsing Functions   #####
@@ -287,12 +394,38 @@ def create_gene_prediction_dataset(sequences, features_by_seqid, gene_token="[AT
 
 
 def create_rna_classification_dataset(sequences, features_by_seqid, cls_token="[CLS]",
-                                       context_pad=50, include_ncrna=False, rna_classes=None):
+                                       context_pad=50, include_ncrna=False, rna_classes=None,
+                                       include_biological_region=True, 
+                                       biological_region_classes=None):
+    """
+    Create RNA classification dataset.
+    
+    NEW: Handles biological_region features by extracting type from logic_name.
+    
+    Args:
+        sequences: Dict of seqid -> sequence
+        features_by_seqid: Dict of seqid -> list of features
+        cls_token: Classification token prefix
+        context_pad: Base pairs to pad around feature
+        include_ncrna: Whether to include ncRNA features
+        rna_classes: Dict of class_name -> class_id
+        include_biological_region: Whether to process biological_region features
+        biological_region_classes: Dict of logic_name -> class_id for biological_region
+                                   If None, uses rna_classes for matching
+    
+    Returns:
+        tuple: (dataset, discovered_bio_types)
+               dataset: list of classification samples
+               discovered_bio_types: dict of discovered biological_region types
+    """
     if rna_classes is None:
         rna_classes = RNA_CLASSES
     
-    dataset       = []
-    skipped_ncrna = 0
+    dataset              = []
+    skipped_ncrna        = 0
+    discovered_bio_types = {}  # NEW: track discovered biological_region types
+    bio_region_used      = {}  # NEW: track which bio types were actually used
+    bio_region_skipped   = {}  # NEW: track which bio types were skipped (no class mapping)
     
     for seqid, sequence in sequences.items():
         features = features_by_seqid.get(seqid, [])
@@ -301,6 +434,68 @@ def create_rna_classification_dataset(sequences, features_by_seqid, cls_token="[
             feat_type       = feat["type"]
             feat_type_lower = feat_type.lower()
             
+            # ============================================================
+            # NEW: Handle biological_region specially
+            # ============================================================
+            if feat_type_lower == "biological_region" and include_biological_region:
+                extracted_type, is_known = extract_biological_region_type(feat)
+                
+                if extracted_type:
+                    # Track discovery
+                    discovered_bio_types[extracted_type] = discovered_bio_types.get(extracted_type, 0) + 1
+                    
+                    # Try to find a class mapping
+                    label     = None
+                    label_str = None
+                    
+                    # First check biological_region_classes if provided
+                    if biological_region_classes and extracted_type in biological_region_classes:
+                        label     = biological_region_classes[extracted_type]
+                        label_str = extracted_type
+                    else:
+                        # Fall back to rna_classes
+                        for class_name, class_id in rna_classes.items():
+                            if extracted_type == class_name.lower():
+                                label     = class_id
+                                label_str = class_name
+                                break
+                    
+                    if label is not None:
+                        bio_region_used[extracted_type] = bio_region_used.get(extracted_type, 0) + 1
+                        
+                        # Create the sample
+                        start   = max(0, feat["start"] - 1 - context_pad)
+                        end     = min(len(sequence), feat["end"] + context_pad)
+                        rna_seq = sequence[start:end]
+                        
+                        if feat["strand"] == "-":
+                            rna_seq = anti(rna_seq)
+                        
+                        input_text = f"{cls_token} {rna_seq}"
+                        
+                        sample = {
+                            "seqid":          seqid,
+                            "feature_id":     feat["attributes"].get("ID", f"{seqid}_{feat['start']}"),
+                            "start":          feat["start"],
+                            "end":            feat["end"],
+                            "strand":         feat["strand"],
+                            "input":          input_text,
+                            "label":          label,
+                            "label_str":      label_str,
+                            "original_type":  feat_type,
+                            "bio_region_type": extracted_type,  # NEW: track original bio type
+                        }
+                        
+                        dataset.append(sample)
+                    else:
+                        bio_region_skipped[extracted_type] = bio_region_skipped.get(extracted_type, 0) + 1
+                
+                continue  # Done with this biological_region feature
+            # ============================================================
+            # END NEW biological_region handling
+            # ============================================================
+            
+            # Original logic for non-biological_region features
             if feat_type not in RNA_FEATURE_TYPES and feat_type_lower not in RNA_FEATURE_TYPES:
                 continue
             
@@ -351,11 +546,36 @@ def create_rna_classification_dataset(sequences, features_by_seqid, cls_token="[
             
             dataset.append(sample)
     
+    # ============================================================
+    # NEW: Report biological_region discovery
+    # ============================================================
+    if discovered_bio_types:
+        print(f"\n  [biological_region discovery]")
+        print(f"    Total biological_region features: {sum(discovered_bio_types.values())}")
+        print(f"    Unique types found: {len(discovered_bio_types)}")
+        
+        if bio_region_used:
+            print(f"    Types USED (had class mapping):")
+            for typ, cnt in sorted(bio_region_used.items(), key=lambda x: -x[1]):
+                print(f"      {typ}: {cnt}")
+        
+        if bio_region_skipped:
+            print(f"    Types SKIPPED (no class mapping - NEED TOKENS):")
+            for typ, cnt in sorted(bio_region_skipped.items(), key=lambda x: -x[1]):
+                print(f"      {typ}: {cnt}  <-- ADD TO RNA_CLASSES")
+    # ============================================================
+    
     if skipped_ncrna > 0:
         print(f"  Skipped {skipped_ncrna} ncRNA features (include_ncrna=False)")
     
     print(f"  Created {len(dataset)} RNA classification samples")
-    return dataset
+    
+    # Return both dataset and discovery info
+    return dataset, {
+        'discovered': discovered_bio_types,
+        'used': bio_region_used,
+        'skipped': bio_region_skipped
+    }
 
 
 ################################
