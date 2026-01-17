@@ -22,7 +22,6 @@ def anti(seq):
 GENE_FEATURE_TYPES = {
     "gene", "exon", "intron", "CDS", "cds",
     "five_prime_UTR", "three_prime_UTR", "utr5", "utr3",
-    "mRNA", "mrna", "transcript",
 }
 
 RNA_CLASSES = {
