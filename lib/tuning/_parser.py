@@ -231,7 +231,6 @@ def create_gene_prediction_dataset(sequences, features_by_seqid, gene_token="[AT
 
 def create_rna_classification_dataset(sequences, features_by_seqid, cls_token="[CLS]",
                                        context_pad=50, include_ncrna=False, rna_classes=None):
-    
     if rna_classes is None:
         rna_classes = RNA_CLASSES
     

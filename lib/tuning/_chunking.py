@@ -1,19 +1,6 @@
 import json
 from pathlib import Path
 
-from ._parser import GENE_FEATURE_TYPES, format_annotation_target
-
-
-################################
-#####  Constants           #####
-################################
-
-
-DEFAULT_WINDOW_SIZE    = 10000
-DEFAULT_STRIDE         = 5000
-DEFAULT_OVERLAP_TOKENS = 50
-DEFAULT_MAX_GFF_LINES  = 400
-
 
 ################################
 #####  Tokenizer Functions #####
@@ -36,7 +23,6 @@ def load_tokenizer_config(tokenizer_path):
 
 
 def get_existing_tokens(tokenizer_config):
-    
     tokens = set()
     
     if "model" in tokenizer_config and "vocab" in tokenizer_config["model"]:
@@ -57,7 +43,6 @@ def get_existing_tokens(tokenizer_config):
 
 
 def find_missing_rna_tokens(tokenizer_config, rna_classes):
-    
     existing = get_existing_tokens(tokenizer_config)
     missing  = []
     
@@ -78,7 +63,6 @@ def find_missing_rna_tokens(tokenizer_config, rna_classes):
 
 
 def append_tokens_to_config(tokenizer_config, new_tokens, output_path=None):
-    
     if not new_tokens:
         return tokenizer_config
     
@@ -123,7 +107,6 @@ def append_tokens_to_config(tokenizer_config, new_tokens, output_path=None):
 
 
 def update_tokenizer_with_rna_classes(tokenizer_path, rna_classes, output_path=None):
-    
     print(f"  Loading tokenizer from {tokenizer_path}")
     config = load_tokenizer_config(tokenizer_path)
     
@@ -156,7 +139,6 @@ def estimate_gff_tokens(gff_lines, tokens_per_line=5.0):
 
 
 def find_gene_boundaries(features, start_bp, end_bp):
-    
     gene_features = [
         f for f in features 
         if f["type"].lower() in {"gene", "mrna", "transcript"}
@@ -178,9 +160,7 @@ def find_gene_boundaries(features, start_bp, end_bp):
     return adjusted_start, adjusted_end
 
 
-def chunk_sequence_with_overlap(sequence, features, window_size=DEFAULT_WINDOW_SIZE, 
-                                 stride=DEFAULT_STRIDE, respect_gene_boundaries=True):
-    
+def chunk_sequence_with_overlap(sequence, features, window_size, stride, respect_gene_boundaries=True):
     seq_len = len(sequence)
     chunks  = []
     
@@ -215,8 +195,7 @@ def chunk_sequence_with_overlap(sequence, features, window_size=DEFAULT_WINDOW_S
     return chunks
 
 
-def chunk_gff_with_overlap(features, max_lines=DEFAULT_MAX_GFF_LINES, overlap_lines=20):
-    
+def chunk_gff_with_overlap(features, max_lines, overlap_lines):
     if len(features) <= max_lines:
         return [features]
     
@@ -236,7 +215,7 @@ def chunk_gff_with_overlap(features, max_lines=DEFAULT_MAX_GFF_LINES, overlap_li
     return chunks
 
 
-def should_chunk_annotation(features, max_lines=DEFAULT_MAX_GFF_LINES, max_tokens=2000):
+def should_chunk_annotation(features, max_lines, max_tokens=2000):
     if len(features) > max_lines:
         return True
     
@@ -244,13 +223,12 @@ def should_chunk_annotation(features, max_lines=DEFAULT_MAX_GFF_LINES, max_token
     return estimated_tokens > max_tokens
 
 
-################################
-#####  Validation          #####
-################################
+#######################
+#####  Validation #####
+#######################
 
 
 def validate_chunks(chunks, original_features):
-    
     all_chunk_features = []
     for _, _, _, chunk_features in chunks:
         all_chunk_features.extend(chunk_features)
@@ -279,16 +257,16 @@ def validate_chunks(chunks, original_features):
     }
 
 
-################################
-#####  Advanced Chunking   #####
-################################
+#######################
+#####  Chunking   #####
+#######################
 
 
 def create_gene_prediction_dataset_with_chunking(sequences, features_by_seqid, window_size=None,
                                                   stride=None, gene_token="[ATT]", bos_token="<BOS>",
                                                   eos_token="<EOS>", context_pad=0, 
-                                                  max_gff_lines=DEFAULT_MAX_GFF_LINES, 
-                                                  overlap_bp=50, overlap_lines=20):
+                                                  max_gff_lines=400, overlap_bp=50, overlap_lines=20):
+    from ._parser import GENE_FEATURE_TYPES, format_annotation_target
     
     dataset = []
     
