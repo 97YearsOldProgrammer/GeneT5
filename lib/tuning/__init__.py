@@ -1,4 +1,5 @@
 from ._parser import (
+    get_filepointer,
     parse_fasta,
     parse_gff,
     group_features_by_seqid,
@@ -30,13 +31,20 @@ from ._chunking import (
     create_gene_prediction_dataset_with_chunking,
 )
 
-from .dataset import (
+try:
+    from .dataset import (
         MixedTaskDataset,
         SmartBatchSampler,
         DynamicPaddingCollator,
-)
+    )
+except ImportError:
+    MixedTaskDataset       = None
+    SmartBatchSampler      = None
+    DynamicPaddingCollator = None
+
 
 __all__ = [
+    "get_filepointer",
     "parse_fasta",
     "parse_gff",
     "group_features_by_seqid",
@@ -67,3 +75,6 @@ __all__ = [
     "SmartBatchSampler",
     "DynamicPaddingCollator",
 ]
+
+
+__version__ = "1.0.0"

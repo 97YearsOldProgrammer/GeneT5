@@ -1,5 +1,7 @@
+import gzip
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -9,7 +11,6 @@ def anti(seq):
     comp     = str.maketrans('ACGTRYMKBDHVNacgtrymkbdhvn', 'TGCAYRKMVHDBNtgcayrkmvhdbn')
     anti_seq = seq.translate(comp)[::-1]
     return anti_seq
-
 
 
 #######################
@@ -51,9 +52,17 @@ RNA_FEATURE_TYPES = {
 }
 
 
-###############################
-#####  Parsing Functions  #####
-###############################
+################################
+#####  Parsing Functions   #####
+################################
+
+
+def get_filepointer(filename):
+    fp = None
+    if   filename.endswith('.gz'): fp = gzip.open(filename, 'rt')
+    elif filename == '-':          fp = sys.stdin
+    else:                          fp = open(filename)
+    return fp
 
 
 def parse_fasta(fasta_path):
@@ -61,63 +70,65 @@ def parse_fasta(fasta_path):
     current_id  = None
     current_seq = []
     
-    with open(fasta_path, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            
-            if line.startswith('>'):
-                if current_id is not None:
-                    sequences[current_id] = ''.join(current_seq)
-                
-                header      = line[1:].split()[0]
-                current_id  = header
-                current_seq = []
-            else:
-                current_seq.append(line.upper())
+    fp = get_filepointer(fasta_path)
+    for line in fp:
+        line = line.strip()
+        if not line:
+            continue
         
-        if current_id is not None:
-            sequences[current_id] = ''.join(current_seq)
+        if line.startswith('>'):
+            if current_id is not None:
+                sequences[current_id] = ''.join(current_seq)
+            
+            header      = line[1:].split()[0]
+            current_id  = header
+            current_seq = []
+        else:
+            current_seq.append(line.upper())
     
+    if current_id is not None:
+        sequences[current_id] = ''.join(current_seq)
+    
+    fp.close()
     return sequences
 
 
 def parse_gff(gff_path):
     features = []
     
-    with open(gff_path, 'r') as f:
-        for line in f:
-            line = line.strip()
-            
-            if not line or line.startswith('#'):
-                continue
-            
-            parts = line.split('\t')
-            if len(parts) < 9:
-                continue
-            
-            attrs = {}
-            for attr in parts[8].split(';'):
-                if '=' in attr:
-                    key, value = attr.split('=', 1)
-                    attrs[key.strip()] = value.strip()
-            
-            feature = {
-                "seqid":      parts[0],
-                "source":     parts[1],
-                "type":       parts[2],
-                "start":      int(parts[3]),
-                "end":        int(parts[4]),
-                "score":      parts[5],
-                "strand":     parts[6],
-                "phase":      parts[7],
-                "attributes": attrs,
-                "raw_line":   line
-            }
-            
-            features.append(feature)
+    fp = get_filepointer(gff_path)
+    for line in fp:
+        line = line.strip()
+        
+        if not line or line.startswith('#'):
+            continue
+        
+        parts = line.split('\t')
+        if len(parts) < 9:
+            continue
+        
+        attrs = {}
+        for attr in parts[8].split(';'):
+            if '=' in attr:
+                key, value = attr.split('=', 1)
+                attrs[key.strip()] = value.strip()
+        
+        feature = {
+            "seqid":      parts[0],
+            "source":     parts[1],
+            "type":       parts[2],
+            "start":      int(parts[3]),
+            "end":        int(parts[4]),
+            "score":      parts[5],
+            "strand":     parts[6],
+            "phase":      parts[7],
+            "attributes": attrs,
+            "raw_line":   line
+        }
+        
+        features.append(feature)
     
+    fp.close()
     return features
 
 
@@ -147,9 +158,9 @@ def group_features_by_parent(features):
     return grouped, orphans
 
 
-##############################
-#####  Dataset Creation  #####
-##############################
+################################
+#####  Dataset Creation    #####
+################################
 
 
 def format_annotation_target(features, gene_token="[ATT]", bos_token="<BOS>", eos_token="<EOS>"):
@@ -301,9 +312,9 @@ def create_rna_classification_dataset(sequences, features_by_seqid, cls_token="[
     return dataset
 
 
-###########################
-#####  I/O Functions  #####
-###########################
+################################
+#####  I/O Functions       #####
+################################
 
 
 def save_dataset(dataset, output_path):
