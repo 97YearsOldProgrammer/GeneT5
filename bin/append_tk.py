@@ -1,3 +1,4 @@
+import sys
 import argparse
 from lib import tokenizer as tk
 
@@ -34,7 +35,7 @@ print(f"  Missing tokens: {len(missing)}")
 
 if not missing:
     print("\n  All tokens already present. Nothing to do.")
-    return
+    sys.exit(0)
 
 # show what will be added
 print(f"\n  Tokens to add:")
@@ -45,7 +46,7 @@ if len(missing) > 20:
 
 if args.dry_run:
     print("\n  [DRY RUN] No changes made.")
-    return
+    sys.exit(0)
 
 # append tokens
 config, added = tk.append_tokens_to_config(config, missing)
