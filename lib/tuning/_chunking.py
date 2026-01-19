@@ -233,7 +233,7 @@ def group_features_by_gene_with_biotype(features):
             if gene_id not in groups:
                 groups[gene_id] = {
                     "features": [],
-                    "biotype":  "unknown",
+                    "biotype":  ".",
                     "start":    feat["start"],
                     "end":      feat["end"],
                     "strand":   feat["strand"],

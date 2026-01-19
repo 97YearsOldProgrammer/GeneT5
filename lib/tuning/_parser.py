@@ -21,12 +21,6 @@ GENE_FEATURE_TYPES = {
     "five_prime_UTR", "three_prime_UTR", "utr5", "utr3",
 }
 
-# biotypes we care about from transcript level
-BIOTYPES = {
-    "mrna", "rrna", "trna", "ncrna", "snrna", "snorna",
-    "lncrna", "mirna", "pseudogene", "protein_coding",
-}
-
 
 ################################
 #####  Parsing Functions   #####
@@ -270,7 +264,7 @@ def build_feature_hierarchy(features):
                 # add to first transcript or create one
                 if not hierarchy[parent]["transcripts"]:
                     hierarchy[parent]["transcripts"][parent] = {
-                        "biotype":  "unknown",
+                        "biotype":  ".",
                         "features": [],
                     }
                 first_t = list(hierarchy[parent]["transcripts"].keys())[0]
@@ -348,8 +342,8 @@ def create_gene_prediction_dataset(sequences, features_by_seqid, gene_token="[AT
             if not all_features:
                 continue
             
-            # use most common biotype or first one
-            primary_biotype = biotypes[0] if biotypes else "unknown"
+            # use most common biotype or "." for unknown
+            primary_biotype = biotypes[0] if biotypes else "."
             
             # get span
             min_start = min(f["start"] for f in all_features)

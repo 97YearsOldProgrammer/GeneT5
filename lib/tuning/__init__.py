@@ -13,7 +13,6 @@ from ._parser import (
     save_dataset,
     load_dataset,
     GENE_FEATURE_TYPES,
-    BIOTYPES,
 )
 
 from ._chunking import (
@@ -46,7 +45,6 @@ except ImportError:
     DynamicPaddingCollator = None
 
 __all__ = [
-    
     # parser
     "anti",
     "parse_fasta",
@@ -62,7 +60,6 @@ __all__ = [
     "save_dataset",
     "load_dataset",
     "GENE_FEATURE_TYPES",
-    "BIOTYPES",
     
     # chunking
     "estimate_tokens",
