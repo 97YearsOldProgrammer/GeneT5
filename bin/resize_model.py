@@ -12,21 +12,27 @@ parser = argparse.ArgumentParser(
     description="Resize GeneT5 model embeddings to match tokenizer vocabulary.")
 parser.add_argument("model_path", type=str,
     help="Path to the model directory (containing config.json and pytorch_model.bin)")
-parser.add_argument("tokenizer_path", type=str,
+parser.add_argument("--tokenizer_path", type=str, default=None,
     help="Path to tokenizer directory. Defaults to model_path if not provided.")
 args = parser.parse_args()
 
 
-# 1. Load Tokenizer
-tokenizer = GeneTokenizer(args.tokenizer_path)
-new_vocab_size = len(tokenizer)
+# Setup Paths
+model_path_str      = args.model_path
+tokenizer_path_str  = args.tokenizer_path if args.tokenizer_path else args.model_path
+print(f"Checking model at: {model_path_str}")
+print(f"Using tokenizer from: {tokenizer_path_str}")
+
+# Load Tokenizer
+tokenizer       = GeneTokenizer(tokenizer_path_str)
+new_vocab_size  = len(tokenizer)
 print(f"Tokenizer Size: {new_vocab_size}")
 
-# 2. Load Model
+# Load Model
 model = GeneT5.from_pretrained(args.model_path, device="cpu")
 print(f"Old Model Size: {model.encoder_embed.weight.shape[0]}")
 
-# 3. Resize Embeddings
+# Resize Embeddings
 if model.encoder_embed.weight.shape[0] != new_vocab_size:
     print(f"Resizing model from {model.vocab_size} to {new_vocab_size}...")
     
