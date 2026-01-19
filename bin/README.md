@@ -2,7 +2,8 @@
 
 For reproducibility, all the Linux Cmd to build this from scratch is being recorded inside this README. 
 
---
+
+---
 
 
 ### Init the Model
@@ -17,4 +18,24 @@ The idea is to utilize existed DNABert-v2 pre-trained model for giving the model
 | **Layer Norms**             | **Copy**        | Keeps the math stable from the start.
 | **Output Head**             | **Copy/Init**   | Usually initialized from the Input Embeddings (Shared).
 
-```zsh
+```python3
+python3 bin/init.py \
+    --save_dir "../Data/model/init/" \
+    --dnabert_path "zhihan1996/DNABERT-2-117M" \
+    --use_moe \
+    --num_experts 8 \
+    --moe_top_k 2 \
+    --tie_weights
+```
+
+
+---
+
+
+### Token Manangement
+
+The tokenizer is first build on original DNABert-v2 Model for further usage. To init the tokenizer script, generate the extended tokens first through new_tokens[init_tk.py].
+
+```python3
+
+```

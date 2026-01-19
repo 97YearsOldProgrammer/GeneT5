@@ -22,27 +22,30 @@ SPECIAL_TOKENS = [
 
 # Type Tokens
 TYPE_TOKENS = [
-    # Prokaryotic
+    
+    # Prokaryote
+    "origin_of_replication", 
     "mobile_genetic_element",
-    "origin_of_replication",
     
-    # Casual
-    "gene",
-    "exon",
-    "intron",
-    "cds",
-    "utr5",
-    
-    # RNA
-    "ncRNA",            # Non-coding RNA
-    "rRNA",             # Ribosomal  RNA
-    "tRNA",             # Transfer   RNA
+    "pseudogene", 
+    "ncRNA", "ncrna", 
+    "tRNA", "trna", 
+    "rRNA", "rrna", 
+    "tmRNA", "tmrna", 
+    "sRNA", "srna",
+    "misc_RNA", "misc_rna", 
+    "antisense_RNA", "antisense_rna",
+    "RNase_P_RNA", "rnase_p_rna", 
+    "SRP_RNA", "srp_rna",
+    "snoRNA", "snorna", 
+    "snRNA", "snrna",
+    "transposable_element", 
 ]
 
 # Task Specific Tokens
 TASK_TOKENS = [
     "[ATT]",            # Annotation
-    "[generate]",
+    "[HIT]",            # Hints
 ]
 
 # Strand tokens
@@ -52,6 +55,7 @@ STRAND_TOKENS = ["+", "-"]
 TEXT_TOKENS = [
     "\t",
     "\n",
+    ".",        # From Phase of Gff
 ]
 
 # Build token list
