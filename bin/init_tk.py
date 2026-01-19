@@ -4,7 +4,7 @@ from pathlib import Path
 
 parser = argparse.ArgumentParser(
     description="Generate extended tokenizer file with special tokens.")
-parser.add_argument("--output", type=str, default="./extended_tokens.txt",
+parser.add_argument("output", type=str, default="./extended_tokens.txt",
     help="Output file path for the token list.")
 args = parser.parse_args()
 
