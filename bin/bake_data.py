@@ -1,8 +1,8 @@
 import argparse
-import json
 from pathlib import Path
 
 from lib import tuning
+from lib import tokenizer as tk
 
 
 parser = argparse.ArgumentParser(
@@ -13,6 +13,8 @@ parser.add_argument("gff",
     help="Path to GFF3 annotation file.")
 parser.add_argument("output_dir",
     help="Output directory for processed datasets.")
+parser.add_argument("--extract_tokens", type=str, default=None,
+    help="Path to txt file to append extracted types/biotypes as tokens.")
 parser.add_argument("--window_size", type=int, default=None,
     help="Window size for sliding window (None for transcript-level).")
 parser.add_argument("--stride", type=int, default=None,
@@ -51,6 +53,33 @@ for feat in features:
     ftype = feat["type"]
     type_counts[ftype] = type_counts.get(ftype, 0) + 1
 print(f"  Feature types: {dict(sorted(type_counts.items(), key=lambda x: -x[1])[:10])}")
+
+
+# extract tokens if requested
+if args.extract_tokens:
+    print(f"\n{' Token Extraction ':=^60}")
+    
+    feature_types = tuning.extract_feature_types(features)
+    biotypes      = tuning.extract_biotypes(features)
+    
+    all_types = feature_types | biotypes
+    
+    print(f"  Feature types found: {sorted(feature_types)}")
+    print(f"  Biotypes found:      {sorted(biotypes)}")
+    print(f"  Total unique:        {len(all_types)}")
+    
+    # append to txt file
+    added = tk.append_tokens_to_txt(sorted(all_types), args.extract_tokens)
+    
+    if added:
+        print(f"  Added {len(added)} new tokens to {args.extract_tokens}")
+        for t in added[:10]:
+            print(f"    + {t}")
+        if len(added) > 10:
+            print(f"    ... and {len(added) - 10} more")
+    else:
+        print(f"  All tokens already in {args.extract_tokens}")
+
 
 output_dir = Path(args.output_dir)
 output_dir.mkdir(parents=True, exist_ok=True)
@@ -110,3 +139,5 @@ print(f"\n{'=' * 60}")
 print("Done!")
 print(f"  Gene prediction: {len(gene_dataset)} samples")
 print(f"  Output directory: {output_dir}")
+if args.extract_tokens:
+    print(f"  Tokens file: {args.extract_tokens}")

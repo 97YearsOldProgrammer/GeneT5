@@ -8,6 +8,8 @@ from ._parser import (
     build_feature_hierarchy,
     format_annotation_target,
     create_gene_prediction_dataset,
+    extract_feature_types,
+    extract_biotypes,
     save_dataset,
     load_dataset,
     GENE_FEATURE_TYPES,
@@ -32,18 +34,19 @@ from ._chunking import (
 # optional torch-dependent imports
 try:
     from .dataset import (
-        GFDataset,
+        LazyDataset,
         MixedTaskDataset,
         SmartBatchSampler,
         DynamicPaddingCollator,
     )
 except ImportError:
-    GFDataset            = None
+    LazyDataset            = None
     MixedTaskDataset       = None
     SmartBatchSampler      = None
     DynamicPaddingCollator = None
 
 __all__ = [
+    
     # parser
     "anti",
     "parse_fasta",
@@ -54,10 +57,13 @@ __all__ = [
     "build_feature_hierarchy",
     "format_annotation_target",
     "create_gene_prediction_dataset",
+    "extract_feature_types",
+    "extract_biotypes",
     "save_dataset",
     "load_dataset",
     "GENE_FEATURE_TYPES",
     "BIOTYPES",
+    
     # chunking
     "estimate_tokens",
     "estimate_gff_tokens",
@@ -71,8 +77,9 @@ __all__ = [
     "group_features_by_gene_with_biotype",
     "create_gene_prediction_dataset_with_chunking",
     "format_annotation_target_chunked",
+    
     # dataset
-    "GFDataset",
+    "LazyDataset",
     "MixedTaskDataset",
     "SmartBatchSampler",
     "DynamicPaddingCollator",

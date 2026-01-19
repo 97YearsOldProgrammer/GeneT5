@@ -18,9 +18,9 @@ def build_gt5(
     decoder_ff_dim      = None,
     decoder_dropout     = 0.1,
     decoder_use_alibi   = True,
-    decoder_use_moe     = False,
-    decoder_num_experts = 1,
-    decoder_moe_top_k   = 1,
+    decoder_use_moe     = True,
+    decoder_num_experts = 8,
+    decoder_moe_top_k   = 2,
     vocab_size          = None,
     tie_weights         = True,
     new_tokens_list     = None
@@ -80,6 +80,8 @@ def build_gt5(
     print(f"      ff_dim:          {decoder_ff_dim}")
     print(f"      use_alibi:       {decoder_use_alibi}")
     print(f"      use_moe:         {decoder_use_moe}")
+    print(f"      num_experts:     {decoder_num_experts}")
+    print(f"      moe_top_k:       {decoder_moe_top_k}")
     
     # DNABERT-2's AutoModel returns BertModel directly (no .bert wrapper)
     # Could be original_model.encoder or original_model.bert.encoder depending on version
@@ -276,7 +278,7 @@ def build_gt5(
         torch.cuda.empty_cache()
     
     # Build Decoder
-    print(f"\n[5] Building Decoder (layers={decoder_num_layers}, moe={decoder_use_moe})")
+    print(f"\n[5] Building Decoder (layers={decoder_num_layers}, moe={decoder_use_moe}, experts={decoder_num_experts})")
     decoder = Decoder(
         num_layers       = decoder_num_layers,
         embed_dim        = dna_config.hidden_size,

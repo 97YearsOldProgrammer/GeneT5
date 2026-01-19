@@ -5,8 +5,11 @@ from pathlib          import Path
 from torch.utils.data import Dataset, Sampler
 
 
-class GFDataset(Dataset):
-
+class LazyDataset(Dataset):
+    """
+    Lazy loading dataset that stores file offsets instead of full samples.
+    Uses minimal RAM by reading samples on-demand.
+    """
     
     def __init__(self, data_paths, tokenizer, max_input_len=4096, max_target_len=2048):
         self.tokenizer      = tokenizer

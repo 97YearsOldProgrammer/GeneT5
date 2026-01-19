@@ -2,14 +2,13 @@ import gzip
 import json
 import sys
 from pathlib import Path
-
+from typing  import Dict, List, Optional, Tuple, Any
 
 
 def anti(seq):
     comp     = str.maketrans('ACGTRYMKBDHVNacgtrymkbdhvn', 'TGCAYRKMVHDBNtgcayrkmvhdbn')
     anti_seq = seq.translate(comp)[::-1]
     return anti_seq
-
 
 
 #######################
@@ -395,6 +394,89 @@ def create_gene_prediction_dataset(sequences, features_by_seqid, gene_token="[AT
     
     print(f"  Created {len(dataset)} gene prediction samples")
     return dataset
+
+
+################################
+#####  Type Extraction     #####
+################################
+
+
+def extract_feature_types(features):
+    """
+    Extract all feature types that belong to valid parent/transcript hierarchy.
+    
+    Returns:
+        set: unique feature types found under valid genes/transcripts
+    """
+    # build parent chain
+    id_to_parent = {}
+    valid_parents = set()
+    
+    for feat in features:
+        attrs   = feat["attributes"]
+        feat_id = attrs.get("ID", "")
+        parent  = attrs.get("Parent", "")
+        ftype   = feat["type"].lower()
+        
+        if feat_id:
+            id_to_parent[feat_id] = parent
+        
+        # genes and transcripts are valid roots
+        if ftype in {"gene", "mrna", "transcript", "rrna", "trna", "ncrna",
+                     "snrna", "snorna", "lncrna", "mirna", "lnc_rna", "guide_rna"}:
+            valid_parents.add(feat_id)
+    
+    # find all IDs that descend from valid parents
+    def is_valid_descendant(feat_id):
+        if not feat_id:
+            return False
+        if feat_id in valid_parents:
+            return True
+        parent = id_to_parent.get(feat_id)
+        if parent:
+            return is_valid_descendant(parent)
+        return False
+    
+    # collect types from features with valid parents
+    types = set()
+    for feat in features:
+        attrs  = feat["attributes"]
+        parent = attrs.get("Parent", "")
+        ftype  = feat["type"]
+        
+        # include if parent is valid or if it's a transcript-level feature
+        if parent and (parent in valid_parents or is_valid_descendant(parent)):
+            types.add(ftype.lower())
+        elif ftype.lower() in {"gene", "mrna", "transcript", "rrna", "trna", "ncrna",
+                               "snrna", "snorna", "lncrna", "mirna"}:
+            types.add(ftype.lower())
+    
+    return types
+
+
+def extract_biotypes(features):
+    """
+    Extract all biotypes from transcript-level features.
+    
+    Returns:
+        set: unique biotypes found
+    """
+    biotypes = set()
+    
+    for feat in features:
+        attrs   = feat["attributes"]
+        biotype = attrs.get("biotype", "")
+        ftype   = feat["type"].lower()
+        
+        if biotype:
+            biotypes.add(biotype.lower())
+        
+        # also add feature type as potential biotype for transcript-level
+        if ftype in {"mrna", "rrna", "trna", "ncrna", "snrna", "snorna", 
+                     "lncrna", "mirna", "pseudogene"}:
+            biotypes.add(ftype)
+    
+    return biotypes
 
 
 ################################
