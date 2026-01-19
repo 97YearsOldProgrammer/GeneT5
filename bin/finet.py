@@ -27,7 +27,7 @@ DEFAULTS = {
     "grad_accum":     64,
     "max_grad_norm":  1.0,
     "bucket_size":    256,
-    "num_workers":    8,
+    "num_workers":    0,
     "val_split":      0.2,
 }
 
@@ -61,7 +61,7 @@ def main():
     parser.add_argument("--save_every", type=int, default=1,
         help="Save checkpoint every N epochs.")
     parser.add_argument("--num_workers", type=int, default=DEFAULTS["num_workers"],
-        help="Number of dataloader workers.")
+        help="Number of dataloader workers. Use 0 for large datasets.")
     parser.add_argument("--early_stopping", type=int, default=None,
         help="Stop training if validation loss doesn't improve for N epochs.")
 
@@ -98,31 +98,22 @@ def main():
     print(f"  Trainable: {stats['total_trainable']:,}")
     print(f"  Frozen:    {stats['total_frozen']:,}")
 
-    # load dataset
-    print(f"\nLoading training data...")
+    # load dataset with lazy loading
+    print(f"\nLoading training data (lazy mode)...")
     print(f"  Files: {args.train_data}")
 
-    full_dataset = tuning.MixedTaskDataset(
-        data_paths     = args.train_data,
-        tokenizer      = tokenizer,
-        max_input_len  = args.max_input_len,
-        max_target_len = args.max_target_len,
+    full_dataset = tuning.LazyDataset(
+        args.train_data,
+        tokenizer,
+        args.max_input_len,
+        args.max_target_len,
     )
-    print(f"  Total samples: {len(full_dataset)}")
-
-    # show task distribution
-    task_counts = {}
-    for sample in full_dataset.samples:
-        task = sample["task"]
-        task_counts[task] = task_counts.get(task, 0) + 1
-    print(f"  Task distribution: {task_counts}")
 
     # Split into train/val
     if args.val_split > 0:
-        val_size = int(len(full_dataset) * args.val_split)
+        val_size   = int(len(full_dataset) * args.val_split)
         train_size = len(full_dataset) - val_size
         
-        # Use generator for reproducible split
         generator = torch.Generator().manual_seed(args.seed)
         train_dataset, val_dataset = random_split(
             full_dataset, [train_size, val_size], generator=generator
@@ -131,33 +122,38 @@ def main():
         print(f"\n  Split:")
         print(f"    Train samples: {len(train_dataset)} ({100*(1-args.val_split):.1f}%)")
         print(f"    Val samples:   {len(val_dataset)} ({100*args.val_split:.1f}%)")
+        
+        train_lengths = [full_dataset.lengths[i] for i in train_dataset.indices]
+        val_lengths   = [full_dataset.lengths[i] for i in val_dataset.indices]
     else:
         train_dataset = full_dataset
-        val_dataset = None
+        val_dataset   = None
+        train_lengths = full_dataset.lengths
+        val_lengths   = None
         print(f"  No validation split (val_split=0)")
 
     # dataloader with smart batching
     print(f"\nSetting up dataloaders...")
 
     collator = tuning.DynamicPaddingCollator(
-        pad_token_id = tokenizer.pad_token_id,
-        label_pad    = -100,
+        tokenizer.pad_token_id,
+        -100,
     )
 
     # Train loader
     train_loader = DataLoader(
         train_dataset,
-        batch_sampler = tuning.SmartBatchSampler(
-            lengths     = [full_dataset.lengths[i] for i in train_dataset.indices],
-            batch_size  = args.batch_size,
-            bucket_size = DEFAULTS["bucket_size"],
-            drop_last   = True,
-            shuffle     = True,
+        batch_sampler=tuning.SmartBatchSampler(
+            train_lengths,
+            args.batch_size,
+            DEFAULTS["bucket_size"],
+            True,
+            True,
         ),
-        collate_fn  = collator,
-        num_workers = args.num_workers,
-        pin_memory  = True,
-        persistent_workers = (args.num_workers > 0), 
+        collate_fn=collator,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        persistent_workers=(args.num_workers > 0), 
     )
     print(f"  Train batches: {len(train_loader)}")
 
@@ -166,17 +162,17 @@ def main():
     if val_dataset is not None:
         val_loader = DataLoader(
             val_dataset,
-            batch_sampler = tuning.SmartBatchSampler(
-                lengths     = [full_dataset.lengths[i] for i in val_dataset.indices],
-                batch_size  = args.batch_size,
-                bucket_size = DEFAULTS["bucket_size"],
-                drop_last   = False,
-                shuffle     = False,
+            batch_sampler=tuning.SmartBatchSampler(
+                val_lengths,
+                args.batch_size,
+                DEFAULTS["bucket_size"],
+                False,
+                False,
             ),
-            collate_fn  = collator,
-            num_workers = args.num_workers,
-            pin_memory  = True,
-            persistent_workers = (args.num_workers > 0),
+            collate_fn=collator,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            persistent_workers=(args.num_workers > 0),
         )
         print(f"  Val batches:   {len(val_loader)}")
 
@@ -185,9 +181,9 @@ def main():
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr           = args.lr,
-        betas        = (0.9, 0.95),
-        weight_decay = DEFAULTS["weight_decay"],
+        lr=args.lr,
+        betas=(0.9, 0.95),
+        weight_decay=DEFAULTS["weight_decay"],
     )
 
     total_steps  = len(train_loader) * args.epochs // args.grad_accum
@@ -195,23 +191,23 @@ def main():
 
     scheduler = get_cosine_schedule_with_warmup(
         optimizer, 
-        num_warmup_steps=warmup_steps, 
-        num_training_steps=total_steps
+        warmup_steps, 
+        total_steps
     )
 
     print(f"  Total steps:  {total_steps}")
     print(f"  Warmup steps: {warmup_steps}")
 
     # resume checkpoint
-    start_epoch = 0
-    best_val_loss = float('inf')
+    start_epoch    = 0
+    best_val_loss  = float('inf')
     patience_counter = 0
     
     if args.checkpoint:
         checkpoint_data = lib_train.load_checkpoint(
             model, optimizer, scheduler, args.checkpoint, device
         )
-        start_epoch = checkpoint_data["epoch"]
+        start_epoch   = checkpoint_data["epoch"]
         best_val_loss = checkpoint_data.get("best_val_loss", float('inf'))
         print(f"  Resumed from epoch {start_epoch}")
         print(f"  Best val loss so far: {best_val_loss:.4f}")
@@ -219,10 +215,10 @@ def main():
     # save config
     config = {
         **vars(args), 
-        "vocab_size": len(tokenizer), 
-        "total_steps": total_steps,
-        "train_samples": len(train_dataset),
-        "val_samples": len(val_dataset) if val_dataset else 0,
+        "vocab_size":     len(tokenizer), 
+        "total_steps":    total_steps,
+        "train_samples":  len(train_dataset),
+        "val_samples":    len(val_dataset) if val_dataset else 0,
     }
     with open(output_dir / "finetune_config.json", "w") as f:
         json.dump(config, f, indent=2)
@@ -250,10 +246,9 @@ def main():
             
             # Check if this is the best model
             if val_loss < best_val_loss:
-                best_val_loss = val_loss
+                best_val_loss    = val_loss
                 patience_counter = 0
                 
-                # Save best model
                 print(f"  ✓ New best validation loss! Saving best_model.pt")
                 lib_train.save_checkpoint(
                     model, optimizer, scheduler, epoch + 1,
@@ -264,14 +259,13 @@ def main():
                 patience_counter += 1
                 print(f"  No improvement ({patience_counter}/{args.early_stopping if args.early_stopping else '∞'})")
                 
-                # Early stopping
                 if args.early_stopping and patience_counter >= args.early_stopping:
                     print(f"\n  Early stopping triggered! No improvement for {args.early_stopping} epochs.")
                     break
         else:
             print(f"  Train Loss: {train_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
         
-        # Save periodic checkpoint (always overwrites same file)
+        # Save periodic checkpoint
         if (epoch + 1) % args.save_every == 0:
             lib_train.save_checkpoint(
                 model, optimizer, scheduler, epoch + 1,

@@ -4,23 +4,17 @@ from ._parser import (
     parse_gff,
     group_features_by_seqid,
     group_features_by_parent,
-    build_transcript_to_gene_map,
+    build_transcript_map,
+    build_feature_hierarchy,
     format_annotation_target,
     create_gene_prediction_dataset,
-    create_rna_classification_dataset,
     save_dataset,
     load_dataset,
     GENE_FEATURE_TYPES,
-    RNA_CLASSES,
-    RNA_FEATURE_TYPES,
+    BIOTYPES,
 )
 
 from ._chunking import (
-    load_tokenizer_config,
-    get_existing_tokens,
-    find_missing_rna_tokens,
-    append_tokens_to_config,
-    update_tokenizer_with_rna_classes,
     estimate_tokens,
     estimate_gff_tokens,
     find_gene_boundaries,
@@ -28,20 +22,23 @@ from ._chunking import (
     chunk_gff_with_overlap,
     should_chunk_annotation,
     validate_chunks,
-    build_gene_hierarchy,
     build_transcript_to_gene_map,
-    group_features_by_gene_simple,
+    build_transcript_info,
+    group_features_by_gene_with_biotype,
     create_gene_prediction_dataset_with_chunking,
+    format_annotation_target_chunked,
 )
 
 # optional torch-dependent imports
 try:
     from .dataset import (
+        GFDataset,
         MixedTaskDataset,
         SmartBatchSampler,
         DynamicPaddingCollator,
     )
 except ImportError:
+    GFDataset            = None
     MixedTaskDataset       = None
     SmartBatchSampler      = None
     DynamicPaddingCollator = None
@@ -53,20 +50,15 @@ __all__ = [
     "parse_gff",
     "group_features_by_seqid",
     "group_features_by_parent",
+    "build_transcript_map",
+    "build_feature_hierarchy",
     "format_annotation_target",
     "create_gene_prediction_dataset",
-    "create_rna_classification_dataset",
     "save_dataset",
     "load_dataset",
     "GENE_FEATURE_TYPES",
-    "RNA_CLASSES",
-    "RNA_FEATURE_TYPES",
+    "BIOTYPES",
     # chunking
-    "load_tokenizer_config",
-    "get_existing_tokens",
-    "find_missing_rna_tokens",
-    "append_tokens_to_config",
-    "update_tokenizer_with_rna_classes",
     "estimate_tokens",
     "estimate_gff_tokens",
     "find_gene_boundaries",
@@ -74,10 +66,13 @@ __all__ = [
     "chunk_gff_with_overlap",
     "should_chunk_annotation",
     "validate_chunks",
-    "build_gene_hierarchy",
-    "group_features_by_gene_simple",
+    "build_transcript_to_gene_map",
+    "build_transcript_info",
+    "group_features_by_gene_with_biotype",
     "create_gene_prediction_dataset_with_chunking",
+    "format_annotation_target_chunked",
     # dataset
+    "GFDataset",
     "MixedTaskDataset",
     "SmartBatchSampler",
     "DynamicPaddingCollator",

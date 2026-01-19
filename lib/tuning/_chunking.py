@@ -3,129 +3,6 @@ from pathlib import Path
 
 
 ################################
-#####  Tokenizer Functions #####
-################################
-
-
-def load_tokenizer_config(tokenizer_path):
-    path = Path(tokenizer_path)
-    
-    if path.is_dir():
-        config_file = path / "tokenizer.json"
-    else:
-        config_file = path
-    
-    if not config_file.exists():
-        raise FileNotFoundError(f"Tokenizer config not found: {config_file}")
-    
-    with open(config_file, 'r') as f:
-        return json.load(f)
-
-
-def get_existing_tokens(tokenizer_config):
-    tokens = set()
-    
-    if "model" in tokenizer_config and "vocab" in tokenizer_config["model"]:
-        vocab = tokenizer_config["model"]["vocab"]
-        if isinstance(vocab, dict):
-            tokens.update(vocab.keys())
-        elif isinstance(vocab, list):
-            tokens.update(vocab)
-    
-    if "added_tokens" in tokenizer_config:
-        for token_info in tokenizer_config["added_tokens"]:
-            if isinstance(token_info, dict) and "content" in token_info:
-                tokens.add(token_info["content"])
-            elif isinstance(token_info, str):
-                tokens.add(token_info)
-    
-    return tokens
-
-
-def find_missing_rna_tokens(tokenizer_config, rna_classes):
-    existing = get_existing_tokens(tokenizer_config)
-    missing  = []
-    
-    for rna_type in rna_classes.keys():
-        token_variants = [
-            rna_type,
-            rna_type.lower(),
-            rna_type.upper(),
-            f"[{rna_type}]",
-            f"[{rna_type.upper()}]",
-        ]
-        
-        found = any(t in existing for t in token_variants)
-        if not found:
-            missing.append(rna_type.lower())
-    
-    return missing
-
-
-def append_tokens_to_config(tokenizer_config, new_tokens, output_path=None):
-    if not new_tokens:
-        return tokenizer_config
-    
-    max_id = 0
-    if "added_tokens" in tokenizer_config:
-        for token_info in tokenizer_config["added_tokens"]:
-            if isinstance(token_info, dict) and "id" in token_info:
-                max_id = max(max_id, token_info["id"])
-    
-    if "model" in tokenizer_config and "vocab" in tokenizer_config["model"]:
-        vocab = tokenizer_config["model"]["vocab"]
-        if isinstance(vocab, dict):
-            max_id = max(max_id, max(vocab.values()) if vocab else 0)
-    
-    if "added_tokens" not in tokenizer_config:
-        tokenizer_config["added_tokens"] = []
-    
-    for i, token in enumerate(new_tokens):
-        new_id      = max_id + 1 + i
-        token_entry = {
-            "id":         new_id,
-            "content":    token,
-            "single_word": False,
-            "lstrip":     False,
-            "rstrip":     False,
-            "normalized": False,
-            "special":    False
-        }
-        tokenizer_config["added_tokens"].append(token_entry)
-    
-    if output_path:
-        output_file = Path(output_path)
-        if output_file.is_dir():
-            output_file = output_file / "tokenizer.json"
-        
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_file, 'w') as f:
-            json.dump(tokenizer_config, f, indent=2)
-        print(f"  Saved updated tokenizer to {output_file}")
-    
-    return tokenizer_config
-
-
-def update_tokenizer_with_rna_classes(tokenizer_path, rna_classes, output_path=None):
-    print(f"  Loading tokenizer from {tokenizer_path}")
-    config = load_tokenizer_config(tokenizer_path)
-    
-    existing = get_existing_tokens(config)
-    print(f"  Found {len(existing)} existing tokens")
-    
-    missing = find_missing_rna_tokens(config, rna_classes)
-    
-    if missing:
-        print(f"  Missing RNA tokens: {missing}")
-        config = append_tokens_to_config(config, missing, output_path)
-        print(f"  Added {len(missing)} new tokens")
-    else:
-        print(f"  All RNA tokens already present")
-    
-    return config, missing
-
-
-################################
 #####  Chunking Functions  #####
 ################################
 
@@ -258,82 +135,19 @@ def validate_chunks(chunks, original_features):
 
 
 #######################################
-#####  Gene Hierarchy Functions   #####
+#####  Hierarchy Building         #####
 #######################################
-
-
-def build_gene_hierarchy(features):
-    """
-    Build gene hierarchy from GFF features.
-    Groups features by gene ID, handling the gene -> mRNA -> exon/CDS structure.
-    
-    Returns dict: {gene_id: [list of all child features including gene itself]}
-    """
-    genes      = {}
-    id_to_gene = {}
-    
-    # first pass: find all gene-level features and create mapping
-    for feat in features:
-        feat_type = feat["type"].lower()
-        attrs     = feat["attributes"]
-        feat_id   = attrs.get("ID", "")
-        
-        if feat_type == "gene":
-            gene_id = feat_id
-            if gene_id not in genes:
-                genes[gene_id] = []
-            genes[gene_id].append(feat)
-            id_to_gene[feat_id] = gene_id
-    
-    # second pass: find mRNA/transcript and map to parent gene
-    for feat in features:
-        feat_type = feat["type"].lower()
-        attrs     = feat["attributes"]
-        feat_id   = attrs.get("ID", "")
-        parent    = attrs.get("Parent", "")
-        
-        if feat_type in {"mrna", "transcript"}:
-            if parent in id_to_gene:
-                gene_id = id_to_gene[parent]
-            elif parent in genes:
-                gene_id = parent
-            else:
-                gene_id = parent if parent else feat_id
-                if gene_id not in genes:
-                    genes[gene_id] = []
-            
-            genes[gene_id].append(feat)
-            id_to_gene[feat_id] = gene_id
-    
-    # third pass: add exon/CDS/UTR features to their parent's gene
-    for feat in features:
-        feat_type = feat["type"].lower()
-        attrs     = feat["attributes"]
-        parent    = attrs.get("Parent", "")
-        
-        if feat_type in {"exon", "cds", "five_prime_utr", "three_prime_utr", "utr", "intron"}:
-            if parent in id_to_gene:
-                gene_id = id_to_gene[parent]
-                genes[gene_id].append(feat)
-            elif parent:
-                # parent might be the gene itself
-                for gid in genes:
-                    if parent == gid or parent.endswith(gid.split(":")[-1] if ":" in gid else gid):
-                        genes[gid].append(feat)
-                        break
-    
-    return genes
 
 
 def build_transcript_to_gene_map(features):
     """
     Build a map of transcript/mRNA ID -> gene ID.
-    This allows resolving exon/CDS parents to their gene.
     """
     parent_map = {}
     for f in features:
         ftype = f["type"].lower()
-        if ftype in {"mrna", "transcript", "guide_rna", "lnc_rna", "ncrna"}:
+        if ftype in {"mrna", "transcript", "rrna", "trna", "ncrna", 
+                     "snrna", "snorna", "guide_rna", "lnc_rna"}:
             t_id     = f["attributes"].get("ID")
             g_parent = f["attributes"].get("Parent")
             if t_id and g_parent:
@@ -341,20 +155,56 @@ def build_transcript_to_gene_map(features):
     return parent_map
 
 
-def group_features_by_gene_simple(features):
+def build_transcript_info(features):
     """
-    Group features by gene ID, resolving transcript->gene relationships.
-    Ensures exons and CDS from the same gene stay together.
+    Build transcript info map with biotype.
+    
+    Returns:
+        {transcript_id: {"parent": gene_id, "biotype": str, "start": int}}
+    """
+    transcript_info = {}
+    
+    sorted_feats = sorted(features, key=lambda x: x["start"])
+    
+    for feat in sorted_feats:
+        ftype = feat["type"].lower()
+        attrs = feat["attributes"]
+        
+        if ftype in {"mrna", "transcript", "rrna", "trna", "ncrna",
+                     "snrna", "snorna", "lncrna", "mirna", "guide_rna", "lnc_rna"}:
+            t_id   = attrs.get("ID", "")
+            parent = attrs.get("Parent", "")
+            
+            biotype = attrs.get("biotype", ftype)
+            if biotype.lower() == "protein_coding":
+                biotype = "mRNA"
+            
+            if t_id:
+                transcript_info[t_id] = {
+                    "parent":  parent,
+                    "biotype": biotype,
+                    "start":   feat["start"],
+                }
+    
+    return transcript_info
+
+
+def group_features_by_gene_with_biotype(features):
+    """
+    Group features by gene ID with biotype tracking.
+    
+    Returns:
+        {gene_id: {"features": [...], "biotype": str, "start": int, "end": int, "strand": str}}
     """
     try:
         from ._parser import GENE_FEATURE_TYPES
     except ImportError:
         from _parser import GENE_FEATURE_TYPES
     
-    # 1. build transcript -> gene map from ALL features
-    parent_map = build_transcript_to_gene_map(features)
+    transcript_info = build_transcript_info(features)
+    parent_map      = build_transcript_to_gene_map(features)
     
-    # 2. filter to gene-related features only
+    # filter to gene-related features
     gene_features = [
         f for f in features
         if f["type"] in GENE_FEATURE_TYPES or f["type"].lower() in GENE_FEATURE_TYPES
@@ -363,18 +213,40 @@ def group_features_by_gene_simple(features):
     if not gene_features:
         return {}
     
-    # 3. group by gene ID (resolving through transcript if needed)
+    # track biotype per gene
+    gene_biotypes = {}
+    for t_id, t_info in transcript_info.items():
+        gene_id = t_info["parent"]
+        if gene_id:
+            if gene_id not in gene_biotypes:
+                gene_biotypes[gene_id] = []
+            gene_biotypes[gene_id].append(t_info["biotype"])
+    
+    # group features
     groups = {}
     for feat in gene_features:
         direct_parent = feat["attributes"].get("Parent", feat["attributes"].get("ID"))
         
-        # resolve to gene ID if parent is a transcript
-        group_id = parent_map.get(direct_parent, direct_parent)
+        gene_id = parent_map.get(direct_parent, direct_parent)
         
-        if group_id:
-            if group_id not in groups:
-                groups[group_id] = []
-            groups[group_id].append(feat)
+        if gene_id:
+            if gene_id not in groups:
+                groups[gene_id] = {
+                    "features": [],
+                    "biotype":  "unknown",
+                    "start":    feat["start"],
+                    "end":      feat["end"],
+                    "strand":   feat["strand"],
+                }
+            
+            groups[gene_id]["features"].append(feat)
+            groups[gene_id]["start"]  = min(groups[gene_id]["start"], feat["start"])
+            groups[gene_id]["end"]    = max(groups[gene_id]["end"], feat["end"])
+    
+    # assign biotypes
+    for gene_id in groups:
+        if gene_id in gene_biotypes and gene_biotypes[gene_id]:
+            groups[gene_id]["biotype"] = gene_biotypes[gene_id][0]
     
     return groups
 
@@ -389,9 +261,9 @@ def create_gene_prediction_dataset_with_chunking(sequences, features_by_seqid, w
                                                   eos_token="<EOS>", context_pad=0, 
                                                   max_gff_lines=400, overlap_bp=50, overlap_lines=20):
     try:
-        from ._parser import GENE_FEATURE_TYPES, format_annotation_target, anti
+        from ._parser import GENE_FEATURE_TYPES, anti
     except ImportError:
-        from _parser import GENE_FEATURE_TYPES, format_annotation_target, anti
+        from _parser import GENE_FEATURE_TYPES, anti
     
     dataset       = []
     total_genes   = 0
@@ -406,33 +278,36 @@ def create_gene_prediction_dataset_with_chunking(sequences, features_by_seqid, w
         if not features:
             continue
         
-        # group features by gene (using Parent hierarchy)
-        gene_groups = group_features_by_gene_simple(features)
+        # group features by gene with biotype
+        gene_groups = group_features_by_gene_with_biotype(features)
         
         if not gene_groups:
             continue
         
-        total_genes += len(gene_groups)
+        # sort genes by position for consistent indexing
+        sorted_genes = sorted(gene_groups.items(), key=lambda x: x[1]["start"])
+        total_genes += len(sorted_genes)
         
-        for gene_id, group_feats in gene_groups.items():
+        for gene_index, (gene_id, gene_data) in enumerate(sorted_genes, start=1):
+            group_feats = gene_data["features"]
+            biotype     = gene_data["biotype"]
+            
             if not group_feats:
                 continue
             
-            # get gene span
-            min_start = min(f["start"] for f in group_feats)
-            max_end   = max(f["end"] for f in group_feats)
-            strand    = group_feats[0]["strand"]
+            min_start = gene_data["start"]
+            max_end   = gene_data["end"]
+            strand    = gene_data["strand"]
             
-            # extract sequence with context padding
+            # extract sequence with context
             seq_start = max(0, min_start - 1 - context_pad)
             seq_end   = min(len(sequence), max_end + context_pad)
             chunk_seq = sequence[seq_start:seq_end]
             
-            # reverse complement if minus strand
             if strand == "-":
                 chunk_seq = anti(chunk_seq)
             
-            # adjust feature coordinates relative to extracted sequence
+            # adjust coordinates
             adjusted_features = []
             for f in group_feats:
                 adj_f          = f.copy()
@@ -440,33 +315,28 @@ def create_gene_prediction_dataset_with_chunking(sequences, features_by_seqid, w
                 adj_f["end"]   = f["end"] - seq_start
                 adjusted_features.append(adj_f)
             
-            # check if this gene needs chunking (very large genes)
+            # check chunking needs
             if window_size is not None and len(chunk_seq) > window_size:
-                # use sliding window for very large genes
                 chunks = chunk_sequence_with_overlap(
-                    sequence=chunk_seq,
-                    features=adjusted_features,
-                    window_size=window_size,
-                    stride=stride,
-                    respect_gene_boundaries=False
+                    chunk_seq, adjusted_features, window_size, stride, False
                 )
                 chunked_genes += 1
             elif should_chunk_annotation(adjusted_features, max_gff_lines):
-                # chunk by GFF lines if too many features
                 gff_chunks = chunk_gff_with_overlap(adjusted_features, max_gff_lines, overlap_lines)
                 chunks     = [(0, len(chunk_seq), chunk_seq, gc) for gc in gff_chunks]
                 chunked_genes += 1
             else:
-                # single chunk for this gene
                 chunks = [(0, len(chunk_seq), chunk_seq, adjusted_features)]
             
-            # create samples for each chunk
+            # create samples
             for chunk_idx, (c_start, c_end, c_seq, c_feats) in enumerate(chunks):
                 if not c_feats:
                     continue
                 
                 input_text  = f"{gene_token} {c_seq}"
-                target_text = format_annotation_target(c_feats, gene_token, bos_token, eos_token)
+                target_text = format_annotation_target_chunked(
+                    c_feats, gene_index, biotype, bos_token, eos_token
+                )
                 
                 sample = {
                     "seqid":        seqid,
@@ -474,6 +344,8 @@ def create_gene_prediction_dataset_with_chunking(sequences, features_by_seqid, w
                     "start":        min_start + c_start,
                     "end":          min_start + c_end,
                     "strand":       strand,
+                    "gene_index":   gene_index,
+                    "biotype":      biotype,
                     "chunk_idx":    chunk_idx,
                     "input":        input_text,
                     "target":       target_text,
@@ -489,3 +361,25 @@ def create_gene_prediction_dataset_with_chunking(sequences, features_by_seqid, w
         print(f"  Chunked {chunked_genes} large genes")
     
     return dataset
+
+
+def format_annotation_target_chunked(gene_features, gene_index, biotype, bos_token, eos_token):
+    """
+    Format annotation target with condensed format.
+    
+    Output: type start end strand phase gene_index biotype
+    """
+    if not gene_features:
+        return f"{bos_token}{eos_token}"
+    
+    lines = []
+    for feat in sorted(gene_features, key=lambda x: x["start"]):
+        ftype  = feat["type"].lower()
+        strand = feat["strand"]
+        start  = feat["start"]
+        end    = feat["end"]
+        phase  = feat["phase"]
+        
+        lines.append(f"{ftype}\t{start}\t{end}\t{strand}\t{phase}\t{gene_index}\t{biotype}")
+    
+    return f"{bos_token}\n" + "\n".join(lines) + f"\n{eos_token}"
