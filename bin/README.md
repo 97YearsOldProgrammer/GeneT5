@@ -54,3 +54,22 @@ python3 bin/append_tk.py data/new_tokens.txt ../Data/model/init/tokenizer.json
 ### Data Baking
 
 To prepare fine-tuning data, using [data_baker](bake_data.py)
+
+```python3
+python3 bin/bake_data.py \
+  ../Data/genome/raw/C.crescentus/GCF_000022005.1_ASM2200v1_genomic.fna.gz\
+  ../Data/genome/raw/C.crescentus/GCF_000022005.1_ASM2200v1_genomic.gff.gz  \
+  ../Data/genome/processed/C.crescentus/ \
+  --extract_tokens data/new_tokens.txt \
+  2>&1 | tee ../Data/logs/baker/C.crescentus.txt
+```
+
+
+---
+
+
+### Tuning
+
+```python3
+
+```

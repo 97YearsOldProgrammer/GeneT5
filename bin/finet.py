@@ -160,7 +160,7 @@ def main():
         batch_sampler=tuning.SmartBatchSampler(
             train_lengths,
             args.batch_size,
-            DEFAULTS["bucket_size"],
+            args.bucket_size,
             True,
             True,
         ),
@@ -179,7 +179,7 @@ def main():
             batch_sampler=tuning.SmartBatchSampler(
                 val_lengths,
                 args.batch_size,
-                DEFAULTS["bucket_size"],
+                args.bucket_size,
                 False,
                 False,
             ),
@@ -197,11 +197,11 @@ def main():
         model.parameters(),
         lr=args.lr,
         betas=(0.9, 0.95),
-        weight_decay=DEFAULTS["weight_decay"],
+        weight_decay=args.weight_decay
     )
 
     total_steps  = len(train_loader) * args.epochs // args.grad_accum
-    warmup_steps = int(total_steps * DEFAULTS["warmup_ratio"])
+    warmup_steps = int(total_steps * args.warmup_ratio])
 
     scheduler = get_cosine_schedule_with_warmup(
         optimizer, 
@@ -249,7 +249,7 @@ def main():
         # Train
         train_loss = lib_train.train_epoch_seq2seq(
             model, train_loader, optimizer, scheduler,
-            device, args.grad_accum, DEFAULTS["max_grad_norm"]
+            device, args.grad_accum, args.max_grad_norm]
         )
         
         # Validate
