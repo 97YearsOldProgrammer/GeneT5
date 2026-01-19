@@ -249,7 +249,7 @@ def main():
         # Train
         train_loss = lib_train.train_epoch_seq2seq(
             model, train_loader, optimizer, scheduler,
-            device, args.grad_accum, args.max_grad_norm]
+            device, args.grad_accum, args.max_grad_norm
         )
         
         # Validate
