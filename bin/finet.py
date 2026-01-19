@@ -48,13 +48,28 @@ def main():
         help="Resume from checkpoint path.")
 
     # training params (override defaults)
-    parser.add_argument("--epochs", type=int, default=DEFAULTS["epochs"])
-    parser.add_argument("--batch_size", type=int, default=DEFAULTS["batch_size"])
-    parser.add_argument("--lr", type=float, default=DEFAULTS["lr"])
-    parser.add_argument("--max_input_len", type=int, default=DEFAULTS["max_input_len"])
-    parser.add_argument("--max_target_len", type=int, default=DEFAULTS["max_target_len"])
-    parser.add_argument("--grad_accum", type=int, default=DEFAULTS["grad_accum"])
-    parser.add_argument("--val_split", type=float, default=DEFAULTS["val_split"],
+    parser.add_argument("--epochs", type=int, 
+        default=DEFAULTS["epochs"])
+    parser.add_argument("--batch_size", type=int, 
+        default=DEFAULTS["batch_size"])
+    parser.add_argument("--lr", type=float, 
+        default=DEFAULTS["lr"])
+    parser.add_argument("--max_input_len", type=int, 
+        default=DEFAULTS["max_input_len"])
+    parser.add_argument("--max_target_len", type=int, 
+        default=DEFAULTS["max_target_len"])
+    parser.add_argument("--grad_accum", type=int, 
+        default=DEFAULTS["grad_accum"])
+    parser.add_argument("--weight_decay", type=float, default=DEFAULTS["weight_decay"],
+        help="Weight decay for AdamW optimizer. Default: 0.1")
+    parser.add_argument("--warmup_ratio", type=float, default=DEFAULTS["warmup_ratio"],
+        help="Ratio of total steps for learning rate warmup. Default: 0.1 (10%)")
+    parser.add_argument("--max_grad_norm", type=float, default=DEFAULTS["max_grad_norm"],
+        help="Maximum gradient norm for clipping. Default: 1.0")
+    parser.add_argument("--bucket_size", type=int, default=DEFAULTS["bucket_size"],
+        help="Bucket size for smart batch sampling. Default: 256")
+    parser.add_argument("--val_split", type=float, 
+        default=DEFAULTS["val_split"],
         help="Fraction of data to use for validation (0.0-1.0). Default: 0.2 (20%)")
     parser.add_argument("--seed", type=int, default=42,
         help="Random seed for reproducibility (shuffling, dropout, etc).")
@@ -64,7 +79,6 @@ def main():
         help="Number of dataloader workers. Use 0 for large datasets.")
     parser.add_argument("--early_stopping", type=int, default=None,
         help="Stop training if validation loss doesn't improve for N epochs.")
-
     args = parser.parse_args()
 
     # Validate val_split

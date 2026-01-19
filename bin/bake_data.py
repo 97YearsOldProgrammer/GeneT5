@@ -27,11 +27,11 @@ parser.add_argument("--eos_token", default="<EOS>",
     help="End of sequence token.")
 parser.add_argument("--gene_context_pad", type=int, default=0,
     help="Context padding around gene features (bp).")
-parser.add_argument("--max_gff_lines", type=int, default=400,
+parser.add_argument("--max_gff_lines", type=int, default=1000,
     help="Maximum GFF lines per sample before chunking (~2000 tokens).")
-parser.add_argument("--overlap_bp", type=int, default=50,
+parser.add_argument("--overlap_bp", type=int, default=500,
     help="Overlap in bp for sequence chunking to avoid splitting genes.")
-parser.add_argument("--overlap_lines", type=int, default=20,
+parser.add_argument("--overlap_lines", type=int, default=30,
     help="Overlap in GFF lines for annotation chunking.")
 args = parser.parse_args()
 
