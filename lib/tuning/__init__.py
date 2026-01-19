@@ -34,13 +34,11 @@ from ._chunking import (
 try:
     from .dataset import (
         LazyDataset,
-        MixedTaskDataset,
         SmartBatchSampler,
         DynamicPaddingCollator,
     )
 except ImportError:
     LazyDataset            = None
-    MixedTaskDataset       = None
     SmartBatchSampler      = None
     DynamicPaddingCollator = None
 
