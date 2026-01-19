@@ -201,7 +201,7 @@ def main():
     )
 
     total_steps  = len(train_loader) * args.epochs // args.grad_accum
-    warmup_steps = int(total_steps * args.warmup_ratio])
+    warmup_steps = int(total_steps * args.warmup_ratio)
 
     scheduler = get_cosine_schedule_with_warmup(
         optimizer, 
