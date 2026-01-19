@@ -91,9 +91,9 @@ def main():
     tokenizer   = GeneTokenizer(model_path)
     print(f"  Vocab size: {len(tokenizer)}")
 
-    # load model with BF16
-    print(f"\nLoading model...")
-    model = GeneT5.from_pretrained(model_path, device=device)
+    # load model in FP32 (training uses BF16 autocast)
+    print(f"\nLoading model in FP32...")
+    model = GeneT5.from_pretrained(model_path, device=device, dtype=torch.float32)
     stats = model.get_param_stats()
     print(f"  Trainable: {stats['total_trainable']:,}")
     print(f"  Frozen:    {stats['total_frozen']:,}")

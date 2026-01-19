@@ -14,6 +14,8 @@ class GeneT5(nn.Module):
     
     Encoder: BigBird sparse attention
     Decoder: Causal attention + cross-attention, optional MoE
+    
+    Initialized in FP32, trained with BF16 mixed precision.
     """
     
     def __init__(
@@ -27,7 +29,7 @@ class GeneT5(nn.Module):
         decoder_ff_dim     = 3072,
         decoder_dropout    = 0.1,
         decoder_use_alibi  = True,
-        decoder_use_moe    = False,
+        decoder_use_moe    = True,
         decoder_num_experts= 8,
         decoder_moe_top_k  = 2,
         vocab_size         = 4096,
@@ -139,20 +141,20 @@ class GeneT5(nn.Module):
         # Compute loss
         loss = None
         if labels is not None:
-            loss_fct    = nn.CrossEntropyLoss(ignore_index=-100)
-            loss        = loss_fct(logits.reshape(-1, self.vocab_size), labels.reshape(-1))
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+            loss     = loss_fct(logits.reshape(-1, self.vocab_size), labels.reshape(-1))
             if moe_loss is not None:
                 loss = loss + moe_loss
         
         outputs = {
-            "logits":           logits,
-            "loss":             loss,
-            "moe_loss":         moe_loss,
-            "encoder_hidden":   encoder_hidden_states
+            "logits":         logits,
+            "loss":           loss,
+            "moe_loss":       moe_loss,
+            "encoder_hidden": encoder_hidden_states
         }
         
         if use_cache:
-            outputs["past_key_values"] = None  # TODO: implement KV cache
+            outputs["past_key_values"] = None
         
         return outputs
     
@@ -209,9 +211,9 @@ class GeneT5(nn.Module):
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                 cumulative_probs              = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
                 
-                sorted_indices_to_remove                     = cumulative_probs > top_p
-                sorted_indices_to_remove[..., 1:]            = sorted_indices_to_remove[..., :-1].clone()
-                sorted_indices_to_remove[..., 0]             = 0
+                sorted_indices_to_remove          = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0]  = 0
                 
                 indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
                 logits[indices_to_remove] = float('-inf')
@@ -264,7 +266,7 @@ class GeneT5(nn.Module):
             param.requires_grad = True
     
     def save(self, save_path):
-        """Save model state"""
+        """Save model state in FP32."""
         path = Path(save_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         
@@ -278,10 +280,9 @@ class GeneT5(nn.Module):
         print(f"Saved to {path}")
     
     def load(self, checkpoint_path, strict=False):
-        """Load model state"""
-        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        """Load model state."""
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         
-        # Handle backwards compatibility (old checkpoints without encoder_embed)
         if "encoder_embed" in ckpt:
             self.encoder_embed.load_state_dict(ckpt["encoder_embed"], strict=strict)
         
@@ -293,15 +294,13 @@ class GeneT5(nn.Module):
         print(f"Loaded from {checkpoint_path}")
     
     @classmethod
-    def from_pretrained(cls, checkpoint_dir, device="cpu"):
-        """Load model from build_model.py output"""
+    def from_pretrained(cls, checkpoint_dir, device="cpu", dtype=torch.float32):
+        """Load model from build_model.py output in FP32."""
         path = Path(checkpoint_dir)
         
-        # Load config
         with open(path / "config.json", "r") as f:
             config = json.load(f)
         
-        # Create model
         model = cls(
             embed_dim           = config["embed_dim"],
             encoder_num_layers  = config["encoder_num_layers"],
@@ -321,11 +320,10 @@ class GeneT5(nn.Module):
             num_rand_blocks     = config.get("num_rand_blocks", 3)
         )
         
-        # Load weights
         model.load(path / "pytorch_model.bin")
-        model = model.to(device)
+        model = model.to(device=device, dtype=dtype)
         
-        print(f"Loaded GeneT5 from {path}")
+        print(f"Loaded GeneT5 from {path} (dtype={dtype})")
         stats = model.get_param_stats()
         print(f"  Total params: {stats['total_trainable'] + stats['total_frozen']:,}")
         

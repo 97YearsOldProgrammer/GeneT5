@@ -34,7 +34,7 @@ python3 bin/init_model.py \
 
 ### Token Manangement
 
-The tokenizer is first build on original DNABert-v2 Model for further usage. To init the tokenizer script, generate the extended tokens first through new_tokens[init_tk.py].
+The tokenizer is first build on original DNABert-v2 Model for further usage. To init the tokenizer script, generate the extended tokens first through [new_tokens](init_tk.py).
 
 ```python3
 python3 bin/init_tk.py data/new_tokens.txt
@@ -44,4 +44,13 @@ python3 bin/init_tk.py data/new_tokens.txt
 Since we can't 100% ensure that we can include all weird types from Gff files. We would also have a pipeline for updating tokens into the model toeknizer. To append new tokens into the tokenizer.json, run this:
 
 ```python3
+python3 bin/append_tk.py data/new_tokens.txt ../Data/model/init/tokenizer.json
 ```
+
+
+---
+
+
+### Data Baking
+
+To prepare fine-tuning data, using [data_baker](bake_data.py)

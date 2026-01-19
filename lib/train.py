@@ -9,21 +9,21 @@ from pathlib import Path
 
 
 def train_epoch(model, dataloader, optimizer, scheduler, device, grad_accum=1, max_grad_norm=1.0):
-    """Train for one epoch with gradient accumulation."""
+    """Train for one epoch with BF16 mixed precision and gradient accumulation."""
     model.train()
     total_loss = 0
     num_steps  = 0
     
-    # Auto-detect BF16 support
+    # BF16 for training (model stays FP32, compute in BF16)
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    scaler = torch.amp.GradScaler('cuda', enabled=(dtype == torch.float16))
     
     optimizer.zero_grad()
     
     for step, batch in enumerate(dataloader):
         batch = {k: v.to(device) for k, v in batch.items()}
         
-        # Forward pass with autocast
-        with torch.autocast(device_type="cuda", dtype=dtype):
+        with torch.amp.autocast('cuda', dtype=dtype):
             outputs = model(**batch) if not hasattr(model, 'forward_finetune') else model(**batch)
             
             if isinstance(outputs, dict):
@@ -33,11 +33,20 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, grad_accum=1, m
             
             loss = loss / grad_accum
         
-        loss.backward()
+        if dtype == torch.float16:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
         
         if (step + 1) % grad_accum == 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            optimizer.step()
+            if dtype == torch.float16:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
             num_steps += 1
@@ -48,20 +57,20 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, grad_accum=1, m
 
 
 def train_epoch_seq2seq(model, dataloader, optimizer, scheduler, device, grad_accum=1, max_grad_norm=1.0):
-    """Train for one epoch - seq2seq specific (encoder-decoder models)."""
+    """Train for one epoch - seq2seq with BF16 mixed precision."""
     model.train()
     total_loss = 0
     
-    # Auto-detect BF16 support
+    # BF16 for training (model stays FP32, compute in BF16)
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    scaler = torch.amp.GradScaler('cuda', enabled=(dtype == torch.float16))
     
     optimizer.zero_grad()
     
     for step, batch in enumerate(dataloader):
         batch = {k: v.to(device) for k, v in batch.items()}
         
-        # Forward pass with autocast
-        with torch.autocast(device_type="cuda", dtype=dtype):
+        with torch.amp.autocast('cuda', dtype=dtype):
             outputs = model(
                 encoder_input_ids = batch["input_ids"],
                 decoder_input_ids = batch["labels"][:, :-1],
@@ -70,11 +79,20 @@ def train_epoch_seq2seq(model, dataloader, optimizer, scheduler, device, grad_ac
             
             loss = outputs["loss"] / grad_accum
         
-        loss.backward()
+        if dtype == torch.float16:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
         
         if (step + 1) % grad_accum == 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            optimizer.step()
+            if dtype == torch.float16:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
         
@@ -84,20 +102,19 @@ def train_epoch_seq2seq(model, dataloader, optimizer, scheduler, device, grad_ac
 
 
 def evaluate(model, dataloader, device):
-    """Evaluate model on validation set."""
+    """Evaluate model on validation set with BF16."""
     model.eval()
     total_loss = 0
     correct    = 0
     total      = 0
     
-    # Auto-detect BF16 support
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     
     with torch.no_grad():
         for batch in dataloader:
-            batch   = {k: v.to(device) for k, v in batch.items()}
+            batch = {k: v.to(device) for k, v in batch.items()}
             
-            with torch.autocast(device_type="cuda", dtype=dtype):
+            with torch.amp.autocast('cuda', dtype=dtype):
                 outputs = model(**batch)
                 
                 if isinstance(outputs, dict):
@@ -107,7 +124,6 @@ def evaluate(model, dataloader, device):
             
             total_loss += loss.item()
             
-            # For classification, compute accuracy
             if isinstance(outputs, dict) and "logits" in outputs:
                 logits = outputs["logits"]
                 preds  = torch.argmax(logits, dim=-1)
@@ -121,23 +137,17 @@ def evaluate(model, dataloader, device):
 
 
 def evaluate_seq2seq(model, dataloader, device):
-    """
-    Evaluate model on validation set - seq2seq specific.
-    
-    Returns:
-        float: Average validation loss
-    """
+    """Evaluate seq2seq model with BF16."""
     model.eval()
     total_loss = 0
     
-    # Auto-detect BF16 support
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     
     with torch.no_grad():
         for batch in dataloader:
             batch = {k: v.to(device) for k, v in batch.items()}
             
-            with torch.autocast(device_type="cuda", dtype=dtype):
+            with torch.amp.autocast('cuda', dtype=dtype):
                 outputs = model(
                     encoder_input_ids = batch["input_ids"],
                     decoder_input_ids = batch["labels"][:, :-1],
@@ -157,12 +167,7 @@ def evaluate_seq2seq(model, dataloader, device):
 
 
 def load_checkpoint(model, optimizer, scheduler, checkpoint_path, device="cpu"):
-    """
-    Load model, optimizer, and scheduler states from checkpoint.
-    
-    Returns:
-        dict: Checkpoint metadata including epoch and best_val_loss
-    """
+    """Load model, optimizer, and scheduler states from checkpoint."""
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -173,15 +178,15 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path, device="cpu"):
     if scheduler and "scheduler_state_dict" in checkpoint:
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
     
-    epoch = checkpoint.get("epoch", 0)
+    epoch         = checkpoint.get("epoch", 0)
     best_val_loss = checkpoint.get("config", {}).get("best_val_loss", float('inf'))
     
     print(f"Loaded checkpoint from {checkpoint_path} (epoch {epoch})")
     
     return {
-        "epoch": epoch,
+        "epoch":         epoch,
         "best_val_loss": best_val_loss,
-        "config": checkpoint.get("config", {})
+        "config":        checkpoint.get("config", {})
     }
 
 
@@ -215,7 +220,6 @@ def setup_gene_prediction_model(model_path, tokenizer, device):
     base_model = EncoderDecoderModel.from_pretrained(model_path)
     base_model.resize_token_embeddings(len(tokenizer))
     
-    # Simple wrapper
     class ModelWrapper(nn.Module):
         def __init__(self, model):
             super().__init__()
@@ -241,7 +245,6 @@ def setup_rna_classification_model(model_path, tokenizer, num_classes, device, d
     hidden_size = encoder.config.hidden_size
     encoder.resize_token_embeddings(len(tokenizer))
     
-    # Simple wrapper with classification head
     class ClassificationWrapper(nn.Module):
         def __init__(self, encoder, hidden_size, num_classes, dropout):
             super().__init__()
@@ -250,13 +253,11 @@ def setup_rna_classification_model(model_path, tokenizer, num_classes, device, d
             self.classifier = nn.Linear(hidden_size, num_classes)
         
         def forward(self, input_ids, attention_mask, labels=None):
-            outputs     = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-            hidden      = outputs.last_hidden_state
-            
-            # Pool: use [CLS] token (first token)
-            pooled      = hidden[:, 0, :]
-            pooled      = self.dropout(pooled)
-            logits      = self.classifier(pooled)
+            outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+            hidden  = outputs.last_hidden_state
+            pooled  = hidden[:, 0, :]
+            pooled  = self.dropout(pooled)
+            logits  = self.classifier(pooled)
             
             loss = None
             if labels is not None:
@@ -290,8 +291,8 @@ def prepare_tokenizer(model_path, special_tokens=None):
 def prepare_optimizer_scheduler(model, train_loader, lr, weight_decay, 
                                 epochs, grad_accum, warmup_ratio, scheduler_type="linear"):
     """Prepare optimizer and scheduler."""
-    from torch.optim    import AdamW
-    from transformers   import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
+    from torch.optim  import AdamW
+    from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
     
     total_steps  = len(train_loader) * epochs // grad_accum
     warmup_steps = int(total_steps * warmup_ratio)
