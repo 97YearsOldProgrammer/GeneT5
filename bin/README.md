@@ -32,6 +32,23 @@ python3 bin/init_model.py \
 ---
 
 
+### Data Baking
+
+To prepare fine-tuning data, using [data_baker](bake_data.py)
+
+```python3
+python3 bin/bake_data.py \
+  ../Data/genome/raw/C.crescentus/GCF_000022005.1_ASM2200v1_genomic.fna.gz\
+  ../Data/genome/raw/C.crescentus/GCF_000022005.1_ASM2200v1_genomic.gff.gz  \
+  ../Data/genome/processed/C.crescentus/ \
+  --extract_tokens data/new_tokens.txt \
+  2>&1 | tee ../Data/logs/baker/C.crescentus.txt
+```
+
+
+---
+
+
 ### Token Manangement
 
 The tokenizer is first build on original DNABert-v2 Model for further usage. To init the tokenizer script, generate the extended tokens first through [new_tokens](init_tk.py).
@@ -47,21 +64,11 @@ Since we can't 100% ensure that we can include all weird types from Gff files. W
 python3 bin/append_tk.py data/new_tokens.txt ../Data/model/init/tokenizer.json
 ```
 
-
----
-
-
-### Data Baking
-
-To prepare fine-tuning data, using [data_baker](bake_data.py)
+**Resizing the Embedding Space**
+After adding token into the model, the encoder embedding dimension need to be resized before further fine-tuning. Run this script:
 
 ```python3
-python3 bin/bake_data.py \
-  ../Data/genome/raw/C.crescentus/GCF_000022005.1_ASM2200v1_genomic.fna.gz\
-  ../Data/genome/raw/C.crescentus/GCF_000022005.1_ASM2200v1_genomic.gff.gz  \
-  ../Data/genome/processed/C.crescentus/ \
-  --extract_tokens data/new_tokens.txt \
-  2>&1 | tee ../Data/logs/baker/C.crescentus.txt
+python3 bin/resize_model.py model_path tokenizer_path
 ```
 
 
