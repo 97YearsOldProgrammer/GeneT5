@@ -50,7 +50,7 @@ def expert_scatter_kernel(
     num_tokens, embed_dim,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Scatter tokens to expert-specific positions"""
+    """Scatter tokens to expert-specific positions."""
     pid = tl.program_id(0)
     
     if pid < num_tokens:
@@ -70,7 +70,7 @@ def expert_gather_kernel(
     num_tokens, embed_dim,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Gather expert outputs back to original positions with weighted sum"""
+    """Gather expert outputs back to original positions with weighted sum."""
     pid = tl.program_id(0)
     
     if pid < num_tokens:

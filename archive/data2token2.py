@@ -3,7 +3,7 @@ data to token for WormBase gene set
 """
 
 import argparse
-from lib import dataset as tk
+from lib import nosing as tk
 
 parser = argparse.ArgumentParser(
     description="Tokenise WormBase FASTA/GFF annotations.")

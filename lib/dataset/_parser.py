@@ -6,6 +6,7 @@ from typing  import Dict, List, Optional, Tuple, Any
 
 
 def anti(seq):
+    """Reverse complement a DNA sequence."""
     comp     = str.maketrans('ACGTRYMKBDHVNacgtrymkbdhvn', 'TGCAYRKMVHDBNtgcayrkmvhdbn')
     anti_seq = seq.translate(comp)[::-1]
     return anti_seq
@@ -16,8 +17,9 @@ def anti(seq):
 #######################
 
 
+# Feature types for gene structure (NO intron - computed from exon gaps)
 GENE_FEATURE_TYPES = {
-    "exon", "intron", "CDS", "cds",
+    "exon", "CDS", "cds",
     "five_prime_UTR", "three_prime_UTR", "utr5", "utr3",
 }
 
@@ -28,6 +30,7 @@ GENE_FEATURE_TYPES = {
 
 
 def get_filepointer(filename):
+    """Get file pointer, handling gzip and stdin."""
     fp = None
     if   filename.endswith('.gz'): fp = gzip.open(filename, 'rt')
     elif filename == '-':          fp = sys.stdin
@@ -39,6 +42,9 @@ def parse_fasta(fasta_path):
     """
     Parse FASTA file, handling multi-chromosome genomes.
     The seqid is the first word after '>' in the header.
+    
+    Returns:
+        Dict mapping seqid to sequence string
     """
     sequences   = {}
     current_id  = None
@@ -71,6 +77,9 @@ def parse_gff(gff_path):
     """
     Parse GFF3 file.
     Column 1 (seqid) is used to match with FASTA sequences.
+    
+    Returns:
+        List of feature dicts
     """
     features = []
     
@@ -101,7 +110,6 @@ def parse_gff(gff_path):
             "strand":     parts[6],
             "phase":      parts[7],
             "attributes": attrs,
-            "raw_line":   line
         }
         
         features.append(feature)
@@ -209,7 +217,6 @@ def build_feature_hierarchy(features):
     """
     gene_to_transcripts, transcript_info = build_transcript_map(features)
     
-    # build parent lookup for exon/CDS -> transcript
     hierarchy = {}
     
     # first pass: initialize genes
@@ -228,7 +235,6 @@ def build_feature_hierarchy(features):
     for t_id, t_info in transcript_info.items():
         gene_id = t_info["parent"]
         
-        # create gene entry if it doesn't exist
         if gene_id and gene_id not in hierarchy:
             hierarchy[gene_id] = {
                 "transcripts": {},
@@ -246,31 +252,167 @@ def build_feature_hierarchy(features):
     # third pass: add exon/CDS features to transcripts
     for feat in features:
         ftype = feat["type"].lower()
-        if ftype not in {"exon", "cds", "intron", "five_prime_utr", "three_prime_utr", "utr"}:
+        if ftype not in {"exon", "cds", "five_prime_utr", "three_prime_utr", "utr"}:
             continue
         
         parent = feat["attributes"].get("Parent", "")
         if not parent:
             continue
         
-        # find which gene this belongs to
         if parent in transcript_info:
             gene_id = transcript_info[parent]["parent"]
             if gene_id in hierarchy and parent in hierarchy[gene_id]["transcripts"]:
                 hierarchy[gene_id]["transcripts"][parent]["features"].append(feat)
-        else:
-            # parent might be gene directly (some GFF formats)
-            if parent in hierarchy:
-                # add to first transcript or create one
-                if not hierarchy[parent]["transcripts"]:
-                    hierarchy[parent]["transcripts"][parent] = {
-                        "biotype":  ".",
-                        "features": [],
-                    }
-                first_t = list(hierarchy[parent]["transcripts"].keys())[0]
-                hierarchy[parent]["transcripts"][first_t]["features"].append(feat)
+        elif parent in hierarchy:
+            if not hierarchy[parent]["transcripts"]:
+                hierarchy[parent]["transcripts"][parent] = {
+                    "biotype":  ".",
+                    "features": [],
+                }
+            first_t = list(hierarchy[parent]["transcripts"].keys())[0]
+            hierarchy[parent]["transcripts"][first_t]["features"].append(feat)
     
     return hierarchy
+
+
+def build_transcript_info(features):
+    """
+    Build transcript info map with biotype.
+    
+    Returns:
+        {transcript_id: {"parent": gene_id, "biotype": str, "start": int}}
+    """
+    transcript_info = {}
+    
+    sorted_feats = sorted(features, key=lambda x: x["start"])
+    
+    for feat in sorted_feats:
+        ftype = feat["type"].lower()
+        attrs = feat["attributes"]
+        
+        if ftype in {"mrna", "transcript", "rrna", "trna", "ncrna",
+                     "snrna", "snorna", "lncrna", "mirna", "guide_rna", "lnc_rna"}:
+            t_id   = attrs.get("ID", "")
+            parent = attrs.get("Parent", "")
+            
+            biotype = attrs.get("biotype", ftype)
+            if biotype.lower() == "protein_coding":
+                biotype = "mRNA"
+            
+            if t_id:
+                transcript_info[t_id] = {
+                    "parent":  parent,
+                    "biotype": biotype,
+                    "start":   feat["start"],
+                }
+    
+    return transcript_info
+
+
+def build_transcript_to_gene_map(features):
+    """
+    Build a map of transcript/mRNA ID -> gene ID.
+    """
+    parent_map = {}
+    for f in features:
+        ftype = f["type"].lower()
+        if ftype in {"mrna", "transcript", "rrna", "trna", "ncrna", 
+                     "snrna", "snorna", "guide_rna", "lnc_rna"}:
+            t_id     = f["attributes"].get("ID")
+            g_parent = f["attributes"].get("Parent")
+            if t_id and g_parent:
+                parent_map[t_id] = g_parent
+    return parent_map
+
+
+def group_features_by_gene(features):
+    """
+    Group features by gene ID.
+    
+    Returns:
+        {gene_id: {"features": [...], "start": int, "end": int, "strand": str}}
+    """
+    transcript_info = build_transcript_info(features)
+    parent_map      = build_transcript_to_gene_map(features)
+    
+    # filter to gene-related features (no introns)
+    gene_features = [
+        f for f in features
+        if f["type"] in GENE_FEATURE_TYPES or f["type"].lower() in GENE_FEATURE_TYPES
+    ]
+    
+    if not gene_features:
+        return {}
+    
+    # group features
+    groups = {}
+    for feat in gene_features:
+        direct_parent = feat["attributes"].get("Parent", feat["attributes"].get("ID"))
+        gene_id = parent_map.get(direct_parent, direct_parent)
+        
+        if gene_id:
+            if gene_id not in groups:
+                groups[gene_id] = {
+                    "features": [],
+                    "start":    feat["start"],
+                    "end":      feat["end"],
+                    "strand":   feat["strand"],
+                }
+            
+            groups[gene_id]["features"].append(feat)
+            groups[gene_id]["start"] = min(groups[gene_id]["start"], feat["start"])
+            groups[gene_id]["end"]   = max(groups[gene_id]["end"], feat["end"])
+    
+    return groups
+
+
+################################
+#####  Target Formatting   #####
+################################
+
+
+def format_annotation_target(
+    gene_features: List[Dict],
+    gene_index: int,
+    biotype: str,
+    bos_token: str = "<bos>",
+    eos_token: str = "<eos>"
+) -> str:
+    """
+    Format annotation target for model output.
+    
+    Output format per line: type\tstart\tend\tstrand\tphase\tgene_index\tbiotype
+    
+    Note: Tabs are used as separators and will be tokenized.
+    
+    Args:
+        gene_features: List of features for this gene
+        gene_index: Index of this gene in the sequence
+        biotype: Biotype of the gene
+        bos_token: Beginning of sequence token
+        eos_token: End of sequence token
+    
+    Returns:
+        Formatted target string
+    """
+    if not gene_features:
+        return f"{bos_token}\n{eos_token}"
+    
+    lines = [bos_token]
+    
+    for feat in sorted(gene_features, key=lambda x: x["start"]):
+        ftype  = feat["type"].lower()
+        strand = feat["strand"]
+        start  = feat["start"]
+        end    = feat["end"]
+        phase  = feat.get("phase", ".")
+        
+        # Format with tabs as separators
+        lines.append(f"{ftype}\t{start}\t{end}\t{strand}\t{phase}\t{gene_index}\t{biotype}")
+    
+    lines.append(eos_token)
+    
+    return "\n".join(lines)
 
 
 ################################
@@ -278,35 +420,29 @@ def build_feature_hierarchy(features):
 ################################
 
 
-def format_annotation_target(gene_features, gene_index, biotype, bos_token="<BOS>", eos_token="<EOS>"):
+def create_gene_prediction_dataset(
+    sequences: Dict[str, str],
+    features_by_seqid: Dict[str, List[Dict]],
+    gene_token: str = "[ATT]",
+    bos_token: str = "<bos>",
+    eos_token: str = "<eos>",
+    context_pad: int = 0
+) -> List[Dict]:
     """
-    Format annotation target with new condensed format.
+    Create gene prediction dataset.
     
-    Output format per line: type start end strand phase gene_index biotype
-    Example: exon 149658 149776 + . 1 rRNA
-    """
-    if not gene_features:
-        return f"{bos_token}{eos_token}"
+    Each sample contains features from one gene.
     
-    lines = []
-    for feat in sorted(gene_features, key=lambda x: x["start"]):
-        ftype  = feat["type"].lower()
-        strand = feat["strand"]
-        start  = feat["start"]
-        end    = feat["end"]
-        phase  = feat["phase"]
-        
-        lines.append(f"{ftype}\t{start}\t{end}\t{strand}\t{phase}\t{gene_index}\t{biotype}")
+    Args:
+        sequences: Dict mapping seqid to DNA sequence
+        features_by_seqid: Dict mapping seqid to feature list
+        gene_token: Token marking gene prediction task
+        bos_token: Beginning of sequence token
+        eos_token: End of sequence token
+        context_pad: Padding around gene region
     
-    return f"{bos_token}\n" + "\n".join(lines) + f"\n{eos_token}"
-
-
-def create_gene_prediction_dataset(sequences, features_by_seqid, gene_token="[ATT]",
-                                    bos_token="<BOS>", eos_token="<EOS>", context_pad=0):
-    """
-    Create gene prediction dataset with proper hierarchy tracking.
-    
-    Each sample contains features from one gene, with gene_index and biotype.
+    Returns:
+        List of dataset samples
     """
     dataset = []
     
@@ -342,7 +478,6 @@ def create_gene_prediction_dataset(sequences, features_by_seqid, gene_token="[AT
             if not all_features:
                 continue
             
-            # use most common biotype or "." for unknown
             primary_biotype = biotypes[0] if biotypes else "."
             
             # get span
@@ -361,7 +496,7 @@ def create_gene_prediction_dataset(sequences, features_by_seqid, gene_token="[AT
             # adjust coordinates relative to extracted sequence
             adjusted_features = []
             for f in all_features:
-                adj_f          = f.copy()
+                adj_f = f.copy()
                 adj_f["start"] = f["start"] - seq_start
                 adj_f["end"]   = f["end"] - seq_start
                 adjusted_features.append(adj_f)
@@ -382,6 +517,8 @@ def create_gene_prediction_dataset(sequences, features_by_seqid, gene_token="[AT
                 "input":        input_text,
                 "target":       target_text,
                 "num_features": len(all_features),
+                "features":     adjusted_features,  # Keep for noising
+                "seq_offset":   seq_start,
             }
             
             dataset.append(sample)
@@ -397,53 +534,18 @@ def create_gene_prediction_dataset(sequences, features_by_seqid, gene_token="[AT
 
 def extract_feature_types(features):
     """
-    Extract all feature types that belong to valid parent/transcript hierarchy.
+    Extract all feature types from valid gene structures.
+    Does NOT include intron (computed, not in GFF).
     
     Returns:
-        set: unique feature types found under valid genes/transcripts
+        set: unique feature types
     """
-    # build parent chain
-    id_to_parent = {}
-    valid_parents = set()
-    
-    for feat in features:
-        attrs   = feat["attributes"]
-        feat_id = attrs.get("ID", "")
-        parent  = attrs.get("Parent", "")
-        ftype   = feat["type"].lower()
-        
-        if feat_id:
-            id_to_parent[feat_id] = parent
-        
-        # genes and transcripts are valid roots
-        if ftype in {"gene", "mrna", "transcript", "rrna", "trna", "ncrna",
-                     "snrna", "snorna", "lncrna", "mirna", "lnc_rna", "guide_rna"}:
-            valid_parents.add(feat_id)
-    
-    # find all IDs that descend from valid parents
-    def is_valid_descendant(feat_id):
-        if not feat_id:
-            return False
-        if feat_id in valid_parents:
-            return True
-        parent = id_to_parent.get(feat_id)
-        if parent:
-            return is_valid_descendant(parent)
-        return False
-    
-    # collect types from features with valid parents
     types = set()
+    
     for feat in features:
-        attrs  = feat["attributes"]
-        parent = attrs.get("Parent", "")
-        ftype  = feat["type"]
-        
-        # include if parent is valid or if it's a transcript-level feature
-        if parent and (parent in valid_parents or is_valid_descendant(parent)):
-            types.add(ftype.lower())
-        elif ftype.lower() in {"gene", "mrna", "transcript", "rrna", "trna", "ncrna",
-                               "snrna", "snorna", "lncrna", "mirna"}:
-            types.add(ftype.lower())
+        ftype = feat["type"].lower()
+        if ftype in {"exon", "cds", "five_prime_utr", "three_prime_utr"}:
+            types.add(ftype)
     
     return types
 
@@ -453,7 +555,7 @@ def extract_biotypes(features):
     Extract all biotypes from transcript-level features.
     
     Returns:
-        set: unique biotypes found
+        set: unique biotypes
     """
     biotypes = set()
     
@@ -465,7 +567,6 @@ def extract_biotypes(features):
         if biotype:
             biotypes.add(biotype.lower())
         
-        # also add feature type as potential biotype for transcript-level
         if ftype in {"mrna", "rrna", "trna", "ncrna", "snrna", "snorna", 
                      "lncrna", "mirna", "pseudogene"}:
             biotypes.add(ftype)
@@ -479,17 +580,21 @@ def extract_biotypes(features):
 
 
 def save_dataset(dataset, output_path):
+    """Save dataset to JSONL file."""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
     with open(output_path, 'w') as f:
         for sample in dataset:
-            f.write(json.dumps(sample) + '\n')
+            # Don't save features list to reduce file size
+            sample_out = {k: v for k, v in sample.items() if k != "features"}
+            f.write(json.dumps(sample_out) + '\n')
     
     print(f"  Saved {len(dataset)} samples to {output_path}")
 
 
 def load_dataset(input_path):
+    """Load dataset from JSONL file."""
     dataset = []
     with open(input_path, 'r') as f:
         for line in f:

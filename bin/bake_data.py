@@ -1,7 +1,7 @@
 import argparse
 from pathlib import Path
 
-from lib import tuning
+from lib import dataset
 from lib import tokenizer as tk
 
 
@@ -39,12 +39,12 @@ args = parser.parse_args()
 # parse input files
 print(f"\n{' GFF3/FASTA Parsing ':=^60}")
 print("Parsing FASTA...")
-sequences = tuning.parse_fasta(args.fasta)
+sequences = dataset.parse_fasta(args.fasta)
 print(f"  Found {len(sequences)} sequence(s): {list(sequences.keys())[:5]}...")
 
 print("Parsing GFF3...")
-features          = tuning.parse_gff(args.gff)
-features_by_seqid = tuning.group_features_by_seqid(features)
+features          = dataset.parse_gff(args.gff)
+features_by_seqid = dataset.group_features_by_seqid(features)
 print(f"  Found {len(features)} features across {len(features_by_seqid)} seqid(s)")
 
 # count feature types
@@ -59,8 +59,8 @@ print(f"  Feature types: {dict(sorted(type_counts.items(), key=lambda x: -x[1])[
 if args.extract_tokens:
     print(f"\n{' Token Extraction ':=^60}")
     
-    feature_types = tuning.extract_feature_types(features)
-    biotypes      = tuning.extract_biotypes(features)
+    feature_types = dataset.extract_feature_types(features)
+    biotypes      = dataset.extract_biotypes(features)
     
     all_types = feature_types | biotypes
     
@@ -88,12 +88,12 @@ output_dir.mkdir(parents=True, exist_ok=True)
 # gene prediction dataset
 print(f"\n{'=' * 60}")
 print("Creating gene prediction dataset...")
-print(f"  Grouping by parent ID, filtering: {tuning.GENE_FEATURE_TYPES}")
+print(f"  Grouping by parent ID, filtering: {dataset.GENE_FEATURE_TYPES}")
 print(f"  Chunking params: max_gff_lines={args.max_gff_lines}, overlap_lines={args.overlap_lines}")
 if args.window_size:
     print(f"  Sliding window: size={args.window_size}, stride={args.stride or args.window_size // 2}")
 
-gene_dataset = tuning.create_gene_prediction_dataset_with_chunking(
+gene_dataset = dataset.create_gene_prediction_dataset_with_chunking(
     sequences,
     features_by_seqid,
     args.window_size,
@@ -107,7 +107,7 @@ gene_dataset = tuning.create_gene_prediction_dataset_with_chunking(
     args.overlap_lines,
 )
 
-tuning.save_dataset(gene_dataset, output_dir / "gene_prediction.jsonl")
+dataset.save_dataset(gene_dataset, output_dir / "gene_prediction.jsonl")
 
 # show sample and stats
 if gene_dataset:
