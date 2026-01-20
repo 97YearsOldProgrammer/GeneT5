@@ -42,6 +42,12 @@ except ImportError:
     SmartBatchSampler      = None
     DynamicPaddingCollator = None
 
+# Binary dataset (also torch-dependent)
+try:
+    from .binary_dataset import BinaryDataset
+except ImportError:
+    BinaryDataset = None
+
 __all__ = [
     # parser
     "anti",
@@ -75,7 +81,7 @@ __all__ = [
     
     # dataset
     "LazyDataset",
-    "MixedTaskDataset",
     "SmartBatchSampler",
     "DynamicPaddingCollator",
+    "BinaryDataset",
 ]

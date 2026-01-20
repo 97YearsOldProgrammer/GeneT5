@@ -32,12 +32,31 @@ DEFAULTS = {
 }
 
 
+def detect_data_format(data_paths):
+    """
+    Detect whether data is in binary or JSONL format.
+    
+    Returns:
+        str: 'binary' or 'jsonl'
+    """
+    for path in data_paths:
+        path = Path(path)
+        if path.suffix == '.bin':
+            return 'binary'
+        if path.suffix == '.jsonl':
+            # Check if corresponding .bin exists
+            bin_path = path.with_suffix('.bin')
+            if bin_path.exists():
+                return 'binary'
+    return 'jsonl'
+
+
 def main():
     parser = argparse.ArgumentParser(description="Fine-tune GeneT5")
 
     # data - multiple jsonl files that get mixed
     parser.add_argument("train_data", type=str, nargs="+",
-        help="Training data paths (jsonl). Multiple files get randomly mixed.")
+        help="Training data paths (jsonl or bin). Multiple files get randomly mixed.")
     parser.add_argument("output_dir", type=str,
         help="Output directory for checkpoints and final model.")
 
@@ -79,6 +98,8 @@ def main():
         help="Number of dataloader workers. Use 0 for large datasets.")
     parser.add_argument("--early_stopping", type=int, default=None,
         help="Stop training if validation loss doesn't improve for N epochs.")
+    parser.add_argument("--force_jsonl", action="store_true",
+        help="Force use of JSONL format even if binary exists.")
     args = parser.parse_args()
 
     # Validate val_split
@@ -112,16 +133,41 @@ def main():
     print(f"  Trainable: {stats['total_trainable']:,}")
     print(f"  Frozen:    {stats['total_frozen']:,}")
 
-    # load dataset with lazy loading
-    print(f"\nLoading training data (lazy mode)...")
+    # Detect data format and load dataset
+    data_format = 'jsonl' if args.force_jsonl else detect_data_format(args.train_data)
+    
+    print(f"\nLoading training data ({data_format} format)...")
     print(f"  Files: {args.train_data}")
-
-    full_dataset = tuning.LazyDataset(
-        args.train_data,
-        tokenizer,
-        args.max_input_len,
-        args.max_target_len,
-    )
+    
+    if data_format == 'binary':
+        # Convert paths to .bin if they're .jsonl
+        bin_paths = []
+        for p in args.train_data:
+            path = Path(p)
+            if path.suffix == '.jsonl':
+                bin_path = path.with_suffix('.bin')
+                if bin_path.exists():
+                    bin_paths.append(str(bin_path))
+                else:
+                    bin_paths.append(str(path))
+            else:
+                bin_paths.append(str(path))
+        
+        full_dataset = tuning.BinaryDataset(
+            bin_paths,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+        
+        # BinaryDataset already has lengths attribute
+        print(f"  Loaded {len(full_dataset)} samples (binary)")
+        
+    else:
+        full_dataset = tuning.LazyDataset(
+            args.train_data,
+            tokenizer,
+            args.max_input_len,
+            args.max_target_len,
+        )
 
     # Split into train/val
     if args.val_split > 0:
@@ -233,6 +279,7 @@ def main():
         "total_steps":    total_steps,
         "train_samples":  len(train_dataset),
         "val_samples":    len(val_dataset) if val_dataset else 0,
+        "data_format":    data_format,
     }
     with open(output_dir / "finetune_config.json", "w") as f:
         json.dump(config, f, indent=2)
