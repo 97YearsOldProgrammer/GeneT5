@@ -1,14 +1,13 @@
 import random
 import math
-from typing import List, Dict, Optional
 
 
 DONOR_SITE    = "GT"
 ACCEPTOR_SITE = "AG"
 
 
-def compute_introns_from_exons(exons: List[Dict], strand: str) -> List[Dict]:
-    """Compute intron positions from sorted exon list."""
+def compute_introns_from_exons(exons, strand):
+
     if len(exons) < 2:
         return []
     
@@ -32,8 +31,8 @@ def compute_introns_from_exons(exons: List[Dict], strand: str) -> List[Dict]:
     return introns
 
 
-def group_exons_by_parent(features: List[Dict]) -> Dict[str, List[Dict]]:
-    """Group exon features by their parent transcript/gene."""
+def group_exons_by_parent(features):
+
     groups = {}
     
     for feat in features:
@@ -48,8 +47,8 @@ def group_exons_by_parent(features: List[Dict]) -> Dict[str, List[Dict]]:
     return groups
 
 
-def drop_intron_by_anchor(intron: Dict, exons: List[Dict], config) -> bool:
-    """Decide whether to drop an intron based on anchor length."""
+def drop_intron_by_anchor(intron, exons, config):
+
     intron_start      = intron["start"]
     intron_end        = intron["end"]
     upstream_anchor   = 0
@@ -70,8 +69,8 @@ def drop_intron_by_anchor(intron: Dict, exons: List[Dict], config) -> bool:
     return random.random() < p_drop
 
 
-def noise_real_introns(introns: List[Dict], exons: List[Dict], config, degraded: bool = False) -> List[Dict]:
-    """Apply RNA-seq style noise to real introns."""
+def noise_real_introns(introns, exons, config, degraded=False):
+
     surviving = []
     drop_mult = config.degraded_drop_mult if degraded else 1.0
     
@@ -92,8 +91,8 @@ def noise_real_introns(introns: List[Dict], exons: List[Dict], config, degraded:
     return surviving
 
 
-def find_splice_sites(sequence: str, site_type: str = "donor") -> List[int]:
-    """Find all GT (donor) or AG (acceptor) sites in sequence."""
+def find_splice_sites(sequence, site_type="donor"):
+
     pattern   = DONOR_SITE if site_type == "donor" else ACCEPTOR_SITE
     positions = []
     seq_upper = sequence.upper()
@@ -109,8 +108,8 @@ def find_splice_sites(sequence: str, site_type: str = "donor") -> List[int]:
     return positions
 
 
-def generate_fake_intron(sequence: str, existing_features: List[Dict], config, strand: str = "+") -> Optional[Dict]:
-    """Generate a plausible false positive intron."""
+def generate_fake_intron(sequence, existing_features, config, strand="+"):
+
     donors    = find_splice_sites(sequence, "donor")
     acceptors = find_splice_sites(sequence, "acceptor")
     
@@ -157,8 +156,8 @@ def generate_fake_intron(sequence: str, existing_features: List[Dict], config, s
     return None
 
 
-def generate_fake_introns(sequence: str, real_introns: List[Dict], existing_features: List[Dict], config) -> List[Dict]:
-    """Generate hallucinated introns based on hallucination rate."""
+def generate_fake_introns(sequence, real_introns, existing_features, config):
+
     n_real = len(real_introns)
     n_fake = int(n_real * config.intron_hallucinate_rate)
     

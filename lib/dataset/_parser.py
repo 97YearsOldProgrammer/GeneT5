@@ -2,7 +2,6 @@ import gzip
 import json
 import sys
 from pathlib import Path
-from typing  import Dict, List, Optional, Tuple, Any
 
 
 def anti(seq):
@@ -30,7 +29,7 @@ GENE_FEATURE_TYPES = {
 
 
 def get_filepointer(filename):
-    """Get file pointer, handling gzip and stdin."""
+
     fp = None
     if   filename.endswith('.gz'): fp = gzip.open(filename, 'rt')
     elif filename == '-':          fp = sys.stdin
@@ -39,13 +38,7 @@ def get_filepointer(filename):
 
 
 def parse_fasta(fasta_path):
-    """
-    Parse FASTA file, handling multi-chromosome genomes.
-    The seqid is the first word after '>' in the header.
-    
-    Returns:
-        Dict mapping seqid to sequence string
-    """
+
     sequences   = {}
     current_id  = None
     current_seq = []
@@ -130,7 +123,7 @@ def group_features_by_seqid(features):
 
 
 def group_features_by_parent(features):
-    """Group features by their Parent attribute."""
+
     grouped = {}
     orphans = []
     
@@ -152,13 +145,7 @@ def group_features_by_parent(features):
 
 
 def build_transcript_map(features):
-    """
-    Build maps for gene->transcript and transcript->biotype relationships.
-    
-    Returns:
-        gene_to_transcripts: {gene_id: [transcript_ids in order]}
-        transcript_info:     {transcript_id: {"parent": gene_id, "biotype": str}}
-    """
+
     gene_to_transcripts = {}
     transcript_info     = {}
     
@@ -197,24 +184,7 @@ def build_transcript_map(features):
 
 
 def build_feature_hierarchy(features):
-    """
-    Build complete hierarchy: gene -> transcript -> exon/CDS
-    
-    Returns:
-        hierarchy: {
-            gene_id: {
-                "transcripts": {
-                    transcript_id: {
-                        "biotype":  str,
-                        "features": [feature_dicts]
-                    }
-                },
-                "start": int,
-                "end":   int,
-                "strand": str
-            }
-        }
-    """
+
     gene_to_transcripts, transcript_info = build_transcript_map(features)
     
     hierarchy = {}
@@ -276,12 +246,7 @@ def build_feature_hierarchy(features):
 
 
 def build_transcript_info(features):
-    """
-    Build transcript info map with biotype.
-    
-    Returns:
-        {transcript_id: {"parent": gene_id, "biotype": str, "start": int}}
-    """
+
     transcript_info = {}
     
     sorted_feats = sorted(features, key=lambda x: x["start"])
@@ -326,12 +291,7 @@ def build_transcript_to_gene_map(features):
 
 
 def group_features_by_gene(features):
-    """
-    Group features by gene ID.
-    
-    Returns:
-        {gene_id: {"features": [...], "start": int, "end": int, "strand": str}}
-    """
+
     transcript_info = build_transcript_info(features)
     parent_map      = build_transcript_to_gene_map(features)
     
@@ -372,29 +332,13 @@ def group_features_by_gene(features):
 
 
 def format_annotation_target(
-    gene_features: List[Dict],
-    gene_index: int,
-    biotype: str,
-    bos_token: str = "<bos>",
-    eos_token: str = "<eos>"
-) -> str:
-    """
-    Format annotation target for model output.
-    
-    Output format per line: type\tstart\tend\tstrand\tphase\tgene_index\tbiotype
-    
-    Note: Tabs are used as separators and will be tokenized.
-    
-    Args:
-        gene_features: List of features for this gene
-        gene_index: Index of this gene in the sequence
-        biotype: Biotype of the gene
-        bos_token: Beginning of sequence token
-        eos_token: End of sequence token
-    
-    Returns:
-        Formatted target string
-    """
+    gene_features,
+    gene_index,
+    biotype,
+    bos_token="<bos>",
+    eos_token="<eos>"
+):
+
     if not gene_features:
         return f"{bos_token}\n{eos_token}"
     
@@ -421,29 +365,14 @@ def format_annotation_target(
 
 
 def create_gene_prediction_dataset(
-    sequences: Dict[str, str],
-    features_by_seqid: Dict[str, List[Dict]],
-    gene_token: str = "[ATT]",
-    bos_token: str = "<bos>",
-    eos_token: str = "<eos>",
-    context_pad: int = 0
-) -> List[Dict]:
-    """
-    Create gene prediction dataset.
+    sequences,
+    features_by_seqid,
+    gene_token="[ATT]",
+    bos_token="<bos>",
+    eos_token="<eos>",
+    context_pad=0
+}:
     
-    Each sample contains features from one gene.
-    
-    Args:
-        sequences: Dict mapping seqid to DNA sequence
-        features_by_seqid: Dict mapping seqid to feature list
-        gene_token: Token marking gene prediction task
-        bos_token: Beginning of sequence token
-        eos_token: End of sequence token
-        context_pad: Padding around gene region
-    
-    Returns:
-        List of dataset samples
-    """
     dataset = []
     
     for seqid, sequence in sequences.items():
@@ -533,13 +462,7 @@ def create_gene_prediction_dataset(
 
 
 def extract_feature_types(features):
-    """
-    Extract all feature types from valid gene structures.
-    Does NOT include intron (computed, not in GFF).
-    
-    Returns:
-        set: unique feature types
-    """
+
     types = set()
     
     for feat in features:
@@ -551,12 +474,7 @@ def extract_feature_types(features):
 
 
 def extract_biotypes(features):
-    """
-    Extract all biotypes from transcript-level features.
-    
-    Returns:
-        set: unique biotypes
-    """
+
     biotypes = set()
     
     for feat in features:
@@ -574,13 +492,13 @@ def extract_biotypes(features):
     return biotypes
 
 
-################################
-#####  I/O Functions       #####
-################################
+#################
+#####  I/O  #####
+#################
 
 
 def save_dataset(dataset, output_path):
-    """Save dataset to JSONL file."""
+
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -594,7 +512,7 @@ def save_dataset(dataset, output_path):
 
 
 def load_dataset(input_path):
-    """Load dataset from JSONL file."""
+
     dataset = []
     with open(input_path, 'r') as f:
         for line in f:

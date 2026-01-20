@@ -1,9 +1,8 @@
 import random
-from typing import List, Dict, Optional
 
 
-def apply_exon_boundary_extension(exon: Dict, config) -> Dict:
-    """Apply boundary extension to exon (coverage bleeds into introns)."""
+def apply_exon_boundary_extension(exon, config):
+
     ext_start = int(random.expovariate(config.exon_boundary_lambda))
     ext_end   = int(random.expovariate(config.exon_boundary_lambda))
     ext_start = min(ext_start, config.exon_boundary_max)
@@ -17,8 +16,8 @@ def apply_exon_boundary_extension(exon: Dict, config) -> Dict:
     }
 
 
-def noise_real_exons(exons: List[Dict], config, degraded: bool = False) -> List[Dict]:
-    """Apply coverage-based noise to real exons."""
+def noise_real_exons(exons, config, degraded=False):
+
     if not exons:
         return []
     
@@ -52,8 +51,8 @@ def noise_real_exons(exons: List[Dict], config, degraded: bool = False) -> List[
     return noised
 
 
-def generate_fake_exon(sequence: str, existing_features: List[Dict], config) -> Optional[Dict]:
-    """Generate a plausible false positive exon."""
+def generate_fake_exon(sequence, existing_features, config):
+
     feature_regions = []
     for feat in existing_features:
         feature_regions.append((feat["start"], feat["end"]))

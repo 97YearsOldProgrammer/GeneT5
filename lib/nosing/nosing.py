@@ -1,6 +1,5 @@
 import random
 from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Optional, Any
 
 from lib.nosing import _intron
 from lib.nosing import _exon
@@ -15,9 +14,8 @@ from lib.nosing import _config
 
 @dataclass
 class NoisingConfig:
-    """Configuration for biological noise parameters."""
     
-    scenario_weights: Dict[str, float] = field(default_factory=lambda: {
+    scenario_weights = field(default_factory=lambda: {
         'full_mix':    0.40,
         'intron_only': 0.25,
         'cds_only':    0.20,
@@ -25,32 +23,32 @@ class NoisingConfig:
         'ab_initio':   0.05,
     })
     
-    intron_drop_base:        float = 0.10
-    intron_anchor_alpha:     float = 0.05
-    intron_anchor_beta:      float = 0.40
-    intron_anchor_gamma:     float = 0.15
-    intron_hallucinate_rate: float = 0.03
-    intron_min_length:       int   = 20
-    intron_max_length:       int   = 50000
+    intron_drop_base        = 0.10
+    intron_anchor_alpha     = 0.05
+    intron_anchor_beta      = 0.40
+    intron_anchor_gamma     = 0.15
+    intron_hallucinate_rate = 0.03
+    intron_min_length       = 20
+    intron_max_length       = 50000
     
-    cds_jitter_sigma:       float = 20.0
-    cds_truncate_5_prob:    float = 0.12
-    cds_truncate_3_prob:    float = 0.10
-    cds_truncate_5_max:     int   = 60
-    cds_truncate_3_max:     int   = 45
-    cds_frameshift_prob:    float = 0.02
-    cds_wrong_strand_prob:  float = 0.28
+    cds_jitter_sigma       = 20.0
+    cds_truncate_5_prob    = 0.12
+    cds_truncate_3_prob    = 0.10
+    cds_truncate_5_max     = 60
+    cds_truncate_3_max     = 45
+    cds_frameshift_prob    = 0.02
+    cds_wrong_strand_prob  = 0.28
     
-    exon_boundary_lambda: float = 0.1
-    exon_boundary_max:    int   = 50
-    exon_merge_prob:      float = 0.02
-    exon_drop_prob:       float = 0.05
+    exon_boundary_lambda = 0.1
+    exon_boundary_max    = 50
+    exon_merge_prob      = 0.02
+    exon_drop_prob       = 0.05
     
-    degraded_drop_mult:  float = 3.0
-    degraded_noise_mult: float = 2.0
+    degraded_drop_mult  = 3.0
+    degraded_noise_mult = 2.0
 
-def select_scenario(config: NoisingConfig) -> str:
-    """Randomly select a training scenario based on weights."""
+def select_scenario(config):
+
     weights   = config.scenario_weights
     scenarios = list(weights.keys())
     probs     = [weights[s] for s in scenarios]
@@ -63,13 +61,12 @@ def select_scenario(config: NoisingConfig) -> str:
 
 
 class GFFNoiser:
-    """Main noiser class that applies biological noise to GFF annotations."""
     
-    def __init__(self, config: Optional[_config.NoisingConfig] = None):
+    def __init__(self, config=None):
         self.config = config or _config.NoisingConfig()
     
-    def extract_features_by_type(self, features: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
-        """Extract exons and CDS features from feature list."""
+    def extract_features_by_type(self, features):
+
         exons = []
         cds   = []
         
@@ -82,8 +79,8 @@ class GFFNoiser:
         
         return exons, cds
     
-    def compute_all_introns(self, features: List[Dict]) -> List[Dict]:
-        """Compute all introns from exon features."""
+    def compute_all_introns(self, features):
+
         all_introns = []
         exon_groups = _intron.group_exons_by_parent(features)
         
@@ -97,13 +94,8 @@ class GFFNoiser:
         
         return all_introns
     
-    def noise_features(
-        self,
-        features: List[Dict],
-        sequence: str,
-        scenario: Optional[str] = None
-    ) -> Tuple[List[Dict], str, Dict[str, Any]]:
-        """Apply biological noise to features based on scenario."""
+    def noise_features(self, features, sequence, scenario=None):
+
         if scenario is None:
             scenario = _config.select_scenario(self.config)
         
@@ -145,8 +137,8 @@ class GFFNoiser:
         
         return hints, scenario, noise_log
     
-    def format_hints_for_input(self, hints: List[Dict], hint_token: str = "[HIT]") -> str:
-        """Format hints as input string for the model."""
+    def format_hints_for_input(self, hints, hint_token="[HIT]"):
+
         if not hints:
             return ""
         

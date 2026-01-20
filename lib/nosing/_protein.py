@@ -1,9 +1,8 @@
 import random
-from typing import List, Dict, Optional
 
 
-def apply_cds_jitter(cds: Dict, config, is_terminal: bool = False) -> Dict:
-    """Apply boundary jitter to CDS feature."""
+def apply_cds_jitter(cds, config, is_terminal=False):
+
     sigma        = config.cds_jitter_sigma
     jitter_start = int(random.gauss(0, sigma))
     jitter_end   = int(random.gauss(0, sigma))
@@ -24,8 +23,8 @@ def apply_cds_jitter(cds: Dict, config, is_terminal: bool = False) -> Dict:
     }
 
 
-def apply_cds_truncation(cds: Dict, config, position: str) -> Dict:
-    """Apply truncation to CDS (simulates incomplete protein alignment)."""
+def apply_cds_truncation(cds, config, position):
+
     result = cds.copy()
     
     if position == "5prime":
@@ -44,16 +43,16 @@ def apply_cds_truncation(cds: Dict, config, position: str) -> Dict:
     return result
 
 
-def apply_frameshift(cds: Dict, config) -> Dict:
-    """Apply frameshift error to CDS."""
+def apply_frameshift(cds, config):
+
     shift           = random.choice([-2, -1, 1, 2])
     result          = cds.copy()
     result["start"] = max(1, cds["start"] + shift)
     return result
 
 
-def noise_real_cds(cds_features: List[Dict], config, degraded: bool = False) -> List[Dict]:
-    """Apply protein alignment style noise to real CDS features."""
+def noise_real_cds(cds_features, config, degraded=False):
+
     if not cds_features:
         return []
     
@@ -81,8 +80,8 @@ def noise_real_cds(cds_features: List[Dict], config, degraded: bool = False) -> 
     return noised
 
 
-def generate_fake_cds(sequence: str, existing_features: List[Dict], config) -> Optional[Dict]:
-    """Generate a plausible false positive CDS."""
+def generate_fake_cds(sequence, existing_features, config):
+
     seq_upper     = sequence.upper()
     atg_positions = []
     start         = 0

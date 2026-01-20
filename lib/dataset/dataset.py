@@ -1,7 +1,6 @@
 import json
 import random
 from pathlib          import Path
-from typing           import List, Dict, Optional, Any, Union
 
 import torch
 from torch.utils.data import Dataset, Sampler
@@ -9,39 +8,18 @@ from torch.utils.data import Dataset, Sampler
 from ._noising import GFFNoiser, NoisingConfig
 
 
-################################
-#####  LAZY DATASET        #####
-################################
-
-
 class LazyDataset(Dataset):
-    """
-    Lazy loading dataset that reads samples on-demand.
-    
-    Uses file offsets for random access without loading entire dataset into RAM.
-    Supports optional noising applied per-sample during training.
-    """
     
     def __init__(
         self,
-        data_paths: Union[str, Path, List],
+        data_paths,
         tokenizer,
-        max_input_len:  int = 4096,
-        max_target_len: int = 2048,
-        noiser: Optional[GFFNoiser] = None,
-        hint_token: str = "[HIT]",
+        max_input_len=4096,
+        max_target_len=2048,
+        noiser=None,
+        hint_token="[HIT]",
     ):
-        """
-        Initialize lazy dataset.
-        
-        Args:
-            data_paths: Path(s) to JSONL file(s)
-            tokenizer: Tokenizer instance
-            max_input_len: Maximum input sequence length
-            max_target_len: Maximum target sequence length
-            noiser: Optional GFFNoiser for adding hints (None = no noising)
-            hint_token: Token to mark hint section in input
-        """
+
         self.tokenizer      = tokenizer
         self.max_input_len  = max_input_len
         self.max_target_len = max_target_len
@@ -82,8 +60,8 @@ class LazyDataset(Dataset):
     def __len__(self):
         return len(self.offsets)
     
-    def _load_sample(self, idx: int) -> Dict:
-        """Load raw sample from file."""
+    def _load_sample(self, idx):
+        """Load raw sample from file"""
         path, offset = self.offsets[idx]
         
         with open(path, "r", encoding="utf-8") as f:
@@ -93,19 +71,9 @@ class LazyDataset(Dataset):
         
         return sample
     
-    def _apply_noising(self, sample: Dict) -> str:
-        """
-        Apply noising to create input with hints.
-        
-        The noiser extracts features from the target, adds noise,
-        and formats them as hints in the input.
-        
-        Args:
-            sample: Raw sample dict with 'input' and 'target'
-        
-        Returns:
-            Modified input string with hints
-        """
+    def _apply_noising(self, sample):
+        """Give Hints to Input"""
+
         if self.noiser is None:
             return sample["input"]
         
@@ -135,18 +103,8 @@ class LazyDataset(Dataset):
         else:
             return original_input
     
-    def _parse_features_from_target(self, target: str) -> List[Dict]:
-        """
-        Parse features from target string.
-        
-        Target format: type\tstart\tend\tstrand\tphase\tgene_index\tbiotype
-        
-        Args:
-            target: Target string
-        
-        Returns:
-            List of feature dicts
-        """
+    def _parse_features_from_target(self, target):
+
         features = []
         
         for line in target.strip().split("\n"):
@@ -174,12 +132,8 @@ class LazyDataset(Dataset):
         
         return features
     
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """
-        Get tokenized sample.
-        
-        Applies noising if noiser is configured.
-        """
+    def __getitem__(self, idx):
+
         sample = self._load_sample(idx)
         
         # Apply noising to input
@@ -202,28 +156,18 @@ class LazyDataset(Dataset):
         }
 
 
-################################
-#####  NOISED DATASET      #####
-################################
-
-
 class NoisedDataset(Dataset):
-    """
-    Dataset with built-in noising for hint-based training.
-    
-    Each epoch generates different noise patterns by re-seeding the noiser.
-    Lazy loading ensures memory efficiency.
-    """
+    """DS For SFT"""
     
     def __init__(
         self,
-        data_paths: Union[str, Path, List],
+        data_paths,
         tokenizer,
-        max_input_len:  int = 4096,
-        max_target_len: int = 2048,
-        noising_config: Optional[NoisingConfig] = None,
-        hint_token: str = "[HIT]",
-        seed: int = 42,
+        max_input_len       =4096,
+        max_target_len      =2048,
+        noising_config      =None,
+        hint_token          ="[HIT]",
+        seed=42,
     ):
         """
         Initialize noised dataset.
@@ -252,7 +196,7 @@ class NoisedDataset(Dataset):
         self.seed = seed
         self.epoch = 0
     
-    def set_epoch(self, epoch: int):
+    def set_epoch(self, epoch):
         """
         Set current epoch for noise variation.
         
@@ -268,7 +212,7 @@ class NoisedDataset(Dataset):
     def lengths(self):
         return self._base_dataset.lengths
     
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx):
         # Seed based on epoch and index for reproducibility
         random.seed(self.seed + self.epoch * len(self) + idx)
         return self._base_dataset[idx]
@@ -282,28 +226,18 @@ class NoisedDataset(Dataset):
 class SmartBatchSampler(Sampler):
     """
     Batch sampler that groups similar-length sequences.
-    
     Reduces padding waste by batching sequences of similar lengths together.
     """
     
     def __init__(
         self,
-        lengths: List[int],
-        batch_size: int,
-        bucket_size: int = 100,
-        drop_last: bool = False,
-        shuffle: bool = True
+        lengths,
+        batch_size,
+        bucket_size=100,
+        drop_last=False,
+        shuffle=True
     ):
-        """
-        Initialize smart batch sampler.
-        
-        Args:
-            lengths: List of sequence lengths
-            batch_size: Number of samples per batch
-            bucket_size: Number of samples per bucket for length grouping
-            drop_last: Whether to drop incomplete last batch
-            shuffle: Whether to shuffle batches
-        """
+
         self.lengths        = lengths
         self.batch_size     = batch_size
         self.bucket_size    = bucket_size
@@ -360,25 +294,16 @@ class SmartBatchSampler(Sampler):
 class DynamicPaddingCollator:
     """
     Collator that pads batches dynamically to the longest sequence.
-    
     More efficient than fixed-length padding.
     """
     
-    def __init__(self, pad_token_id: int, label_pad: int = -100):
-        """
-        Initialize collator.
-        
-        Args:
-            pad_token_id: Token ID for padding input
-            label_pad: Value for padding labels (typically -100 for ignore)
-        """
+    def __init__(self, pad_token_id, label_pad=-100):
+
         self.pad_token_id = pad_token_id
         self.label_pad    = label_pad
     
-    def __call__(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
-        """
-        Collate batch with dynamic padding.
-        """
+    def __call__(self, batch):
+
         max_input_len  = max(len(b["input_ids"]) for b in batch)
         max_target_len = max(len(b["labels"]) for b in batch) if batch[0]["labels"].numel() > 0 else 0
         

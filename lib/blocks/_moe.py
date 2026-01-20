@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing      import Optional
 
 import torch
 import torch.nn            as nn
@@ -14,17 +13,17 @@ import triton.language as tl
 
 @dataclass
 class MoEConfig:
-    embed_dim:            int   = 768
-    ff_dim:               int   = 3072
-    num_experts:          int   = 8
-    top_k:                int   = 2
-    dropout:              float = 0.0
-    capacity_factor:      float = 1.25
-    eval_capacity_factor: float = 2.0
-    aux_loss_weight:      float = 0.01
-    load_balance_weight:  float = 0.01
-    router_z_loss_weight: float = 0.001
-    activation:           str   = 'silu'
+    embed_dim            = 768
+    ff_dim               = 3072
+    num_experts          = 8
+    top_k                = 2
+    dropout              = 0.0
+    capacity_factor      = 1.25
+    eval_capacity_factor = 2.0
+    aux_loss_weight      = 0.01
+    load_balance_weight  = 0.01
+    router_z_loss_weight = 0.001
+    activation           = 'silu'
 
 
 @triton.jit
@@ -73,13 +72,13 @@ def expert_gather_kernel(
 class Router(nn.Module):
     """Top-K router for expert selection."""
     
-    def __init__(self, embed_dim: int, num_experts: int, top_k: int = 2):
+    def __init__(self, embed_dim, num_experts, top_k=2):
         super().__init__()
         self.num_experts = num_experts
         self.top_k       = top_k
         self.gate        = nn.Linear(embed_dim, num_experts, bias=False)
     
-    def forward(self, x: torch.Tensor):
+    def forward(self, x):
         logits           = self.gate(x)
         probs            = F.softmax(logits, dim=-1)
         weights, indices = torch.topk(probs, self.top_k, dim=-1)
@@ -90,14 +89,14 @@ class Router(nn.Module):
 class GeGLUExpert(nn.Module):
     """Single expert with Gated Linear Unit activation."""
     
-    def __init__(self, embed_dim: int, ff_dim: int, dropout: float = 0.0):
+    def __init__(self, embed_dim, ff_dim, dropout=0.0):
         super().__init__()
         self.wi_gate = nn.Linear(embed_dim, ff_dim, bias=False)
         self.wi_up   = nn.Linear(embed_dim, ff_dim, bias=False)
         self.wo      = nn.Linear(ff_dim, embed_dim, bias=False)
         self.dropout = nn.Dropout(dropout)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         gate   = F.silu(self.wi_gate(x))
         up     = self.wi_up(x)
         hidden = self.dropout(gate * up)
@@ -107,7 +106,7 @@ class GeGLUExpert(nn.Module):
 class MoE(nn.Module):
     """Mixture of Experts layer optimized for single GPU."""
     
-    def __init__(self, config: MoEConfig):
+    def __init__(self, config):
         super().__init__()
         
         self.config               = config
@@ -126,7 +125,7 @@ class MoE(nn.Module):
         ])
         self.dropout = nn.Dropout(config.dropout)
     
-    def forward(self, x: torch.Tensor):
+    def forward(self, x):
         batch_size, seq_len, embed_dim = x.shape
         num_tokens                     = batch_size * seq_len
         x_flat                         = x.view(num_tokens, embed_dim)
@@ -142,7 +141,7 @@ class MoE(nn.Module):
         
         return output, aux_loss
     
-    def _forward_experts(self, x_flat: torch.Tensor, top_k_indices: torch.Tensor, top_k_probs: torch.Tensor) -> torch.Tensor:
+    def _forward_experts(self, x_flat, top_k_indices, top_k_probs):
         """Route tokens through experts and combine outputs."""
         num_tokens, embed_dim = x_flat.shape
         output                = torch.zeros_like(x_flat)
@@ -173,7 +172,7 @@ class MoE(nn.Module):
         
         return output
     
-    def _compute_aux_loss(self, router_logits: torch.Tensor, router_probs: torch.Tensor, top_k_indices: torch.Tensor) -> torch.Tensor:
+    def _compute_aux_loss(self, router_logits, router_probs, top_k_indices):
         """Compute auxiliary losses for load balancing."""
         num_tokens  = router_logits.shape[0]
         expert_mask = F.one_hot(top_k_indices, self.num_experts).float().sum(dim=1)
@@ -185,7 +184,7 @@ class MoE(nn.Module):
         
         return self.load_balance_weight * load_balance_loss + self.router_z_weight * z_loss
     
-    def get_expert_utilization(self, x: torch.Tensor) -> dict:
+    def get_expert_utilization(self, x):
         """Debug helper: get expert utilization statistics."""
         with torch.no_grad():
             batch_size, seq_len, embed_dim = x.shape
