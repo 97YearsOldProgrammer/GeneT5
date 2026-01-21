@@ -44,6 +44,7 @@ TYPE_TOKENS = [
 
 # Task Specific Tokens
 TASK_TOKENS = [
+    "[GFD]"             # Find Gene Region
     "[ATT]",            # Annotation
     "[HIT]",            # Hints
 ]
