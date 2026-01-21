@@ -77,6 +77,12 @@ python3 bin/resize_model.py model_path tokenizer_path
 
 ### Tuning
 
-```python3
+To Tune on distributed device: Run the following Sh script
 
+```sh
+# Node 0
+MASTER_ADDR=192.168.100.10 NNODES=2 NODE_RANK=0 ./bin/launch_distributed.sh
+
+# Node 1  
+MASTER_ADDR=192.168.100.10 NNODES=2 NODE_RANK=1 ./bin/launch_distributed.sh
 ```
