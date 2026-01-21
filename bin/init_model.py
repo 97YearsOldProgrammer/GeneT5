@@ -35,6 +35,20 @@ parser.add_argument("--num_experts", type=int, default=8,
     help="Number of experts for MoE (default: 8).")
 parser.add_argument("--moe_top_k", type=int, default=2,
     help="Top-K routing for MoE (default: 2).")
+
+# Initialization Parameters (DeepSeek-style)
+parser.add_argument("--init_std", type=float, default=0.02,
+    help="Default standard deviation for random parameter initialization. "
+         "DeepSeek uses 0.006, standard transformer uses 0.02.")
+parser.add_argument("--init_embed_std", type=float, default=None,
+    help="Std for embedding layers (defaults to --init_std).")
+parser.add_argument("--init_ffn_std", type=float, default=None,
+    help="Std for FFN layers (defaults to --init_std).")
+parser.add_argument("--init_attn_std", type=float, default=None,
+    help="Std for attention layers (defaults to --init_std).")
+parser.add_argument("--init_moe_router_std", type=float, default=None,
+    help="Std for MoE router (defaults to --init_std).")
+
 args = parser.parse_args()
 
 
@@ -60,7 +74,12 @@ saved_path = build_gt5(
     decoder_moe_top_k   = args.moe_top_k,
     vocab_size          = args.vocab_size,
     tie_weights         = args.tie_weights,
-    new_tokens_list     = new_tokens_list if new_tokens_list else None
+    new_tokens_list     = new_tokens_list if new_tokens_list else None,
+    init_std            = args.init_std,
+    init_embed_std      = args.init_embed_std,
+    init_ffn_std        = args.init_ffn_std,
+    init_attn_std       = args.init_attn_std,
+    init_moe_router_std = args.init_moe_router_std,
 )
         
 print(f"\nSUCCESS: Model initialized and saved to:")
