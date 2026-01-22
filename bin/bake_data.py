@@ -1,143 +1,200 @@
 import argparse
+import sys
 from pathlib import Path
 
-from lib import dataset
-from lib import tokenizer as tk
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+import lib.dataset   as ds
+import lib.tokenizer as tk
+
+
+def print_run_stats(stats, chunk_stats, validation, output_path):
+    """Print comprehensive run statistics"""
+    print(f"\n{'='*60}")
+    print("Run Statistics")
+    print(f"{'='*60}")
+    
+    print(f"\nChunking:")
+    print(f"  Total chunks:     {chunk_stats['total_chunks']}")
+    print(f"  Backtrack events: {chunk_stats['backtrack_count']}")
+    
+    if chunk_stats["genes_per_chunk"]:
+        avg_genes = sum(chunk_stats["genes_per_chunk"]) / len(chunk_stats["genes_per_chunk"])
+        print(f"  Avg genes/chunk:  {avg_genes:.2f}")
+    
+    if chunk_stats["chunk_sizes"]:
+        avg_size = sum(chunk_stats["chunk_sizes"]) / len(chunk_stats["chunk_sizes"])
+        print(f"  Avg chunk size:   {avg_size/1000:.1f} kb")
+    
+    print(f"\nData Augmentation:")
+    print(f"  Raw chunks:       {stats['raw_count']}")
+    print(f"  Augmented chunks: {stats['aug_count']}")
+    print(f"  Total samples:    {stats['total_samples']}")
+    
+    print(f"\nOutput:")
+    print(f"  Binary file:      {output_path}")
+    print(f"  File size:        {stats.get('file_size', 0) / 1024:.1f} KB")
+    
+    if validation:
+        ds.print_validation_stats(validation)
 
 
 parser = argparse.ArgumentParser(
-    description="Parse GFF3/FASTA for GeneT5 fine-tuning tasks.")
+    description="Parse GFF3/FASTA for GeneT5 with dynamic chunking")
+
 parser.add_argument("fasta",
-    help="Path to FASTA file (can be multi-chromosome).")
+    help="Path to FASTA file")
 parser.add_argument("gff",
-    help="Path to GFF3 annotation file.")
+    help="Path to GFF3 annotation file")
 parser.add_argument("output_dir",
-    help="Output directory for processed datasets.")
+    help="Output directory")
+
+parser.add_argument("--limit", type=int, default=25000,
+    help="Window size limit in bp (default: 25000)")
+parser.add_argument("--overlap", type=int, default=5000,
+    help="Overlap in bp (default: 5000)")
+parser.add_argument("--anchor_pad", type=int, default=5000,
+    help="Padding before first gene (default: 5000)")
+
+parser.add_argument("--hint_ratio", type=float, default=0.5,
+    help="Ratio of samples with hints (default: 0.5)")
+parser.add_argument("--seed", type=int, default=42,
+    help="Random seed")
+
 parser.add_argument("--extract_tokens", type=str, default=None,
-    help="Path to txt file to append extracted types/biotypes as tokens.")
-parser.add_argument("--window_size", type=int, default=None,
-    help="Window size for sliding window (None for transcript-level).")
-parser.add_argument("--stride", type=int, default=None,
-    help="Stride for sliding window (default: window_size // 2).")
-parser.add_argument("--gene_token", default="[ATT]",
-    help="Special token for gene prediction task.")
-parser.add_argument("--bos_token", default="<BOS>",
-    help="Beginning of sequence token.")
-parser.add_argument("--eos_token", default="<EOS>",
-    help="End of sequence token.")
-parser.add_argument("--gene_context_pad", type=int, default=0,
-    help="Context padding around gene features (bp).")
-parser.add_argument("--max_gff_lines", type=int, default=1000,
-    help="Maximum GFF lines per sample before chunking (~2000 tokens).")
-parser.add_argument("--overlap_bp", type=int, default=500,
-    help="Overlap in bp for sequence chunking to avoid splitting genes.")
-parser.add_argument("--overlap_lines", type=int, default=30,
-    help="Overlap in GFF lines for annotation chunking.")
+    help="Path to txt file for extracted tokens")
+
+parser.add_argument("--validation_file", type=str, default=None,
+    help="Path to existing validation file to extend")
+parser.add_argument("--long_threshold", type=int, default=50000,
+    help="Threshold for long genes (default: 50000)")
+parser.add_argument("--top_k_complex", type=int, default=5,
+    help="Number of complex loci for validation (default: 5)")
+parser.add_argument("--num_rare", type=int, default=10,
+    help="Number of rare samples for validation (default: 10)")
+parser.add_argument("--num_easy", type=int, default=10,
+    help="Number of easy samples for validation (default: 10)")
+
+parser.add_argument("--compress", action="store_true", default=True,
+    help="Compress binary output")
+parser.add_argument("--no_compress", action="store_false", dest="compress",
+    help="Disable compression")
+
 args = parser.parse_args()
 
 
-# parse input files
-print(f"\n{' GFF3/FASTA Parsing ':=^60}")
-print("Parsing FASTA...")
-sequences = dataset.parse_fasta(args.fasta)
+print(f"\n{' GFF3/FASTA Processing ':=^60}")
+
+print("\nParsing FASTA...")
+sequences = ds.parse_fasta(args.fasta)
 print(f"  Found {len(sequences)} sequence(s): {list(sequences.keys())[:5]}...")
 
-print("Parsing GFF3...")
-features          = dataset.parse_gff(args.gff)
-features_by_seqid = dataset.group_features_by_seqid(features)
-print(f"  Found {len(features)} features across {len(features_by_seqid)} seqid(s)")
+print("\nParsing GFF3...")
+features = ds.parse_gff(args.gff)
+print(f"  Found {len(features)} features")
 
-# count feature types
 type_counts = {}
 for feat in features:
-    ftype = feat["type"]
+    ftype             = feat["type"]
     type_counts[ftype] = type_counts.get(ftype, 0) + 1
 print(f"  Feature types: {dict(sorted(type_counts.items(), key=lambda x: -x[1])[:10])}")
 
+print("\nBuilding gene index...")
+gene_index = ds.build_gene_index(features)
+print(f"  Found {len(gene_index)} genes")
 
-# extract tokens if requested
 if args.extract_tokens:
     print(f"\n{' Token Extraction ':=^60}")
     
-    feature_types = dataset.extract_feature_types(features)
-    biotypes      = dataset.extract_biotypes(features)
+    feature_types = ds.extract_feature_types(features)
+    biotypes      = ds.extract_biotypes(features)
+    all_types     = feature_types | biotypes
     
-    all_types = feature_types | biotypes
+    print(f"  Feature types: {sorted(feature_types)}")
+    print(f"  Biotypes:      {sorted(biotypes)}")
     
-    print(f"  Feature types found: {sorted(feature_types)}")
-    print(f"  Biotypes found:      {sorted(biotypes)}")
-    print(f"  Total unique:        {len(all_types)}")
-    
-    # append to txt file
     added = tk.append_tokens_to_txt(sorted(all_types), args.extract_tokens)
-    
     if added:
         print(f"  Added {len(added)} new tokens to {args.extract_tokens}")
-        for t in added[:10]:
-            print(f"    + {t}")
-        if len(added) > 10:
-            print(f"    ... and {len(added) - 10} more")
-    else:
-        print(f"  All tokens already in {args.extract_tokens}")
 
+print(f"\n{' Building Validation Set ':=^60}")
+
+validation = ds.build_validation_set(
+    gene_index,
+    args.long_threshold,
+    args.top_k_complex,
+    args.num_rare,
+    args.num_easy,
+    args.seed,
+)
+
+if args.validation_file and Path(args.validation_file).exists():
+    existing   = ds.load_validation_set(args.validation_file)
+    validation = ds.extend_validation_set(existing, validation)
+    print(f"  Extended existing validation set")
+
+print(f"\n{' Dynamic Chunking ':=^60}")
+print(f"  Limit:   {args.limit/1000:.1f} kb")
+print(f"  Overlap: {args.overlap/1000:.1f} kb")
+print(f"  Step:    {(args.limit - args.overlap)/1000:.1f} kb")
+
+train_gene_index = {
+    gid: gdata for gid, gdata in gene_index.items()
+    if gid not in validation["all_ids"]
+}
+
+chunks, chunk_stats = ds.dynamic_chunking(
+    sequences,
+    train_gene_index,
+    args.limit,
+    args.overlap,
+    args.anchor_pad,
+)
+
+print(f"  Created {len(chunks)} raw chunks")
+
+print(f"\n{' Data Augmentation ':=^60}")
+
+all_chunks = ds.augment_with_hints(chunks, args.hint_ratio, args.seed)
+
+raw_count = sum(1 for c in all_chunks if not c.is_augmented)
+aug_count = sum(1 for c in all_chunks if c.is_augmented)
+total     = len(all_chunks)
+
+if total > 0:
+    print(f"  Raw:       {raw_count} ({raw_count/total*100:.1f}%)")
+    print(f"  Augmented: {aug_count} ({aug_count/total*100:.1f}%)")
+else:
+    print("  No chunks created (sequences may be shorter than window size)")
+
+print(f"\n{' Smart Compacting ':=^60}")
+
+efficiency = ds.estimate_compacting_efficiency(all_chunks)
+print(f"  Groups:          {efficiency['num_groups']}")
+print(f"  Avg utilization: {efficiency['avg_utilization']*100:.1f}%")
 
 output_dir = Path(args.output_dir)
 output_dir.mkdir(parents=True, exist_ok=True)
 
+output_path = output_dir / "train_data.gt5b"
+ds.write_binary_dataset(all_chunks, output_path, args.compress)
 
-# gene prediction dataset
-print(f"\n{'=' * 60}")
-print("Creating gene prediction dataset...")
-print(f"  Grouping by parent ID, filtering: {dataset.GENE_FEATURE_TYPES}")
-print(f"  Chunking params: max_gff_lines={args.max_gff_lines}, overlap_lines={args.overlap_lines}")
-if args.window_size:
-    print(f"  Sliding window: size={args.window_size}, stride={args.stride or args.window_size // 2}")
+file_size = output_path.stat().st_size
 
-gene_dataset = dataset.create_gene_prediction_dataset_with_chunking(
-    sequences,
-    features_by_seqid,
-    args.window_size,
-    args.stride,
-    args.gene_token,
-    args.bos_token,
-    args.eos_token,
-    args.gene_context_pad,
-    args.max_gff_lines,
-    args.overlap_bp,
-    args.overlap_lines,
-)
+val_output = output_dir / "validation_set.json"
+ds.save_validation_set(validation, val_output)
 
-dataset.save_dataset(gene_dataset, output_dir / "gene_prediction.jsonl")
+run_stats = {
+    "raw_count":     raw_count,
+    "aug_count":     aug_count,
+    "total_samples": len(all_chunks),
+    "file_size":     file_size,
+}
 
-# show sample and stats
-if gene_dataset:
-    sample = gene_dataset[0]
-    print(f"\n  Sample entry:")
-    print(f"    parent_id:   {sample.get('parent_id', 'N/A')}")
-    print(f"    seqid:       {sample['seqid']}")
-    print(f"    span:        {sample['start']}-{sample['end']}")
-    print(f"    gene_index:  {sample.get('gene_index', 'N/A')}")
-    print(f"    biotype:     {sample.get('biotype', 'N/A')}")
-    print(f"    input len:   {len(sample['input'])} chars")
-    print(f"    target preview:\n{sample['target'][:400]}...")
-    
-    # biotype distribution
-    biotype_dist = {}
-    for s in gene_dataset:
-        bt = s.get("biotype", "unknown")
-        biotype_dist[bt] = biotype_dist.get(bt, 0) + 1
-    print(f"\n  Biotype distribution: {biotype_dist}")
-    
-    chunked_count = sum(1 for s in gene_dataset if s.get('is_chunked', False))
-    if chunked_count > 0:
-        print(f"\n  Chunking stats:")
-        print(f"    Chunked samples:  {chunked_count}")
-        print(f"    Original samples: {len(gene_dataset) - chunked_count}")
+print_run_stats(run_stats, chunk_stats, validation, output_path)
 
-
-print(f"\n{'=' * 60}")
+print(f"\n{'='*60}")
 print("Done!")
-print(f"  Gene prediction: {len(gene_dataset)} samples")
-print(f"  Output directory: {output_dir}")
-if args.extract_tokens:
-    print(f"  Tokens file: {args.extract_tokens}")
+print(f"  Training data:   {output_path}")
+print(f"  Validation set:  {val_output}")
+print(f"{'='*60}")

@@ -1,1 +1,113 @@
-from . import dataset
+from ._parser import (
+    anti,
+    get_filepointer,
+    parse_fasta,
+    parse_gff,
+    group_features_by_seqid,
+    group_features_by_parent,
+    build_gene_index,
+    extract_feature_types,
+    extract_biotypes,
+    format_target_annotation,
+    save_dataset,
+    load_dataset,
+    GENE_FEATURE_TYPES,
+)
+
+from ._compacting import (
+    BinaryChunk,
+    dynamic_chunking,
+    generate_hints_from_features,
+    augment_with_hints,
+    smart_compacting,
+    write_binary_dataset,
+    read_binary_dataset,
+    get_chunk_at_index,
+    get_dataset_info,
+    estimate_compacting_efficiency,
+    check_cut_inside_gene,
+    find_genes_in_range,
+)
+
+from ._validation import (
+    calculate_locus_complexity,
+    identify_long_genes,
+    identify_complex_loci,
+    identify_easy_genes,
+    select_rare_samples,
+    generate_validation_hints,
+    build_validation_scenarios,
+    build_validation_set,
+    save_validation_set,
+    load_validation_set,
+    extend_validation_set,
+    print_validation_stats,
+)
+
+from .dataset import (
+    LazyDataset,
+    NoisedDataset,
+    SmartBatchSampler,
+    DistributedSmartBatchSampler,
+    DistributedSamplerWrapper,
+    DynamicPaddingCollator,
+    create_distributed_dataloader,
+    set_dataloader_epoch,
+)
+
+try:
+    from ._noising import (
+        NoisingConfig,
+        GFFNoiser,
+    )
+except ImportError:
+    pass
+
+
+__all__ = [
+    "anti",
+    "get_filepointer",
+    "parse_fasta",
+    "parse_gff",
+    "group_features_by_seqid",
+    "group_features_by_parent",
+    "build_gene_index",
+    "extract_feature_types",
+    "extract_biotypes",
+    "format_target_annotation",
+    "save_dataset",
+    "load_dataset",
+    "GENE_FEATURE_TYPES",
+    "BinaryChunk",
+    "dynamic_chunking",
+    "generate_hints_from_features",
+    "augment_with_hints",
+    "smart_compacting",
+    "write_binary_dataset",
+    "read_binary_dataset",
+    "get_chunk_at_index",
+    "get_dataset_info",
+    "estimate_compacting_efficiency",
+    "check_cut_inside_gene",
+    "find_genes_in_range",
+    "calculate_locus_complexity",
+    "identify_long_genes",
+    "identify_complex_loci",
+    "identify_easy_genes",
+    "select_rare_samples",
+    "generate_validation_hints",
+    "build_validation_scenarios",
+    "build_validation_set",
+    "save_validation_set",
+    "load_validation_set",
+    "extend_validation_set",
+    "print_validation_stats",
+    "LazyDataset",
+    "NoisedDataset",
+    "SmartBatchSampler",
+    "DistributedSmartBatchSampler",
+    "DistributedSamplerWrapper",
+    "DynamicPaddingCollator",
+    "create_distributed_dataloader",
+    "set_dataloader_epoch",
+]
