@@ -239,6 +239,7 @@ class SparseAttention(nn.Module):
         return block_indices
     
     def forward(self, hidden_states, attention_mask=None):
+        
         B, L, D = hidden_states.shape
         
         pad_len = (self.block_size - L % self.block_size) % self.block_size
