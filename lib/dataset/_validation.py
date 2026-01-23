@@ -1,61 +1,84 @@
 import json
+import math
 import random
-from pathlib    import Path
+from pathlib     import Path
 from collections import defaultdict
+
+
+########################
+#####  Complexity  #####
+########################
+
+
+def entropy(probs):
+    """Calculate Shannon entropy of probability distribution"""
+    
+    if not probs:
+        return 0.0
+    
+    h = 0.0
+    for p in probs:
+        if p > 0:
+            h -= p * math.log2(p)
+    return h
 
 
 def calculate_locus_complexity(gene_data):
     """
-    Calculate complexity score for a gene locus
+    Calculate complexity score using entropy-based approach
     
-    Factors: AS degree, exon variance, overlaps, span ratio
+    Higher entropy = more alternative splicing complexity
     """
-    transcripts     = gene_data.get("transcripts", {})
-    features        = gene_data.get("features", [])
-    num_transcripts = len(transcripts)
     
-    if num_transcripts == 0:
+    transcripts = gene_data.get("transcripts", {})
+    features    = gene_data.get("features", [])
+    num_trans   = len(transcripts)
+    
+    if num_trans == 0:
         return 0.0
     
-    as_score = num_transcripts * 2.0
+    if num_trans == 1:
+        num_exons = sum(1 for f in features if f.get("type", "").lower() == "exon")
+        return num_exons * 0.1
     
-    exon_counts = []
+    weights = []
+    total   = 0.0
+    
     for t_id, t_data in transcripts.items():
         t_features = t_data.get("features", [])
         exon_count = sum(1 for f in t_features if f.get("type", "").lower() == "exon")
-        exon_counts.append(exon_count)
+        cds_count  = sum(1 for f in t_features if f.get("type", "").lower() == "cds")
+        
+        score = 1.0 + exon_count * 0.5 + cds_count * 0.3
+        w     = 2 ** score
+        weights.append(w)
+        total += w
     
-    exon_variance = 0.0
-    if len(exon_counts) > 1:
-        mean_exons    = sum(exon_counts) / len(exon_counts)
-        exon_variance = sum((x - mean_exons) ** 2 for x in exon_counts) / len(exon_counts)
+    if total == 0:
+        return float(num_trans)
     
-    overlap_score   = 0.0
-    sorted_features = sorted(features, key=lambda x: x.get("start", 0))
-    for i in range(len(sorted_features) - 1):
-        curr_end   = sorted_features[i].get("end", 0)
-        next_start = sorted_features[i + 1].get("start", 0)
-        if curr_end >= next_start:
-            overlap_score += 1.0
+    probs      = [w / total for w in weights]
+    h          = entropy(probs)
+    complexity = h * num_trans
     
     gene_start = gene_data.get("start", 0)
     gene_end   = gene_data.get("end", 0)
     gene_span  = gene_end - gene_start + 1
     
-    coding_len = sum(
-        f.get("end", 0) - f.get("start", 0) + 1
-        for f in features
-        if f.get("type", "").lower() in {"exon", "cds"}
-    )
-    
-    span_ratio = (gene_span / max(coding_len, 1)) if coding_len > 0 else 1.0
-    complexity = as_score + exon_variance * 0.5 + overlap_score * 1.5 + span_ratio * 0.1
+    if gene_span > 50000:
+        complexity *= 1.5
     
     return complexity
 
 
+##############################
+#####  Gene Identifiers  #####
+##############################
+
+
 def identify_long_genes(gene_groups, threshold_bp=50000):
     """Identify genes longer than threshold"""
+    
     long_genes = []
     
     for gene_id, gene_data in gene_groups.items():
@@ -70,7 +93,8 @@ def identify_long_genes(gene_groups, threshold_bp=50000):
 
 
 def identify_complex_loci(gene_groups, top_k=5):
-    """Identify top-K most complex loci based on complexity score"""
+    """Identify top-K most complex loci based on entropy complexity score"""
+    
     scored = []
     
     for gene_id, gene_data in gene_groups.items():
@@ -88,6 +112,7 @@ def identify_easy_genes(gene_groups, num_samples=10, seed=42):
     
     Easy genes: single transcript, few exons, short span
     """
+    
     random.seed(seed)
     
     easy_candidates = []
@@ -117,6 +142,7 @@ def identify_easy_genes(gene_groups, num_samples=10, seed=42):
 
 def select_rare_samples(gene_groups, exclude_ids, num_samples=10, seed=42):
     """Randomly select rare samples excluding specified gene IDs"""
+    
     random.seed(seed)
     
     candidates = {
@@ -158,6 +184,11 @@ def select_rare_samples(gene_groups, exclude_ids, num_samples=10, seed=42):
     return [(gid, gdata) for gid, gdata, _ in selected]
 
 
+##############################
+#####  Hint Generation   #####
+##############################
+
+
 def generate_validation_hints(features, scenario="mixed", seed=None):
     """
     Generate noised hints for validation scenarios
@@ -169,6 +200,7 @@ def generate_validation_hints(features, scenario="mixed", seed=None):
         mixed    - random mix of good and bad
         empty    - no hints at all
     """
+    
     if seed is not None:
         random.seed(seed)
     
@@ -223,17 +255,22 @@ def generate_validation_hints(features, scenario="mixed", seed=None):
     return hints, scenario
 
 
+################################
+#####  Validation Builder  #####
+################################
+
+
 def build_validation_scenarios(gene_id, gene_data, seed=42):
     """
     Build multiple validation scenarios for a single gene
     
     Returns list of scenarios with different hint qualities
     """
+    
     random.seed(seed)
     
-    features  = gene_data.get("features", [])
-    scenarios = []
-    
+    features       = gene_data.get("features", [])
+    scenarios      = []
     scenario_types = ["perfect", "good", "bad", "empty"]
     
     for stype in scenario_types:
@@ -270,6 +307,7 @@ def build_validation_set(
     Includes: long genes, complex loci, rare samples, easy samples
     Each with multiple noise scenarios
     """
+    
     validation = {
         "long_genes":   [],
         "complex_loci": [],
@@ -345,8 +383,14 @@ def build_validation_set(
     return validation
 
 
+#################
+#####  I/O  #####
+#################
+
+
 def save_validation_set(validation, output_path):
     """Save validation set to JSON file"""
+    
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -375,6 +419,7 @@ def save_validation_set(validation, output_path):
 
 def load_validation_set(input_path):
     """Load existing validation set from JSON file"""
+    
     with open(input_path, 'r') as f:
         data = json.load(f)
     
@@ -385,6 +430,7 @@ def load_validation_set(input_path):
 
 def extend_validation_set(existing, new_validation):
     """Extend existing validation set with new entries"""
+    
     for category in ["long_genes", "complex_loci", "rare_samples", "easy_samples"]:
         existing_ids = {item["gene_id"] for item in existing.get(category, [])}
         for item in new_validation.get(category, []):
@@ -401,6 +447,7 @@ def extend_validation_set(existing, new_validation):
 
 def print_validation_stats(validation):
     """Print validation set statistics"""
+    
     print(f"\n{'='*60}")
     print("Validation Set Statistics")
     print(f"{'='*60}")
@@ -417,7 +464,7 @@ def print_validation_stats(validation):
             print(f"    {item['gene_id']}: {item['length']:,} bp")
     
     if validation["complex_loci"]:
-        print(f"\n  Most complex loci:")
+        print(f"\n  Most complex loci (entropy-based):")
         for item in validation["complex_loci"][:5]:
             print(f"    {item['gene_id']}: complexity={item['complexity']:.2f}")
     

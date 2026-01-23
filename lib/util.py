@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import lib.dataset as ds
+
 
 #######################
 #####  Bake Data  #####
@@ -9,6 +11,7 @@ from pathlib import Path
 
 def print_run_stats(stats, chunk_stats, validation, output_path):
     """Print comprehensive run statistics"""
+    
     print(f"\n{'='*60}")
     print("Run Statistics")
     print(f"{'='*60}")
