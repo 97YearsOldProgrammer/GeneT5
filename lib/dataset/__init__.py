@@ -56,10 +56,9 @@ from .dataset import (
 )
 
 try:
-    from ._noising import (
-        NoisingConfig,
-        GFFNoiser,
-    )
+    import lib.nosing.nosing as ns
+    NoisingConfig = ns.NoisingConfig
+    GFFNoiser     = ns.GFFNoiser
 except ImportError:
     pass
 

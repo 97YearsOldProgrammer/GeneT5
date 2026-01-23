@@ -2,7 +2,7 @@ import json
 import random
 from pathlib import Path
 
-from ._noising import GFFNoiser, NoisingConfig
+import lib.nosing.nosing as ns
 
 
 class LazyDataset:
@@ -54,6 +54,7 @@ class LazyDataset:
     
     def _load_sample(self, idx):
         """Load raw sample from file"""
+        
         path, offset = self.offsets[idx]
         
         with open(path, "r", encoding="utf-8") as f:
@@ -97,8 +98,8 @@ class NoisedDataset:
         hint_token     = "[HIT]",
         seed           = 42,
     ):
-        config = noising_config or NoisingConfig()
-        noiser = GFFNoiser(config)
+        config = noising_config or ns.NoisingConfig()
+        noiser = ns.GFFNoiser(config)
         
         self._base_dataset = LazyDataset(
             data_paths,
@@ -114,6 +115,7 @@ class NoisedDataset:
     
     def set_epoch(self, epoch):
         """Set current epoch for noise variation"""
+        
         self.epoch = epoch
         random.seed(self.seed + epoch)
     
@@ -216,6 +218,7 @@ class DistributedSmartBatchSampler:
     
     def set_epoch(self, epoch):
         """Set epoch for deterministic shuffling"""
+        
         self.epoch = epoch
     
     def __iter__(self):
@@ -372,6 +375,7 @@ def create_distributed_dataloader(
 
 def set_dataloader_epoch(dataloader, epoch):
     """Set epoch on dataloader's sampler for proper shuffling"""
+    
     if hasattr(dataloader, 'batch_sampler'):
         sampler = dataloader.get('batch_sampler')
     elif hasattr(dataloader, 'sampler'):
