@@ -35,8 +35,6 @@ parser.add_argument("--num_experts", type=int, default=8,
     help="Number of experts for MoE (default: 8).")
 parser.add_argument("--moe_top_k", type=int, default=2,
     help="Top-K routing for MoE (default: 2).")
-
-# Initialization Parameters (DeepSeek-style)
 parser.add_argument("--init_std", type=float, default=0.02,
     help="Default standard deviation for random parameter initialization. "
          "DeepSeek uses 0.006, standard transformer uses 0.02.")
@@ -46,9 +44,8 @@ parser.add_argument("--init_ffn_std", type=float, default=None,
     help="Std for FFN layers (defaults to --init_std).")
 parser.add_argument("--init_attn_std", type=float, default=None,
     help="Std for attention layers (defaults to --init_std).")
-parser.add_argument("--init_moe_router_std", type=float, default=None,
+parser.add_argument("--init_moe_router_std", type=float, default=0.006,
     help="Std for MoE router (defaults to --init_std).")
-
 args = parser.parse_args()
 
 

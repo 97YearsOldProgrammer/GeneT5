@@ -9,29 +9,24 @@ import lib.tokenizer as tk
 
 parser = argparse.ArgumentParser(
     description="Parse GFF3/FASTA for GeneT5 with dynamic chunking")
-
 parser.add_argument("fasta",
     help="Path to FASTA file")
 parser.add_argument("gff",
     help="Path to GFF3 annotation file")
 parser.add_argument("output_dir",
     help="Output directory")
-
 parser.add_argument("--limit", type=int, default=25000,
     help="Window size limit in bp (default: 25000)")
-parser.add_argument("--overlap", type=int, default=5000,
-    help="Overlap in bp (default: 5000)")
-parser.add_argument("--anchor_pad", type=int, default=5000,
-    help="Padding before first gene (default: 5000)")
-
+parser.add_argument("--overlap_ratio", type=float, default=1/2.718281828,
+    help="Overlap ratio relative to window size (default: 1/e ≈ 0.368)")
+parser.add_argument("--anchor_pad_ratio", type=float, default=1/2.718281828,
+    help="Padding ratio relative to window size for first gene (default: 1/e ≈ 0.368)")
 parser.add_argument("--hint_ratio", type=float, default=0.5,
     help="Ratio of samples with hints (default: 0.5)")
 parser.add_argument("--seed", type=int, default=42,
     help="Random seed")
-
 parser.add_argument("--extract_tokens", type=str, default=None,
     help="Path to txt file for extracted tokens")
-
 parser.add_argument("--validation_file", type=str, default=None,
     help="Path to existing validation file to extend")
 parser.add_argument("--long_threshold", type=int, default=50000,
@@ -42,12 +37,10 @@ parser.add_argument("--num_rare", type=int, default=10,
     help="Number of rare samples for validation (default: 10)")
 parser.add_argument("--num_easy", type=int, default=10,
     help="Number of easy samples for validation (default: 10)")
-
 parser.add_argument("--compress", action="store_true", default=True,
     help="Compress binary output")
 parser.add_argument("--no_compress", action="store_false", dest="compress",
     help="Disable compression")
-
 args = parser.parse_args()
 
 
@@ -95,6 +88,8 @@ validation = ds.build_validation_set(
     args.num_easy,
     args.seed,
 )
+overlap     = int(args.limit * args.overlap_ratio)
+anchor_pad  = int(args.limit * args.anchor_pad_ratio)
 
 if args.validation_file and Path(args.validation_file).exists():
     existing   = ds.load_validation_set(args.validation_file)
@@ -103,8 +98,8 @@ if args.validation_file and Path(args.validation_file).exists():
 
 print(f"\n{' Dynamic Chunking ':=^60}")
 print(f"  Limit:   {args.limit/1000:.1f} kb")
-print(f"  Overlap: {args.overlap/1000:.1f} kb")
-print(f"  Step:    {(args.limit - args.overlap)/1000:.1f} kb")
+print(f"  Overlap: {overlap/1000:.1f} kb ({args.overlap_ratio:.3f})")
+print(f"  Step:    {(args.limit - overlap)/1000:.1f} kb")
 
 train_gene_index = {
     gid: gdata for gid, gdata in gene_index.items()
@@ -115,8 +110,8 @@ chunks, chunk_stats = ds.dynamic_chunking(
     sequences,
     train_gene_index,
     args.limit,
-    args.overlap,
-    args.anchor_pad,
+    overlap,
+    anchor_pad,
 )
 
 print(f"  Created {len(chunks)} raw chunks")
