@@ -6,6 +6,11 @@ import lib.nosing._intron  as intron
 import lib.nosing._protein as protein
 
 
+####################
+#####  Config  #####
+####################
+
+
 @dataclass
 class NoisingConfig:
     """Configuration for GFF noising during training"""
@@ -41,6 +46,11 @@ class NoisingConfig:
 
     degraded_drop_mult:  float = 3.0
     degraded_noise_mult: float = 2.0
+
+
+#######################
+#####  Utilities  #####
+#######################
 
 
 def select_scenario(config):
