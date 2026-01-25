@@ -14,6 +14,8 @@ def main():
         help="Chunk size limit in bp")
     parser.add_argument("--threshold", type=int, default=50000, 
         help="Long gene threshold in bp")
+    parser.add_argument("--top_k_long", type=int, default=5, 
+        help="Top K long genes for validation")
     
     args = parser.parse_args()
 
@@ -46,8 +48,8 @@ def main():
             str(baked_dir),
             "--limit", str(args.limit),
             "--long_threshold", str(args.threshold),
+            "--top_k_long", str(args.top_k_long),
             "--extract_tokens", "data/new_tokens.txt",
-            "--compress"
         ]
 
         print(f"  -> Baking to {baked_dir}...")

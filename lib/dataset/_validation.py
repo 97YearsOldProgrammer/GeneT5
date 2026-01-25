@@ -73,8 +73,18 @@ def calculate_complexity(gene_data):
 #######################
 
 
-def identify_long_genes(gene_groups, threshold_bp=50000):
-    """Identify genes longer than threshold"""
+def identify_long_genes(gene_groups, threshold_bp=50000, top_k=None):
+    """
+    Identify genes longer than threshold.
+    
+    Args:
+        gene_groups: dict of gene_id -> gene_data
+        threshold_bp: minimum length threshold in bp
+        top_k: if provided, return only top K longest genes (default: all)
+    
+    Returns:
+        List of (gene_id, gene_data, length) tuples, sorted by length descending
+    """
 
     long_genes = []
 
@@ -86,7 +96,14 @@ def identify_long_genes(gene_groups, threshold_bp=50000):
         if gene_len > threshold_bp:
             long_genes.append((gene_id, gene_data, gene_len))
 
-    return sorted(long_genes, key=lambda x: -x[2])
+    # Sort by length descending
+    long_genes = sorted(long_genes, key=lambda x: -x[2])
+
+    # Limit to top_k if specified
+    if top_k is not None and top_k > 0:
+        long_genes = long_genes[:top_k]
+
+    return long_genes
 
 
 def identify_complex_loci(gene_groups, top_k=5):
@@ -218,12 +235,24 @@ def build_scenarios(gene_id, gene_data, seed=42):
 def build_validation_set(
     gene_groups,
     long_threshold   = 50000,
+    top_k_long       = 5,
     top_k_complex    = 5,
     num_rare_samples = 10,
     num_easy_samples = 10,
     seed             = 42,
 ):
-    """Build validation set using feature-based selection"""
+    """
+    Build validation set using feature-based selection.
+    
+    Args:
+        gene_groups: dict of gene_id -> gene_data
+        long_threshold: minimum length threshold for long genes
+        top_k_long: number of top longest genes to include
+        top_k_complex: number of top complex genes to include
+        num_rare_samples: number of rare biotype samples
+        num_easy_samples: number of easy gene samples
+        seed: random seed
+    """
 
     validation = {
         "long_genes":   [],
@@ -234,7 +263,8 @@ def build_validation_set(
         "scenarios":    [],
     }
 
-    long_genes = identify_long_genes(gene_groups, long_threshold)
+    # Get top K long genes (filtered by threshold, limited to top_k)
+    long_genes = identify_long_genes(gene_groups, long_threshold, top_k_long)
     for gene_id, gene_data, length in long_genes:
         validation["long_genes"].append({
             "gene_id": gene_id,

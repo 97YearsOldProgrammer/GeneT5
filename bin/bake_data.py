@@ -28,6 +28,8 @@ parser.add_argument('--extract_tokens', required=False, type=str, default=None,
     metavar='<file>', help='extract tokens to file')
 parser.add_argument('--long_threshold', required=False, type=int, default=50000,
     metavar='<int>', help='long gene threshold [%(default)i]')
+parser.add_argument('--top_k_long', required=False, type=int, default=5,
+    metavar='<int>', help='top K long genes for validation [%(default)i]')
 parser.add_argument('--top_k_complex', required=False, type=int, default=5,
     metavar='<int>', help='top K complex genes for validation [%(default)i]')
 parser.add_argument('--num_rare', required=False, type=int, default=5,
@@ -66,6 +68,7 @@ print(f"\n{' Building Validation Set ':=^60}")
 validation = ds.build_validation_set(
     gene_index,
     args.long_threshold,
+    args.top_k_long,
     args.top_k_complex,
     args.num_rare,
     args.num_easy,
