@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import math
 
 from lib.blocks._component import LayerNorm, FeedForward
-from lib.blocks._mlatt     import MLAttention, MLAttentionConfig
+from lib.blocks._spareatt  import SparseAttention, SparseAttentionConfig
 from lib.blocks._gqatt     import GQAttention, GQAttentionConfig
 from lib.blocks._moe       import MoE, MoEConfig
 
@@ -21,17 +21,19 @@ class DecoderBlock(nn.Module):
         embed_dim, 
         num_heads, 
         ff_dim, 
-        dropout          = 0.0, 
-        attn_dropout     = 0.0, 
-        use_alibi        = True,
-        use_moe          = False,
-        num_experts      = 8,
-        moe_top_k        = 2,
-        moe_load_balance = 0.01,
-        moe_router_z     = 0.001,
-        kv_lora_rank     = 64,
-        q_lora_rank      = 128,
-        num_kv_heads     = None,
+        dropout            = 0.0, 
+        attn_dropout       = 0.0, 
+        use_alibi          = True,
+        use_moe            = False,
+        num_experts        = 8,
+        moe_top_k          = 2,
+        moe_load_balance   = 0.01,
+        moe_router_z       = 0.001,
+        num_kv_heads       = None,
+        block_size         = 64,
+        window_size        = 256,
+        num_global_tokens  = 64,
+        num_random_blocks  = 3,
     ):
         super().__init__()
         
@@ -40,17 +42,21 @@ class DecoderBlock(nn.Module):
         if num_kv_heads is None:
             num_kv_heads = max(1, num_heads // 4)
         
-        mla_config = MLAttentionConfig(
-            embed_dim    = embed_dim,
-            num_heads    = num_heads,
-            kv_lora_rank = kv_lora_rank,
-            q_lora_rank  = q_lora_rank,
-            dropout      = attn_dropout,
-            use_alibi    = use_alibi,
+        # Self-attention: SparseAttention (weight-compatible with standard attention)
+        sparse_config = SparseAttentionConfig(
+            embed_dim         = embed_dim,
+            num_heads         = num_heads,
+            block_size        = block_size,
+            window_size       = window_size,
+            num_global_tokens = num_global_tokens,
+            num_random_blocks = num_random_blocks,
+            dropout           = attn_dropout,
+            use_alibi         = use_alibi,
         )
-        self.self_attn = MLAttention(config=mla_config, is_causal=True)
+        self.self_attn = SparseAttention(config=sparse_config, is_causal=True)
         self.norm1     = LayerNorm(embed_dim)
         
+        # Cross-attention: GQAttention
         gqa_config = GQAttentionConfig(
             embed_dim     = embed_dim,
             num_heads     = num_heads,
@@ -62,6 +68,7 @@ class DecoderBlock(nn.Module):
         self.cross_attn = GQAttention(config=gqa_config, is_causal=False)
         self.norm2      = LayerNorm(embed_dim)
         
+        # Feed-forward: MoE or standard
         if use_moe:
             moe_config = MoEConfig(
                 embed_dim            = embed_dim,
@@ -87,14 +94,12 @@ class DecoderBlock(nn.Module):
         encoder_attention_mask = None, 
         position_bias          = None
     ):
+        # Self-attention
         normed = self.norm1(hidden_states)
-        attn_output, position_bias = self.self_attn(
-            normed,
-            attention_mask = attention_mask,
-            position_bias  = position_bias
-        )
-        hidden_states = hidden_states + self.dropout(attn_output)
+        attn_output, _ = self.self_attn(normed, attention_mask)
+        hidden_states  = hidden_states + self.dropout(attn_output)
         
+        # Cross-attention
         normed = self.norm2(hidden_states)
         cross_output, _ = self.cross_attn(
             normed,
@@ -103,16 +108,17 @@ class DecoderBlock(nn.Module):
         )
         hidden_states = hidden_states + self.dropout(cross_output)
         
+        # Feed-forward
         normed = self.norm3(hidden_states)
         
         if self.use_moe:
             ff_output, moe_aux_loss = self.ff(normed)
             hidden_states           = hidden_states + self.dropout(ff_output)
-            return hidden_states, position_bias, moe_aux_loss
+            return hidden_states, None, moe_aux_loss
         else:
             ff_output     = self.ff(normed)
             hidden_states = hidden_states + self.dropout(ff_output)
-            return hidden_states, position_bias, None
+            return hidden_states, None, None
 
 
 class Decoder(nn.Module):
@@ -123,17 +129,19 @@ class Decoder(nn.Module):
         embed_dim, 
         num_heads, 
         ff_dim, 
-        dropout          = 0.0, 
-        attn_dropout     = 0.0,
-        use_alibi        = True,
-        use_moe          = True,
-        num_experts      = 8,
-        moe_top_k        = 2,
-        moe_load_balance = 0.01,
-        moe_router_z     = 0.001,
-        kv_lora_rank     = 64,
-        q_lora_rank      = 128,
-        num_kv_heads     = None,
+        dropout            = 0.0, 
+        attn_dropout       = 0.0,
+        use_alibi          = True,
+        use_moe            = True,
+        num_experts        = 8,
+        moe_top_k          = 2,
+        moe_load_balance   = 0.01,
+        moe_router_z       = 0.001,
+        num_kv_heads       = None,
+        block_size         = 64,
+        window_size        = 256,
+        num_global_tokens  = 64,
+        num_random_blocks  = 3,
     ):
         super().__init__()
         
@@ -145,20 +153,22 @@ class Decoder(nn.Module):
         
         self.layers = nn.ModuleList([
             DecoderBlock(
-                embed_dim        = embed_dim,
-                num_heads        = num_heads,
-                ff_dim           = ff_dim,
-                dropout          = dropout,
-                attn_dropout     = attn_dropout,
-                use_alibi        = use_alibi,
-                use_moe          = use_moe,
-                num_experts      = num_experts,
-                moe_top_k        = moe_top_k,
-                moe_load_balance = moe_load_balance,
-                moe_router_z     = moe_router_z,
-                kv_lora_rank     = kv_lora_rank,
-                q_lora_rank      = q_lora_rank,
-                num_kv_heads     = num_kv_heads,
+                embed_dim          = embed_dim,
+                num_heads          = num_heads,
+                ff_dim             = ff_dim,
+                dropout            = dropout,
+                attn_dropout       = attn_dropout,
+                use_alibi          = use_alibi,
+                use_moe            = use_moe,
+                num_experts        = num_experts,
+                moe_top_k          = moe_top_k,
+                moe_load_balance   = moe_load_balance,
+                moe_router_z       = moe_router_z,
+                num_kv_heads       = num_kv_heads,
+                block_size         = block_size,
+                window_size        = window_size,
+                num_global_tokens  = num_global_tokens,
+                num_random_blocks  = num_random_blocks,
             )
             for _ in range(num_layers)
         ])
@@ -173,24 +183,18 @@ class Decoder(nn.Module):
         attention_mask         = None, 
         encoder_attention_mask = None
     ):
-        position_bias  = None
         total_moe_loss = 0.0 if self.use_moe else None
         
         for layer in self.layers:
-            result = layer(
+            hidden_states, _, moe_aux_loss = layer(
                 hidden_states,
                 encoder_hidden_states  = encoder_hidden_states,
                 attention_mask         = attention_mask,
                 encoder_attention_mask = encoder_attention_mask,
-                position_bias          = position_bias
             )
             
-            if self.use_moe:
-                hidden_states, position_bias, moe_aux_loss = result
-                if moe_aux_loss is not None:
-                    total_moe_loss = total_moe_loss + moe_aux_loss
-            else:
-                hidden_states, position_bias, _ = result
+            if self.use_moe and moe_aux_loss is not None:
+                total_moe_loss = total_moe_loss + moe_aux_loss
         
         hidden_states = self.final_norm(hidden_states)
         hidden_states = self.dropout(hidden_states)
@@ -203,15 +207,21 @@ class Decoder(nn.Module):
         if len(self.layers) == 0:
             return {}
         
-        layer          = self.layers[0]
-        mla_cache_size = layer.self_attn.get_kv_cache_size(batch_size, seq_len)
-        gqa_cache_size = layer.cross_attn.get_kv_cache_size(batch_size, encoder_seq_len)
-        num_layers     = len(self.layers)
+        layer      = self.layers[0]
+        num_layers = len(self.layers)
+        
+        # SparseAttention: standard KV cache
+        num_heads = layer.self_attn.num_heads
+        head_dim  = layer.self_attn.head_dim
+        self_kv   = batch_size * seq_len * num_heads * head_dim * 2 * 2  # K+V, float16
+        
+        # GQAttention: reduced KV cache
+        cross_kv = layer.cross_attn.get_kv_cache_size(batch_size, encoder_seq_len)
         
         return {
-            "mla_per_layer":  mla_cache_size,
-            "gqa_per_layer":  gqa_cache_size,
-            "total_mla":      mla_cache_size * num_layers,
-            "total_gqa":      gqa_cache_size * num_layers,
-            "total_kv_cache": (mla_cache_size + gqa_cache_size) * num_layers,
+            "self_attn_per_layer":  self_kv,
+            "cross_attn_per_layer": cross_kv,
+            "total_self":           self_kv * num_layers,
+            "total_cross":          cross_kv * num_layers,
+            "total_kv_cache":       (self_kv + cross_kv) * num_layers,
         }

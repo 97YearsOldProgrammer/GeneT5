@@ -305,13 +305,13 @@ def build_validation_set(
 #################
 
 
-def save_validation_set(validation, output_path):
+pythondef save_validation_set(validation, output_path):
     """Save validation set to JSON file and print stats to stdout"""
 
     output_path = pathlib.Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Clean data only - no stats in JSON
+    # Data only - no stats in JSON
     save_data = {
         "long_genes":   validation["long_genes"],
         "complex_loci": validation["complex_loci"],
@@ -325,7 +325,7 @@ def save_validation_set(validation, output_path):
         json.dump(save_data, f, indent=2)
 
     # Print stats to stdout
-    print(f"\n  Validation Set Stats:")
+    print(f"\n  Validation Set:")
     print(f"    Long genes:     {len(validation['long_genes'])}")
     print(f"    Complex loci:   {len(validation['complex_loci'])}")
     print(f"    Rare samples:   {len(validation['rare_samples'])}")

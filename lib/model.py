@@ -20,27 +20,33 @@ class GeneT5(nn.Module):
     
     def __init__(
         self,
-        embed_dim          = 768,
-        encoder_num_layers = 12,
-        encoder_num_heads  = 12,
-        encoder_ff_dim     = 3072,
-        decoder_num_layers = 12,
-        decoder_num_heads  = 12,
-        decoder_ff_dim     = 3072,
-        decoder_dropout    = 0.1,
-        decoder_use_alibi  = True,
-        decoder_use_moe    = True,
-        decoder_num_experts= 8,
-        decoder_moe_top_k  = 2,
-        vocab_size         = 4096,
-        tie_weights        = True,
-        block_size         = 64,
-        num_rand_blocks    = 3
+        embed_dim           = 768,
+        encoder_num_layers  = 12,
+        encoder_num_heads   = 12,
+        encoder_ff_dim      = 3072,
+        decoder_num_layers  = 12,
+        decoder_num_heads   = 12,
+        decoder_ff_dim      = 3072,
+        decoder_dropout     = 0.1,
+        decoder_use_alibi   = True,
+        decoder_use_moe     = True,
+        decoder_num_experts = 8,
+        decoder_moe_top_k   = 2,
+        decoder_num_kv_heads= None,
+        vocab_size          = 4096,
+        tie_weights         = True,
+        block_size          = 64,
+        window_size         = 256,
+        num_global_tokens   = 64,
+        num_rand_blocks     = 3,
     ):
         super().__init__()
         
         self.embed_dim  = embed_dim
         self.vocab_size = vocab_size
+        
+        if decoder_num_kv_heads is None:
+            decoder_num_kv_heads = max(1, decoder_num_heads // 4)
         
         # Encoder embedding
         self.encoder_embed         = nn.Embedding(vocab_size, embed_dim)
@@ -57,21 +63,28 @@ class GeneT5(nn.Module):
             use_alibi          = True,
             use_bigbird_sparse = True,
             block_size         = block_size,
-            num_random_blocks  = num_rand_blocks
+            window_size        = window_size,
+            num_global_tokens  = num_global_tokens,
+            num_random_blocks  = num_rand_blocks,
         )
         
         # Decoder
         self.decoder = Decoder(
-            num_layers       = decoder_num_layers,
-            embed_dim        = embed_dim,
-            num_heads        = decoder_num_heads,
-            ff_dim           = decoder_ff_dim,
-            dropout          = decoder_dropout,
-            attn_dropout     = decoder_dropout,
-            use_alibi        = decoder_use_alibi,
-            use_moe          = decoder_use_moe,
-            num_experts      = decoder_num_experts,
-            moe_top_k        = decoder_moe_top_k
+            num_layers        = decoder_num_layers,
+            embed_dim         = embed_dim,
+            num_heads         = decoder_num_heads,
+            ff_dim            = decoder_ff_dim,
+            dropout           = decoder_dropout,
+            attn_dropout      = decoder_dropout,
+            use_alibi         = decoder_use_alibi,
+            use_moe           = decoder_use_moe,
+            num_experts       = decoder_num_experts,
+            moe_top_k         = decoder_moe_top_k,
+            num_kv_heads      = decoder_num_kv_heads,
+            block_size        = block_size,
+            window_size       = window_size,
+            num_global_tokens = num_global_tokens,
+            num_random_blocks = num_rand_blocks,
         )
         
         # Decoder embeddings
@@ -295,7 +308,7 @@ class GeneT5(nn.Module):
     
     @classmethod
     def from_pretrained(cls, checkpoint_dir, device="cpu", dtype=torch.float32):
-        """Load model from build_model.py output in FP32."""
+        """Load model from build_model.py output"""
         path = Path(checkpoint_dir)
         
         with open(path / "config.json", "r") as f:
@@ -314,10 +327,13 @@ class GeneT5(nn.Module):
             decoder_use_moe     = config["decoder_use_moe"],
             decoder_num_experts = config.get("decoder_num_experts", 8),
             decoder_moe_top_k   = config.get("decoder_moe_top_k", 2),
+            decoder_num_kv_heads= config.get("decoder_num_kv_heads"),
             vocab_size          = config["vocab_size"],
             tie_weights         = config["tie_weights"],
             block_size          = config.get("block_size", 64),
-            num_rand_blocks     = config.get("num_rand_blocks", 3)
+            window_size         = config.get("window_size", 256),
+            num_global_tokens   = config.get("num_global_tokens", 64),
+            num_rand_blocks     = config.get("num_rand_blocks", 3),
         )
         
         model.load(path / "pytorch_model.bin")
