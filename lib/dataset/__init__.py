@@ -27,6 +27,9 @@ from ._compacting import (
     estimate_compacting_efficiency,
     check_cut_inside_gene,
     find_genes_in_range,
+    estimate_chunk_input_length,
+    compact_to_target_length,
+    flatten_compacted_groups,
 )
 
 from ._validation import (
@@ -42,9 +45,17 @@ from ._validation import (
     load_validation_set,
     extend_validation_set,
     print_validation_stats,
+    estimate_scenario_input_tokens,
+    compact_validation_scenarios,
+    scenario_to_jsonl_record,
+    write_validation_jsonl,
+    load_validation_jsonl,
+    append_validation_jsonl,
+    get_existing_validation_ids,
 )
 
 from .dataset import (
+    ValidationDataset,
     LazyDataset,
     NoisedDataset,
     SmartBatchSampler,
@@ -89,6 +100,9 @@ __all__ = [
     "estimate_compacting_efficiency",
     "check_cut_inside_gene",
     "find_genes_in_range",
+    "estimate_chunk_input_length",
+    "compact_to_target_length",
+    "flatten_compacted_groups",
     "calculate_locus_complexity",
     "identify_long_genes",
     "identify_complex_loci",
@@ -101,6 +115,14 @@ __all__ = [
     "load_validation_set",
     "extend_validation_set",
     "print_validation_stats",
+    "estimate_scenario_input_tokens",
+    "compact_validation_scenarios",
+    "scenario_to_jsonl_record",
+    "write_validation_jsonl",
+    "load_validation_jsonl",
+    "append_validation_jsonl",
+    "get_existing_validation_ids",
+    "ValidationDataset",
     "LazyDataset",
     "NoisedDataset",
     "SmartBatchSampler",

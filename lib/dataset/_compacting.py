@@ -11,12 +11,7 @@ FORMAT_VERSION = 1
 
 
 class BinaryChunk:
-    """
-    Binary representation of a single training chunk
-    
-    Each chunk is a self-contained unit for cross-attention
-    Once decoder processes this chunk, cross-attention scope is limited to it
-    """
+    """Binary representation of a single training chunk"""
     
     def __init__(
         self,
@@ -48,6 +43,7 @@ class BinaryChunk:
     
     def to_bytes(self):
         """Serialize chunk to bytes"""
+        
         meta = {
             "seqid":        self.seqid,
             "start":        self.start,
@@ -78,6 +74,7 @@ class BinaryChunk:
     @classmethod
     def from_bytes(cls, data):
         """Deserialize chunk from bytes"""
+        
         header_size = struct.calcsize('<4I')
         meta_len, seq_len, feat_len, hints_len = struct.unpack('<4I', data[:header_size])
         
@@ -114,20 +111,27 @@ class BinaryChunk:
     
     def estimate_tokens(self, bp_per_token=4.5):
         """Estimate token count for this chunk"""
+        
         seq_tokens  = len(self.sequence) / bp_per_token
         feat_tokens = len(self.features) * 7
         hint_tokens = len(self.hints) * 5 if self.has_hints else 0
         overhead    = 10
         
         return int(seq_tokens + feat_tokens + hint_tokens + overhead)
+    
+    def estimate_input_tokens(self, bp_per_token=4.5):
+        """Estimate input token count (sequence + hints only)"""
+        
+        seq_tokens  = len(self.sequence) / bp_per_token
+        hint_tokens = len(self.hints) * 5 if self.has_hints else 0
+        overhead    = 5
+        
+        return int(seq_tokens + hint_tokens + overhead)
 
 
 def check_cut_inside_gene(gene_index, seqid, cut_pos):
-    """
-    Check if cut position falls inside a gene body
+    """Check if cut position falls inside a gene body"""
     
-    Returns (is_inside, gene_id) or (False, None)
-    """
     for gene_id, gene_data in gene_index.items():
         if gene_data["seqid"] != seqid:
             continue
@@ -143,6 +147,7 @@ def check_cut_inside_gene(gene_index, seqid, cut_pos):
 
 def find_genes_in_range(gene_index, seqid, start, end):
     """Find all genes overlapping a genomic range"""
+    
     genes = []
     
     for gene_id, gene_data in gene_index.items():
@@ -165,17 +170,8 @@ def dynamic_chunking(
     overlap_bp = 5000,
     anchor_pad = 5000,
 ):
-    """
-    Gene-centric sliding window chunking
+    """Gene-centric sliding window chunking"""
     
-    Each chunk is a self-contained cross-attention unit
-    Decoder only attends to encoder outputs within the same chunk
-    
-    Strategy:
-        1 Anchor at first gene start - anchor_pad
-        2 Window size = limit_bp, step = limit_bp - overlap_bp
-        3 Backtrack if cut falls inside gene
-    """
     chunks    = []
     step_size = limit_bp - overlap_bp
     
@@ -289,11 +285,8 @@ def dynamic_chunking(
 
 
 def generate_hints_from_features(features, noise_rate=0.1):
-    """
-    Generate noised hints from features (simulating extrinsic evidence)
+    """Generate noised hints from features (simulating extrinsic evidence)"""
     
-    Applies: boundary jitter, random drops, fake additions
-    """
     hints = []
     
     for feat in features:
@@ -327,11 +320,8 @@ def generate_hints_from_features(features, noise_rate=0.1):
 
 
 def augment_with_hints(chunks, hint_ratio=0.5, seed=42):
-    """
-    Create augmented copies with hints
+    """Create augmented copies with hints"""
     
-    Returns combined list: original + augmented
-    """
     random.seed(seed)
     
     num_to_augment = int(len(chunks) * hint_ratio)
@@ -364,17 +354,8 @@ def augment_with_hints(chunks, hint_ratio=0.5, seed=42):
 
 
 def smart_compacting(chunks, max_tokens=10000, bp_per_token=4.5):
-    """
-    Pack chunks efficiently into compacted groups
+    """Pack chunks efficiently into compacted groups"""
     
-    IMPORTANT: Each chunk remains a single cross-attention unit
-    Compacting is for storage efficiency, not for merging attention scope
-    
-    Strategy:
-        Sort by estimated token count
-        Greedy bin packing: pair large with small
-        Separate raw and augmented data
-    """
     raw_chunks = [c for c in chunks if not c.is_augmented]
     aug_chunks = [c for c in chunks if c.is_augmented]
     
@@ -417,8 +398,134 @@ def smart_compacting(chunks, max_tokens=10000, bp_per_token=4.5):
     return compacted
 
 
+#####################################################
+#####  Input-Length Based Compacting Workflow   #####
+#####################################################
+
+
+def estimate_chunk_input_length(chunk, bp_per_token=4.5):
+    """Estimate input length in tokens for a single chunk"""
+    
+    seq_tokens  = len(chunk.sequence) / bp_per_token
+    hint_tokens = len(chunk.hints) * 5 if chunk.has_hints else 0
+    overhead    = 5
+    
+    return int(seq_tokens + hint_tokens + overhead)
+
+
+def compact_to_target_length(
+    chunks,
+    target_length,
+    hard_limit    = None,
+    bp_per_token  = 4.5,
+    seed          = 42,
+):
+    """
+    Compact chunks to converge toward target input length with minimal padding
+    
+    Uses first-fit-decreasing bin packing to maximize utilization
+    """
+    
+    random.seed(seed)
+    
+    hard_limit = hard_limit or int(target_length * 1.1)
+    
+    raw_chunks = [c for c in chunks if not c.is_augmented]
+    aug_chunks = [c for c in chunks if c.is_augmented]
+    
+    all_compacted = []
+    compact_stats = {
+        "total_groups":     0,
+        "total_input_toks": 0,
+        "utilizations":     [],
+        "overflow_count":   0,
+        "singleton_count":  0,
+    }
+    
+    for chunk_list in [raw_chunks, aug_chunks]:
+        if not chunk_list:
+            continue
+        
+        with_lengths = [
+            (c, estimate_chunk_input_length(c, bp_per_token))
+            for c in chunk_list
+        ]
+        with_lengths.sort(key=lambda x: -x[1])
+        
+        bins       = []
+        bin_totals = []
+        
+        for chunk, length in with_lengths:
+            if length > hard_limit:
+                bins.append([chunk])
+                bin_totals.append(length)
+                compact_stats["overflow_count"] += 1
+                continue
+            
+            best_bin   = -1
+            best_space = hard_limit + 1
+            
+            for i, total in enumerate(bin_totals):
+                remaining = target_length - total
+                if remaining >= length and remaining < best_space:
+                    best_bin   = i
+                    best_space = remaining
+            
+            if best_bin == -1:
+                for i, total in enumerate(bin_totals):
+                    remaining = hard_limit - total
+                    if remaining >= length and remaining < best_space:
+                        best_bin   = i
+                        best_space = remaining
+            
+            if best_bin >= 0:
+                bins[best_bin].append(chunk)
+                bin_totals[best_bin] += length
+            else:
+                bins.append([chunk])
+                bin_totals.append(length)
+        
+        for i, group in enumerate(bins):
+            all_compacted.append(group)
+            
+            total_len   = bin_totals[i]
+            utilization = total_len / target_length if target_length > 0 else 0
+            
+            compact_stats["total_groups"]     += 1
+            compact_stats["total_input_toks"] += total_len
+            compact_stats["utilizations"].append(utilization)
+            
+            if len(group) == 1:
+                compact_stats["singleton_count"] += 1
+    
+    if compact_stats["utilizations"]:
+        compact_stats["avg_utilization"] = sum(compact_stats["utilizations"]) / len(compact_stats["utilizations"])
+        compact_stats["min_utilization"] = min(compact_stats["utilizations"])
+        compact_stats["max_utilization"] = max(compact_stats["utilizations"])
+    else:
+        compact_stats["avg_utilization"] = 0
+        compact_stats["min_utilization"] = 0
+        compact_stats["max_utilization"] = 0
+    
+    return all_compacted, compact_stats
+
+
+def flatten_compacted_groups(compacted_groups):
+    """Flatten compacted groups back to chunk list with group markers"""
+    
+    flattened = []
+    
+    for group_idx, group in enumerate(compacted_groups):
+        for chunk in group:
+            chunk.compact_group = group_idx
+            flattened.append(chunk)
+    
+    return flattened
+
+
 def write_binary_dataset(chunks, output_path, compress=True):
     """Write chunks to binary file with optional compression"""
+    
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -455,6 +562,7 @@ def write_binary_dataset(chunks, output_path, compress=True):
 
 def read_binary_dataset(input_path):
     """Read chunks from binary file"""
+    
     with open(input_path, 'rb') as f:
         magic = f.read(4)
         if magic != MAGIC_HEADER:
@@ -485,6 +593,7 @@ def read_binary_dataset(input_path):
 
 def get_chunk_at_index(input_path, index):
     """Read single chunk by index without loading entire file"""
+    
     with open(input_path, 'rb') as f:
         magic = f.read(4)
         if magic != MAGIC_HEADER:
@@ -511,6 +620,7 @@ def get_chunk_at_index(input_path, index):
 
 def get_dataset_info(input_path):
     """Get metadata about binary dataset without loading all chunks"""
+    
     with open(input_path, 'rb') as f:
         magic = f.read(4)
         if magic != MAGIC_HEADER:
@@ -538,6 +648,7 @@ def get_dataset_info(input_path):
 
 def estimate_compacting_efficiency(chunks, max_tokens=10000):
     """Estimate efficiency of compacting strategy"""
+    
     total_tokens = sum(c.estimate_tokens() for c in chunks)
     compacted    = smart_compacting(chunks, max_tokens)
     num_groups   = len(compacted)

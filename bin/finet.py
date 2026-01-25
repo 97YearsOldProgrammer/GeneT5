@@ -17,7 +17,6 @@ from lib.model     import GeneT5
 from lib.tokenizer import GeneTokenizer
 
 
-# Training Parameters
 DEFAULTS = {
     "max_input_len":  4096,
     "max_target_len": 2048,
@@ -39,35 +38,39 @@ def main():
 
     # Data
     parser.add_argument("train_data", type=str, nargs="+",
-        help="Training data paths (JSONL files).")
+        help="Training data paths (JSONL files)")
     parser.add_argument("output_dir", type=str,
-        help="Output directory for checkpoints and final model.")
+        help="Output directory for checkpoints and final model")
     parser.add_argument("model_path", type=str,
-        help="Path to pretrained GeneT5 model directory.")
+        help="Path to pretrained GeneT5 model directory")
 
     # Model
     parser.add_argument("--checkpoint", type=str, default=None,
-        help="Resume from checkpoint path.")
+        help="Resume from checkpoint path")
+
+    # Validation
+    parser.add_argument("--validation_file", type=str, default=None,
+        help="Path to validation JSONL file (overrides val_split)")
 
     # Noising
     parser.add_argument("--enable_noising", action="store_true", default=True,
-        help="Enable hint-based noising (default: True).")
+        help="Enable hint-based noising (default: True)")
     parser.add_argument("--no_noising", action="store_false", dest="enable_noising",
-        help="Disable noising (train on raw data).")
+        help="Disable noising (train on raw data)")
     parser.add_argument("--hint_token", type=str, default="[HIT]",
-        help="Token to mark hint section in input.")
+        help="Token to mark hint section in input")
     
     # Noising scenario weights
     parser.add_argument("--scenario_full_mix", type=float, default=0.40,
-        help="Weight for full_mix scenario (intron + CDS hints).")
+        help="Weight for full_mix scenario (intron + CDS hints)")
     parser.add_argument("--scenario_intron_only", type=float, default=0.25,
-        help="Weight for intron_only scenario.")
+        help="Weight for intron_only scenario")
     parser.add_argument("--scenario_cds_only", type=float, default=0.20,
-        help="Weight for cds_only scenario.")
+        help="Weight for cds_only scenario")
     parser.add_argument("--scenario_degraded", type=float, default=0.10,
-        help="Weight for degraded scenario (heavy noise).")
+        help="Weight for degraded scenario (heavy noise)")
     parser.add_argument("--scenario_ab_initio", type=float, default=0.05,
-        help="Weight for ab_initio scenario (no hints).")
+        help="Weight for ab_initio scenario (no hints)")
 
     # Training params
     parser.add_argument("--epochs", type=int, default=DEFAULTS["epochs"])
@@ -88,13 +91,13 @@ def main():
 
     # Distributed training params (DGX Spark)
     parser.add_argument("--distributed", action="store_true", default=False,
-        help="Enable distributed training across multiple DGX Spark systems.")
+        help="Enable distributed training across multiple DGX Spark systems")
     parser.add_argument("--backend", type=str, default="nccl",
-        help="Distributed backend (nccl for GPU, gloo for CPU).")
+        help="Distributed backend (nccl for GPU, gloo for CPU)")
     parser.add_argument("--find_unused_params", action="store_true", default=False,
-        help="Enable find_unused_parameters in DDP (needed for MoE in some cases).")
+        help="Enable find_unused_parameters in DDP (needed for MoE in some cases)")
     parser.add_argument("--no_lr_scaling", action="store_true", default=False,
-        help="Disable automatic learning rate scaling with world size.")
+        help="Disable automatic learning rate scaling with world size")
 
     args = parser.parse_args()
 
@@ -202,8 +205,32 @@ def main():
         base_seed,
     )
 
-    # Split into train/val
-    if args.val_split > 0:
+
+    ###########################################
+    #####  Validation Dataset Handling    #####
+    ###########################################
+
+
+    if args.validation_file and Path(args.validation_file).exists():
+        if is_main:
+            print(f"\n  Loading validation from file: {args.validation_file}")
+        
+        train_dataset = full_dataset
+        train_lengths = full_dataset.lengths
+        
+        val_dataset = dataset.ValidationDataset(
+            args.validation_file,
+            tokenizer,
+            args.max_input_len,
+            args.max_target_len,
+        )
+        val_lengths = val_dataset.lengths
+        
+        if is_main:
+            print(f"    Train samples: {len(train_dataset)}")
+            print(f"    Val samples:   {len(val_dataset)}")
+    
+    elif args.val_split > 0:
         val_size   = int(len(full_dataset) * args.val_split)
         train_size = len(full_dataset) - val_size
 
@@ -219,6 +246,7 @@ def main():
 
         train_lengths = [full_dataset.lengths[i] for i in train_dataset.indices]
         val_lengths   = [full_dataset.lengths[i] for i in val_dataset.indices]
+    
     else:
         train_dataset = full_dataset
         val_dataset   = None

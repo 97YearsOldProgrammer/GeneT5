@@ -24,11 +24,7 @@ def entropy(probs):
 
 
 def calculate_locus_complexity(gene_data):
-    """
-    Calculate complexity score using entropy-based approach
-    
-    Higher entropy = more alternative splicing complexity
-    """
+    """Calculate complexity score using entropy-based approach"""
     
     transcripts = gene_data.get("transcripts", {})
     features    = gene_data.get("features", [])
@@ -107,11 +103,7 @@ def identify_complex_loci(gene_groups, top_k=5):
 
 
 def identify_easy_genes(gene_groups, num_samples=10, seed=42):
-    """
-    Identify easy genes with simple structure
-    
-    Easy genes: single transcript, few exons, short span
-    """
+    """Identify easy genes with simple structure"""
     
     random.seed(seed)
     
@@ -190,16 +182,7 @@ def select_rare_samples(gene_groups, exclude_ids, num_samples=10, seed=42):
 
 
 def generate_validation_hints(features, scenario="mixed", seed=None):
-    """
-    Generate noised hints for validation scenarios
-    
-    Scenarios:
-        perfect  - exact copy of features (no noise)
-        good     - minor boundary jitter only
-        bad      - heavy noise, drops, fake additions
-        mixed    - random mix of good and bad
-        empty    - no hints at all
-    """
+    """Generate noised hints for validation scenarios"""
     
     if seed is not None:
         random.seed(seed)
@@ -261,11 +244,7 @@ def generate_validation_hints(features, scenario="mixed", seed=None):
 
 
 def build_validation_scenarios(gene_id, gene_data, seed=42):
-    """
-    Build multiple validation scenarios for a single gene
-    
-    Returns list of scenarios with different hint qualities
-    """
+    """Build multiple validation scenarios for a single gene"""
     
     random.seed(seed)
     
@@ -301,12 +280,7 @@ def build_validation_set(
     num_easy_samples = 10,
     seed             = 42,
 ):
-    """
-    Build validation set using feature-based selection
-    
-    Includes: long genes, complex loci, rare samples, easy samples
-    Each with multiple noise scenarios
-    """
+    """Build validation set using feature-based selection"""
     
     validation = {
         "long_genes":   [],
@@ -381,6 +355,192 @@ def build_validation_set(
         validation["scenarios"].extend(scenarios)
     
     return validation
+
+
+#####################################################
+#####  Validation Compacting and JSONL Support  #####
+#####################################################
+
+
+def estimate_scenario_input_tokens(scenario, bp_per_token=4.5):
+    """Estimate input tokens for a validation scenario"""
+    
+    seq_len     = scenario.get("end", 0) - scenario.get("start", 0)
+    seq_tokens  = seq_len / bp_per_token
+    hint_tokens = len(scenario.get("hints", [])) * 5
+    overhead    = 10
+    
+    return int(seq_tokens + hint_tokens + overhead)
+
+
+def compact_validation_scenarios(
+    scenarios,
+    target_length,
+    hard_limit   = None,
+    bp_per_token = 4.5,
+    seed         = 42,
+):
+    """Compact validation scenarios using first-fit-decreasing bin packing"""
+    
+    random.seed(seed)
+    
+    hard_limit = hard_limit or int(target_length * 1.1)
+    
+    with_lengths = [
+        (s, estimate_scenario_input_tokens(s, bp_per_token))
+        for s in scenarios
+    ]
+    with_lengths.sort(key=lambda x: -x[1])
+    
+    bins       = []
+    bin_totals = []
+    
+    for scenario, length in with_lengths:
+        if length > hard_limit:
+            bins.append([scenario])
+            bin_totals.append(length)
+            continue
+        
+        best_bin   = -1
+        best_space = hard_limit + 1
+        
+        for i, total in enumerate(bin_totals):
+            remaining = target_length - total
+            if remaining >= length and remaining < best_space:
+                best_bin   = i
+                best_space = remaining
+        
+        if best_bin == -1:
+            for i, total in enumerate(bin_totals):
+                remaining = hard_limit - total
+                if remaining >= length and remaining < best_space:
+                    best_bin   = i
+                    best_space = remaining
+        
+        if best_bin >= 0:
+            bins[best_bin].append(scenario)
+            bin_totals[best_bin] += length
+        else:
+            bins.append([scenario])
+            bin_totals.append(length)
+    
+    compact_stats = {
+        "num_groups":      len(bins),
+        "total_scenarios": len(scenarios),
+        "utilizations":    [t / target_length for t in bin_totals],
+    }
+    
+    if compact_stats["utilizations"]:
+        compact_stats["avg_utilization"] = sum(compact_stats["utilizations"]) / len(compact_stats["utilizations"])
+    else:
+        compact_stats["avg_utilization"] = 0
+    
+    return bins, compact_stats
+
+
+def scenario_to_jsonl_record(scenario, sequences=None):
+    """Convert a validation scenario to JSONL record format"""
+    
+    gene_id   = scenario.get("gene_id", "unknown")
+    start     = scenario.get("start", 0)
+    end       = scenario.get("end", 0)
+    strand    = scenario.get("strand", "+")
+    features  = scenario.get("features", [])
+    hints     = scenario.get("hints", [])
+    stype     = scenario.get("scenario_type", "unknown")
+    
+    input_parts = []
+    
+    if sequences and gene_id in sequences:
+        seq = sequences.get(gene_id, "")
+    else:
+        seq = scenario.get("sequence", "")
+    
+    if seq:
+        input_parts.append(seq)
+    
+    if hints:
+        input_parts.append("[HIT]")
+        for h in sorted(hints, key=lambda x: x.get("start", 0)):
+            htype  = h.get("type", "exon").lower()
+            hstart = h.get("start", 0)
+            hend   = h.get("end", 0)
+            hstrand = h.get("strand", "+")
+            input_parts.append(f"{htype}\t{hstart}\t{hend}\t{hstrand}")
+    
+    target_parts = ["<BOS>"]
+    for f in sorted(features, key=lambda x: x.get("start", 0)):
+        ftype  = f.get("type", "exon").lower()
+        fstart = f.get("start", 0)
+        fend   = f.get("end", 0)
+        fstrand = f.get("strand", "+")
+        fphase = f.get("phase", ".")
+        target_parts.append(f"{ftype}\t{fstart}\t{fend}\t{fstrand}\t{fphase}")
+    target_parts.append("<EOS>")
+    
+    return {
+        "input":         "\n".join(input_parts),
+        "target":        "\n".join(target_parts),
+        "gene_id":       gene_id,
+        "scenario_type": stype,
+        "start":         start,
+        "end":           end,
+        "strand":        strand,
+    }
+
+
+def write_validation_jsonl(scenarios, output_path, sequences=None, append=False):
+    """Write validation scenarios to JSONL file"""
+    
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    mode = 'a' if append else 'w'
+    
+    with open(output_path, mode) as f:
+        for scenario in scenarios:
+            record = scenario_to_jsonl_record(scenario, sequences)
+            f.write(json.dumps(record) + '\n')
+    
+    return output_path
+
+
+def load_validation_jsonl(input_path):
+    """Load validation scenarios from JSONL file"""
+    
+    records = []
+    
+    with open(input_path, 'r') as f:
+        for line in f:
+            if line.strip():
+                records.append(json.loads(line))
+    
+    return records
+
+
+def append_validation_jsonl(scenarios, output_path, sequences=None):
+    """Append validation scenarios to existing JSONL file"""
+    
+    return write_validation_jsonl(scenarios, output_path, sequences, append=True)
+
+
+def get_existing_validation_ids(jsonl_path):
+    """Get gene IDs already in validation JSONL file"""
+    
+    path = Path(jsonl_path)
+    if not path.exists():
+        return set()
+    
+    ids = set()
+    with open(path, 'r') as f:
+        for line in f:
+            if line.strip():
+                record = json.loads(line)
+                gid    = record.get("gene_id", "")
+                if gid:
+                    ids.add(gid)
+    
+    return ids
 
 
 #################
