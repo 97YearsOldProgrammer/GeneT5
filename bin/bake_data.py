@@ -184,10 +184,8 @@ ds.write_binary(val_chunks, val_path, args.compress)
 val_size = val_path.stat().st_size
 print(f"  Validation: {val_path} ({ds.format_size(val_size)})")
 
-# write validation metadata
-val_meta_path = output_dir / 'validation_meta.json'
+# print validation stats
 ds.save_validation_set(validation, val_meta_path)
-print(f"  Val meta:   {val_meta_path}")
 
 # print stats
 raw_count = sum(1 for c in all_chunks if not c.is_augmented)

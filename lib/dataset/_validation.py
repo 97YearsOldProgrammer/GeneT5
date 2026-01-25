@@ -306,11 +306,12 @@ def build_validation_set(
 
 
 def save_validation_set(validation, output_path):
-    """Save validation set to JSON file"""
+    """Save validation set to JSON file and print stats to stdout"""
 
     output_path = pathlib.Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Clean data only - no stats in JSON
     save_data = {
         "long_genes":   validation["long_genes"],
         "complex_loci": validation["complex_loci"],
@@ -318,18 +319,19 @@ def save_validation_set(validation, output_path):
         "easy_samples": validation["easy_samples"],
         "all_ids":      list(validation["all_ids"]),
         "scenarios":    validation["scenarios"],
-        "stats": {
-            "num_long":      len(validation["long_genes"]),
-            "num_complex":   len(validation["complex_loci"]),
-            "num_rare":      len(validation["rare_samples"]),
-            "num_easy":      len(validation["easy_samples"]),
-            "num_scenarios": len(validation["scenarios"]),
-            "total":         len(validation["all_ids"]),
-        }
     }
 
     with open(output_path, 'w') as f:
         json.dump(save_data, f, indent=2)
+
+    # Print stats to stdout
+    print(f"\n  Validation Set Stats:")
+    print(f"    Long genes:     {len(validation['long_genes'])}")
+    print(f"    Complex loci:   {len(validation['complex_loci'])}")
+    print(f"    Rare samples:   {len(validation['rare_samples'])}")
+    print(f"    Easy samples:   {len(validation['easy_samples'])}")
+    print(f"    Total genes:    {len(validation['all_ids'])}")
+    print(f"    Scenarios:      {len(validation['scenarios'])}")
 
     return output_path
 
