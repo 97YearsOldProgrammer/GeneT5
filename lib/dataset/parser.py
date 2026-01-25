@@ -1,7 +1,12 @@
-import gzip
-import json
+"""Parsing utilities for FASTA and GFF3 files"""
+
+import gzip as gz
+import json as js
 import sys
-from pathlib import Path
+import pathlib as pl
+
+
+#####################  Constants  #####################
 
 
 GENE_FEATURE_TYPES = {
@@ -10,17 +15,25 @@ GENE_FEATURE_TYPES = {
 }
 
 
+#####################  Sequence Utilities  #####################
+
+
 def anti(seq):
     """Reverse complement a DNA sequence"""
+    
     comp     = str.maketrans('ACGTRYMKBDHVNacgtrymkbdhvn', 'TGCAYRKMVHDBNtgcayrkmvhdbn')
     anti_seq = seq.translate(comp)[::-1]
     return anti_seq
 
 
+#####################  File I/O  #####################
+
+
 def get_filepointer(filename):
     """Get file pointer handling gzip and stdin"""
+    
     fp = None
-    if   filename.endswith('.gz'): fp = gzip.open(filename, 'rt')
+    if   filename.endswith('.gz'): fp = gz.open(filename, 'rt')
     elif filename == '-':          fp = sys.stdin
     else:                          fp = open(filename)
     return fp
@@ -28,6 +41,7 @@ def get_filepointer(filename):
 
 def parse_fasta(fasta_path):
     """Parse FASTA file into dict of sequences"""
+    
     sequences   = {}
     current_id  = None
     current_seq = []
@@ -56,10 +70,8 @@ def parse_fasta(fasta_path):
 
 
 def parse_gff(gff_path):
-    """
-    Parse GFF3 file
-    Column 1 (seqid) is used to match with FASTA sequences
-    """
+    """Parse GFF3 file into list of feature dicts"""
+    
     features = []
     
     fp = get_filepointer(gff_path)
@@ -97,8 +109,12 @@ def parse_gff(gff_path):
     return features
 
 
-def group_features_by_seqid(features):
+#####################  Feature Grouping  #####################
+
+
+def group_by_seqid(features):
     """Group features by their seqid (chromosome/contig)"""
+    
     grouped = {}
     for feat in features:
         seqid = feat["seqid"]
@@ -108,8 +124,9 @@ def group_features_by_seqid(features):
     return grouped
 
 
-def group_features_by_parent(features):
+def group_by_parent(features):
     """Group features by parent ID"""
+    
     grouped = {}
     orphans = []
     
@@ -125,12 +142,12 @@ def group_features_by_parent(features):
     return grouped, orphans
 
 
+#####################  Gene Index Building  #####################
+
+
 def build_gene_index(features):
-    """
-    Build gene hierarchy from features
+    """Build gene hierarchy from features"""
     
-    Returns dict: gene_id -> {seqid, start, end, strand, transcripts, features}
-    """
     gene_info          = {}
     transcript_info    = {}
     transcript_to_gene = {}
@@ -202,8 +219,12 @@ def build_gene_index(features):
     return gene_info
 
 
+#####################  Token Extraction  #####################
+
+
 def extract_feature_types(features):
     """Extract unique feature types for tokenizer"""
+    
     types = set()
     
     for feat in features:
@@ -216,6 +237,7 @@ def extract_feature_types(features):
 
 def extract_biotypes(features):
     """Extract unique biotypes for tokenizer"""
+    
     biotypes = set()
     
     for feat in features:
@@ -233,12 +255,12 @@ def extract_biotypes(features):
     return biotypes
 
 
-def format_target_annotation(features, gene_index_map, bos_token="<BOS>", eos_token="<EOS>"):
-    """
-    Format features as target annotation
+#####################  Target Formatting  #####################
+
+
+def format_target(features, gene_index_map, bos_token="<BOS>", eos_token="<EOS>"):
+    """Format features as target annotation string"""
     
-    Format: type\tstart\tend\tstrand\tphase\tgene_idx\tbiotype
-    """
     lines = [bos_token]
     
     gene_indices = {}
@@ -262,24 +284,29 @@ def format_target_annotation(features, gene_index_map, bos_token="<BOS>", eos_to
     return "\n".join(lines)
 
 
-def save_dataset(dataset, output_path):
+#####################  Dataset I/O  #####################
+
+
+def save_jsonl(dataset, output_path):
     """Save dataset to JSONL file"""
-    output_path = Path(output_path)
+    
+    output_path = pl.Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
     with open(output_path, 'w') as f:
         for sample in dataset:
             sample_out = {k: v for k, v in sample.items() if k != "features"}
-            f.write(json.dumps(sample_out) + '\n')
+            f.write(js.dumps(sample_out) + '\n')
     
-    print(f"  Saved {len(dataset)} samples to {output_path}")
+    return len(dataset)
 
 
-def load_dataset(input_path):
+def load_jsonl(input_path):
     """Load dataset from JSONL file"""
+    
     dataset = []
     with open(input_path, 'r') as f:
         for line in f:
             if line.strip():
-                dataset.append(json.loads(line))
+                dataset.append(js.loads(line))
     return dataset

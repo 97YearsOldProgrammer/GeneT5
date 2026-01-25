@@ -1,13 +1,12 @@
-import json
-import math
-import random
-from pathlib     import Path
-from collections import defaultdict
+"""Validation set building and management"""
+
+import json    as js
+import math    as mt
+import random  as rnd
+import pathlib as pl
 
 
-########################
-#####  Complexity  #####
-########################
+#####################  Entropy Calculation  #####################
 
 
 def entropy(probs):
@@ -19,11 +18,11 @@ def entropy(probs):
     h = 0.0
     for p in probs:
         if p > 0:
-            h -= p * math.log2(p)
+            h -= p * mt.log2(p)
     return h
 
 
-def calculate_locus_complexity(gene_data):
+def calculate_complexity(gene_data):
     """Calculate complexity score using entropy-based approach"""
     
     transcripts = gene_data.get("transcripts", {})
@@ -67,9 +66,7 @@ def calculate_locus_complexity(gene_data):
     return complexity
 
 
-##############################
-#####  Gene Identifiers  #####
-##############################
+#####################  Gene Identifiers  #####################
 
 
 def identify_long_genes(gene_groups, threshold_bp=50000):
@@ -94,7 +91,7 @@ def identify_complex_loci(gene_groups, top_k=5):
     scored = []
     
     for gene_id, gene_data in gene_groups.items():
-        score = calculate_locus_complexity(gene_data)
+        score = calculate_complexity(gene_data)
         scored.append((gene_id, gene_data, score))
     
     scored.sort(key=lambda x: -x[2])
@@ -105,7 +102,7 @@ def identify_complex_loci(gene_groups, top_k=5):
 def identify_easy_genes(gene_groups, num_samples=10, seed=42):
     """Identify easy genes with simple structure"""
     
-    random.seed(seed)
+    rnd.seed(seed)
     
     easy_candidates = []
     
@@ -120,7 +117,7 @@ def identify_easy_genes(gene_groups, num_samples=10, seed=42):
         gene_len   = gene_end - gene_start + 1
         
         if num_trans <= 1 and num_features <= 6 and gene_len < 10000:
-            complexity = calculate_locus_complexity(gene_data)
+            complexity = calculate_complexity(gene_data)
             easy_candidates.append((gene_id, gene_data, complexity))
     
     easy_candidates.sort(key=lambda x: x[2])
@@ -128,14 +125,14 @@ def identify_easy_genes(gene_groups, num_samples=10, seed=42):
     if len(easy_candidates) <= num_samples:
         return [(gid, gdata) for gid, gdata, _ in easy_candidates]
     
-    selected = random.sample(easy_candidates[:num_samples * 3], num_samples)
+    selected = rnd.sample(easy_candidates[:num_samples * 3], num_samples)
     return [(gid, gdata) for gid, gdata, _ in selected]
 
 
 def select_rare_samples(gene_groups, exclude_ids, num_samples=10, seed=42):
     """Randomly select rare samples excluding specified gene IDs"""
     
-    random.seed(seed)
+    rnd.seed(seed)
     
     candidates = {
         gid: gdata for gid, gdata in gene_groups.items()
@@ -172,20 +169,18 @@ def select_rare_samples(gene_groups, exclude_ids, num_samples=10, seed=42):
     if len(top_rare) <= num_samples:
         return [(gid, gdata) for gid, gdata, _ in top_rare]
     
-    selected = random.sample(top_rare, num_samples)
+    selected = rnd.sample(top_rare, num_samples)
     return [(gid, gdata) for gid, gdata, _ in selected]
 
 
-##############################
-#####  Hint Generation   #####
-##############################
+#####################  Hint Generation  #####################
 
 
-def generate_validation_hints(features, scenario="mixed", seed=None):
+def generate_hints(features, scenario="mixed", seed=None):
     """Generate noised hints for validation scenarios"""
     
     if seed is not None:
-        random.seed(seed)
+        rnd.seed(seed)
     
     if scenario == "empty":
         return [], "empty"
@@ -194,7 +189,7 @@ def generate_validation_hints(features, scenario="mixed", seed=None):
         return [f.copy() for f in features], "perfect"
     
     if scenario == "mixed":
-        scenario = random.choice(["good", "bad", "perfect", "empty"])
+        scenario = rnd.choice(["good", "bad", "perfect", "empty"])
         if scenario == "empty":
             return [], "empty"
         if scenario == "perfect":
@@ -207,13 +202,13 @@ def generate_validation_hints(features, scenario="mixed", seed=None):
     fake_rate  = 0.02 if is_good else 0.15
     
     for feat in features:
-        if random.random() < drop_rate:
+        if rnd.random() < drop_rate:
             continue
         
         hint = feat.copy()
         
-        jitter_start  = int(random.gauss(0, jitter_std))
-        jitter_end    = int(random.gauss(0, jitter_std))
+        jitter_start  = int(rnd.gauss(0, jitter_std))
+        jitter_end    = int(rnd.gauss(0, jitter_std))
         hint["start"] = max(1, hint["start"] + jitter_start)
         hint["end"]   = hint["end"] + jitter_end
         
@@ -222,38 +217,36 @@ def generate_validation_hints(features, scenario="mixed", seed=None):
         
         hints.append(hint)
     
-    if features and random.random() < fake_rate:
+    if features and rnd.random() < fake_rate:
         max_pos    = max(f["end"] for f in features)
-        fake_start = random.randint(1, max(1, max_pos - 200))
-        fake_end   = fake_start + random.randint(50, 200)
+        fake_start = rnd.randint(1, max(1, max_pos - 200))
+        fake_end   = fake_start + rnd.randint(50, 200)
         
         hints.append({
-            "type":   random.choice(["exon", "intron", "CDS"]),
+            "type":   rnd.choice(["exon", "intron", "CDS"]),
             "start":  fake_start,
             "end":    fake_end,
-            "strand": random.choice(["+", "-"]),
+            "strand": rnd.choice(["+", "-"]),
             "fake":   True,
         })
     
     return hints, scenario
 
 
-################################
-#####  Validation Builder  #####
-################################
+#####################  Scenario Building  #####################
 
 
-def build_validation_scenarios(gene_id, gene_data, seed=42):
+def build_scenarios(gene_id, gene_data, seed=42):
     """Build multiple validation scenarios for a single gene"""
     
-    random.seed(seed)
+    rnd.seed(seed)
     
     features       = gene_data.get("features", [])
     scenarios      = []
     scenario_types = ["perfect", "good", "bad", "empty"]
     
     for stype in scenario_types:
-        hints, actual_type = generate_validation_hints(
+        hints, actual_type = generate_hints(
             features,
             scenario = stype,
             seed     = seed + hash(stype) % 10000,
@@ -301,7 +294,7 @@ def build_validation_set(
         })
         validation["all_ids"].add(gene_id)
         
-        scenarios = build_validation_scenarios(gene_id, gene_data, seed)
+        scenarios = build_scenarios(gene_id, gene_data, seed)
         validation["scenarios"].extend(scenarios)
     
     remaining = {
@@ -318,7 +311,7 @@ def build_validation_set(
         })
         validation["all_ids"].add(gene_id)
         
-        scenarios = build_validation_scenarios(gene_id, gene_data, seed)
+        scenarios = build_scenarios(gene_id, gene_data, seed)
         validation["scenarios"].extend(scenarios)
     
     remaining = {
@@ -334,7 +327,7 @@ def build_validation_set(
         })
         validation["all_ids"].add(gene_id)
         
-        scenarios = build_validation_scenarios(gene_id, gene_data, seed)
+        scenarios = build_scenarios(gene_id, gene_data, seed)
         validation["scenarios"].extend(scenarios)
     
     rare_samples = select_rare_samples(
@@ -351,94 +344,75 @@ def build_validation_set(
         })
         validation["all_ids"].add(gene_id)
         
-        scenarios = build_validation_scenarios(gene_id, gene_data, seed)
+        scenarios = build_scenarios(gene_id, gene_data, seed)
         validation["scenarios"].extend(scenarios)
     
     return validation
 
 
-#####################################################
-#####  Validation Compacting and JSONL Support  #####
-#####################################################
+#####################  I/O  #####################
 
 
-def estimate_scenario_input_tokens(scenario, bp_per_token=4.5):
-    """Estimate input tokens for a validation scenario"""
+def save_validation_set(validation, output_path):
+    """Save validation set to JSON file"""
     
-    seq_len     = scenario.get("end", 0) - scenario.get("start", 0)
-    seq_tokens  = seq_len / bp_per_token
-    hint_tokens = len(scenario.get("hints", [])) * 5
-    overhead    = 10
+    output_path = pl.Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     
-    return int(seq_tokens + hint_tokens + overhead)
-
-
-def compact_validation_scenarios(
-    scenarios,
-    target_length,
-    hard_limit   = None,
-    bp_per_token = 4.5,
-    seed         = 42,
-):
-    """Compact validation scenarios using first-fit-decreasing bin packing"""
-    
-    random.seed(seed)
-    
-    hard_limit = hard_limit or int(target_length * 1.1)
-    
-    with_lengths = [
-        (s, estimate_scenario_input_tokens(s, bp_per_token))
-        for s in scenarios
-    ]
-    with_lengths.sort(key=lambda x: -x[1])
-    
-    bins       = []
-    bin_totals = []
-    
-    for scenario, length in with_lengths:
-        if length > hard_limit:
-            bins.append([scenario])
-            bin_totals.append(length)
-            continue
-        
-        best_bin   = -1
-        best_space = hard_limit + 1
-        
-        for i, total in enumerate(bin_totals):
-            remaining = target_length - total
-            if remaining >= length and remaining < best_space:
-                best_bin   = i
-                best_space = remaining
-        
-        if best_bin == -1:
-            for i, total in enumerate(bin_totals):
-                remaining = hard_limit - total
-                if remaining >= length and remaining < best_space:
-                    best_bin   = i
-                    best_space = remaining
-        
-        if best_bin >= 0:
-            bins[best_bin].append(scenario)
-            bin_totals[best_bin] += length
-        else:
-            bins.append([scenario])
-            bin_totals.append(length)
-    
-    compact_stats = {
-        "num_groups":      len(bins),
-        "total_scenarios": len(scenarios),
-        "utilizations":    [t / target_length for t in bin_totals],
+    save_data = {
+        "long_genes":   validation["long_genes"],
+        "complex_loci": validation["complex_loci"],
+        "rare_samples": validation["rare_samples"],
+        "easy_samples": validation["easy_samples"],
+        "all_ids":      list(validation["all_ids"]),
+        "scenarios":    validation["scenarios"],
+        "stats": {
+            "num_long":      len(validation["long_genes"]),
+            "num_complex":   len(validation["complex_loci"]),
+            "num_rare":      len(validation["rare_samples"]),
+            "num_easy":      len(validation["easy_samples"]),
+            "num_scenarios": len(validation["scenarios"]),
+            "total":         len(validation["all_ids"]),
+        }
     }
     
-    if compact_stats["utilizations"]:
-        compact_stats["avg_utilization"] = sum(compact_stats["utilizations"]) / len(compact_stats["utilizations"])
-    else:
-        compact_stats["avg_utilization"] = 0
+    with open(output_path, 'w') as f:
+        js.dump(save_data, f, indent=2)
     
-    return bins, compact_stats
+    return output_path
 
 
-def scenario_to_jsonl_record(scenario, sequences=None):
+def load_validation_set(input_path):
+    """Load existing validation set from JSON file"""
+    
+    with open(input_path, 'r') as f:
+        data = js.load(f)
+    
+    data["all_ids"] = set(data.get("all_ids", []))
+    
+    return data
+
+
+def get_existing_ids(jsonl_path):
+    """Get gene IDs already in validation JSONL file"""
+    
+    path = pl.Path(jsonl_path)
+    if not path.exists():
+        return set()
+    
+    ids = set()
+    with open(path, 'r') as f:
+        for line in f:
+            if line.strip():
+                record = js.loads(line)
+                gid    = record.get("gene_id", "")
+                if gid:
+                    ids.add(gid)
+    
+    return ids
+
+
+def scenario_to_record(scenario, sequences=None):
     """Convert a validation scenario to JSONL record format"""
     
     gene_id   = scenario.get("gene_id", "unknown")
@@ -462,19 +436,19 @@ def scenario_to_jsonl_record(scenario, sequences=None):
     if hints:
         input_parts.append("[HIT]")
         for h in sorted(hints, key=lambda x: x.get("start", 0)):
-            htype  = h.get("type", "exon").lower()
-            hstart = h.get("start", 0)
-            hend   = h.get("end", 0)
+            htype   = h.get("type", "exon").lower()
+            hstart  = h.get("start", 0)
+            hend    = h.get("end", 0)
             hstrand = h.get("strand", "+")
             input_parts.append(f"{htype}\t{hstart}\t{hend}\t{hstrand}")
     
     target_parts = ["<BOS>"]
     for f in sorted(features, key=lambda x: x.get("start", 0)):
-        ftype  = f.get("type", "exon").lower()
-        fstart = f.get("start", 0)
-        fend   = f.get("end", 0)
+        ftype   = f.get("type", "exon").lower()
+        fstart  = f.get("start", 0)
+        fend    = f.get("end", 0)
         fstrand = f.get("strand", "+")
-        fphase = f.get("phase", ".")
+        fphase  = f.get("phase", ".")
         target_parts.append(f"{ftype}\t{fstart}\t{fend}\t{fstrand}\t{fphase}")
     target_parts.append("<EOS>")
     
@@ -487,150 +461,3 @@ def scenario_to_jsonl_record(scenario, sequences=None):
         "end":           end,
         "strand":        strand,
     }
-
-
-def write_validation_jsonl(scenarios, output_path, sequences=None, append=False):
-    """Write validation scenarios to JSONL file"""
-    
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    mode = 'a' if append else 'w'
-    
-    with open(output_path, mode) as f:
-        for scenario in scenarios:
-            record = scenario_to_jsonl_record(scenario, sequences)
-            f.write(json.dumps(record) + '\n')
-    
-    return output_path
-
-
-def load_validation_jsonl(input_path):
-    """Load validation scenarios from JSONL file"""
-    
-    records = []
-    
-    with open(input_path, 'r') as f:
-        for line in f:
-            if line.strip():
-                records.append(json.loads(line))
-    
-    return records
-
-
-def append_validation_jsonl(scenarios, output_path, sequences=None):
-    """Append validation scenarios to existing JSONL file"""
-    
-    return write_validation_jsonl(scenarios, output_path, sequences, append=True)
-
-
-def get_existing_validation_ids(jsonl_path):
-    """Get gene IDs already in validation JSONL file"""
-    
-    path = Path(jsonl_path)
-    if not path.exists():
-        return set()
-    
-    ids = set()
-    with open(path, 'r') as f:
-        for line in f:
-            if line.strip():
-                record = json.loads(line)
-                gid    = record.get("gene_id", "")
-                if gid:
-                    ids.add(gid)
-    
-    return ids
-
-
-#################
-#####  I/O  #####
-#################
-
-
-def save_validation_set(validation, output_path):
-    """Save validation set to JSON file"""
-    
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    save_data = {
-        "long_genes":   validation["long_genes"],
-        "complex_loci": validation["complex_loci"],
-        "rare_samples": validation["rare_samples"],
-        "easy_samples": validation["easy_samples"],
-        "all_ids":      list(validation["all_ids"]),
-        "scenarios":    validation["scenarios"],
-        "stats": {
-            "num_long":      len(validation["long_genes"]),
-            "num_complex":   len(validation["complex_loci"]),
-            "num_rare":      len(validation["rare_samples"]),
-            "num_easy":      len(validation["easy_samples"]),
-            "num_scenarios": len(validation["scenarios"]),
-            "total":         len(validation["all_ids"]),
-        }
-    }
-    
-    with open(output_path, 'w') as f:
-        json.dump(save_data, f, indent=2)
-    
-    return output_path
-
-
-def load_validation_set(input_path):
-    """Load existing validation set from JSON file"""
-    
-    with open(input_path, 'r') as f:
-        data = json.load(f)
-    
-    data["all_ids"] = set(data.get("all_ids", []))
-    
-    return data
-
-
-def extend_validation_set(existing, new_validation):
-    """Extend existing validation set with new entries"""
-    
-    for category in ["long_genes", "complex_loci", "rare_samples", "easy_samples"]:
-        existing_ids = {item["gene_id"] for item in existing.get(category, [])}
-        for item in new_validation.get(category, []):
-            if item["gene_id"] not in existing_ids:
-                existing[category].append(item)
-                existing["all_ids"].add(item["gene_id"])
-    
-    if "scenarios" not in existing:
-        existing["scenarios"] = []
-    existing["scenarios"].extend(new_validation.get("scenarios", []))
-    
-    return existing
-
-
-def print_validation_stats(validation):
-    """Print validation set statistics"""
-    
-    print(f"\n{'='*60}")
-    print("Validation Set Statistics")
-    print(f"{'='*60}")
-    print(f"  Long genes (>50kb):  {len(validation['long_genes'])}")
-    print(f"  Complex loci:        {len(validation['complex_loci'])}")
-    print(f"  Rare samples:        {len(validation['rare_samples'])}")
-    print(f"  Easy samples:        {len(validation.get('easy_samples', []))}")
-    print(f"  Total scenarios:     {len(validation.get('scenarios', []))}")
-    print(f"  Total unique genes:  {len(validation['all_ids'])}")
-    
-    if validation["long_genes"]:
-        print(f"\n  Longest genes:")
-        for item in validation["long_genes"][:5]:
-            print(f"    {item['gene_id']}: {item['length']:,} bp")
-    
-    if validation["complex_loci"]:
-        print(f"\n  Most complex loci (entropy-based):")
-        for item in validation["complex_loci"][:5]:
-            print(f"    {item['gene_id']}: complexity={item['complexity']:.2f}")
-    
-    if validation.get("scenarios"):
-        scenario_counts = {}
-        for s in validation["scenarios"]:
-            stype = s.get("scenario_type", "unknown")
-            scenario_counts[stype] = scenario_counts.get(stype, 0) + 1
-        print(f"\n  Scenario distribution: {scenario_counts}")
