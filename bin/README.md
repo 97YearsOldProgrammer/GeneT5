@@ -20,12 +20,13 @@ The idea is to utilize existed DNABert-v2 pre-trained model for giving the model
 
 ```python3
 python3 bin/init_model.py \
-    --save_dir "../Data/model/init/" \
+    --save_dir "../model/init/" \
     --dnabert_path "zhihan1996/DNABERT-2-117M" \
     --use_moe \
-    --num_experts 8 \
+    --num_experts 32 \
     --moe_top_k 2 \
-    --tie_weights
+    --tie_weights \
+    2>&1 | tee -a ../logs/init.txt
 ```
 
 
@@ -42,7 +43,7 @@ python3 bin/bake_data.py \
   ../Data/genome/raw/C.crescentus/GCF_000022005.1_ASM2200v1_genomic.gff.gz  \
   ../Data/genome/processed/C.crescentus/ \
   --extract_tokens data/new_tokens.txt \
-  2>&1 | tee ../Data/logs/baker/C.crescentus.txt
+  2>&1 | tee -a ../Data/logs/baker/C.crescentus.txt
 ```
 
 

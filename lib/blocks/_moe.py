@@ -11,19 +11,29 @@ import triton
 import triton.language as tl
 
 
+####################
+#####  Config  #####
+####################
+
+
 @dataclass
 class MoEConfig:
-    embed_dim            = 768
-    ff_dim               = 3072
-    num_experts          = 8
-    top_k                = 2
-    dropout              = 0.0
-    capacity_factor      = 1.25
-    eval_capacity_factor = 2.0
-    aux_loss_weight      = 0.01
-    load_balance_weight  = 0.01
-    router_z_loss_weight = 0.001
-    activation           = 'silu'
+    embed_dim:            int   = 768
+    ff_dim:               int   = 3072
+    num_experts:          int   = 8
+    top_k:                int   = 2
+    dropout:              float = 0.0
+    capacity_factor:      float = 1.25
+    eval_capacity_factor: float = 2.0
+    aux_loss_weight:      float = 0.01
+    load_balance_weight:  float = 0.01
+    router_z_loss_weight: float = 0.001
+    activation:           str   = 'silu'
+
+
+#######################
+#####  Algorithm  #####
+#######################
 
 
 @triton.jit
@@ -32,7 +42,7 @@ def expert_scatter_kernel(
     num_tokens, embed_dim,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Scatter tokens to expert-specific positions."""
+    """Scatter tokens to expert-specific positions"""
     pid = tl.program_id(0)
     
     if pid < num_tokens:
