@@ -28,145 +28,6 @@ DEFAULTS = {
 }
 
 
-class BinaryTrainDataset(Dataset):
-    """PyTorch dataset wrapper for binary training files"""
-
-    def __init__(self, binary_path, tokenizer, max_input_len, max_target_len, seed=42):
-
-        self.binary_path    = binary_path
-        self.tokenizer      = tokenizer
-        self.max_input_len  = max_input_len
-        self.max_target_len = max_target_len
-        self.seed           = seed
-        self.epoch          = 0
-
-        self._info   = ds.get_binary_info(binary_path)
-        self._length = self._info["num_chunks"]
-        self.lengths = ds.build_length_index(binary_path)
-
-    def set_epoch(self, epoch):
-
-        self.epoch = epoch
-
-    def __len__(self):
-
-        return self._length
-
-    def __getitem__(self, idx):
-
-        random.seed(self.seed + self.epoch * len(self) + idx)
-
-        reader = ds.BinaryDatasetReader(self.binary_path)
-        sample = reader.get_sample(idx)
-
-        input_ids  = self.tokenizer.encode(sample["input_text"], add_special_tokens=False)
-        target_ids = self.tokenizer.encode(sample["target_text"], add_special_tokens=False)
-
-        if len(input_ids) > self.max_input_len:
-            input_ids = input_ids[:self.max_input_len]
-
-        if len(target_ids) > self.max_target_len:
-            target_ids = target_ids[:self.max_target_len]
-
-        return {
-            "input_ids":      input_ids,
-            "attention_mask": [1] * len(input_ids),
-            "labels":         target_ids,
-        }
-
-
-class DynamicPaddingCollator:
-    """Collator that pads batches dynamically"""
-
-    def __init__(self, pad_token_id, label_pad=-100):
-
-        self.pad_token_id = pad_token_id
-        self.label_pad    = label_pad
-
-    def __call__(self, batch):
-
-        max_input_len  = max(len(b["input_ids"]) for b in batch)
-        max_target_len = max(len(b["labels"]) for b in batch) if batch[0]["labels"] else 0
-
-        input_ids      = []
-        attention_mask = []
-        labels         = []
-
-        for b in batch:
-            inp_len = len(b["input_ids"])
-            pad_len = max_input_len - inp_len
-
-            input_ids.append(b["input_ids"] + [self.pad_token_id] * pad_len)
-            attention_mask.append(b["attention_mask"] + [0] * pad_len)
-
-            if max_target_len > 0:
-                lbl_len = len(b["labels"])
-                lbl_pad = max_target_len - lbl_len
-                labels.append(b["labels"] + [self.label_pad] * lbl_pad)
-
-        result = {
-            "input_ids":      torch.tensor(input_ids),
-            "attention_mask": torch.tensor(attention_mask),
-        }
-
-        if labels:
-            result["labels"] = torch.tensor(labels)
-
-        return result
-
-
-class SmartBatchSampler:
-    """Batch sampler that groups similar-length sequences"""
-
-    def __init__(self, lengths, batch_size, bucket_size=100, drop_last=False, shuffle=True):
-
-        self.lengths        = lengths
-        self.batch_size     = batch_size
-        self.bucket_size    = bucket_size
-        self.drop_last      = drop_last
-        self.shuffle        = shuffle
-        self.sorted_indices = sorted(range(len(lengths)), key=lambda i: lengths[i])
-
-    def __iter__(self):
-
-        buckets = []
-        bucket  = []
-
-        for idx in self.sorted_indices:
-            bucket.append(idx)
-            if len(bucket) >= self.bucket_size:
-                buckets.append(bucket)
-                bucket = []
-
-        if bucket:
-            buckets.append(bucket)
-
-        if self.shuffle:
-            random.shuffle(buckets)
-            for b in buckets:
-                random.shuffle(b)
-
-        all_indices = [idx for bucket in buckets for idx in bucket]
-        batches     = []
-
-        for i in range(0, len(all_indices), self.batch_size):
-            batch = all_indices[i:i + self.batch_size]
-            if len(batch) == self.batch_size or not self.drop_last:
-                batches.append(batch)
-
-        if self.shuffle:
-            random.shuffle(batches)
-
-        for batch in batches:
-            yield batch
-
-    def __len__(self):
-
-        if self.drop_last:
-            return len(self.lengths) // self.batch_size
-        return (len(self.lengths) + self.batch_size - 1) // self.batch_size
-
-
 def main():
 
     args = parse_args()
@@ -293,9 +154,9 @@ def create_dataloaders(train_dataset, val_dataset, args, tokenizer):
 
     print(f"\nSetting up dataloaders...")
 
-    collator = DynamicPaddingCollator(tokenizer.pad_token_id, -100)
+    collator = ds.DynamicPaddingCollator(tokenizer.pad_token_id, -100)
 
-    train_sampler = SmartBatchSampler(
+    train_sampler = ds.SmartBatchSampler(
         train_dataset.lengths, args.batch_size, args.bucket_size,
         drop_last=True, shuffle=True
     )
@@ -308,7 +169,7 @@ def create_dataloaders(train_dataset, val_dataset, args, tokenizer):
         pin_memory    = True,
     )
 
-    val_sampler = SmartBatchSampler(
+    val_sampler = ds.SmartBatchSampler(
         val_dataset.lengths, args.batch_size, args.bucket_size,
         drop_last=False, shuffle=False
     )

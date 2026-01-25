@@ -63,8 +63,11 @@ save_validation_set  = validation.save_validation_set
 #####################
 
 
-BinaryDatasetReader = dataload.BinaryDatasetReader
-build_length_index  = dataload.build_length_index
+BinaryDatasetReader     = dataload.BinaryDatasetReader
+build_length_index      = dataload.build_length_index
+BinaryTrainDataset      = dataload.BinaryTrainDataset
+DynamicPaddingCollator  = dataload.DynamicPaddingCollator
+SmartBatchSampler       = dataload.SmartBatchSampler
 
 
 ###################
