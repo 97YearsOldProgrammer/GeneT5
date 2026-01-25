@@ -305,7 +305,7 @@ def build_validation_set(
 #################
 
 
-pythondef save_validation_set(validation, output_path):
+def save_validation_set(validation, output_path):
     """Save validation set to JSON file and print stats to stdout"""
 
     output_path = pathlib.Path(output_path)
