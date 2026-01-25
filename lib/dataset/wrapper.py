@@ -47,6 +47,7 @@ augment_with_hints = chunking.augment_with_hints
 
 compact_chunks = compacting.compact_chunks
 flatten_groups = compacting.flatten_groups
+COMPACT_SEP    = compacting.COMPACT_SEP
 
 
 ######################
@@ -67,6 +68,7 @@ BinaryDatasetReader     = dataload.BinaryDatasetReader
 build_length_index      = dataload.build_length_index
 BinaryTrainDataset      = dataload.BinaryTrainDataset
 DynamicPaddingCollator  = dataload.DynamicPaddingCollator
+CompactingCollator      = dataload.CompactingCollator
 SmartBatchSampler       = dataload.SmartBatchSampler
 
 

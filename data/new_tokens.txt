@@ -1034,11 +1034,3 @@ transposable_element
 997
 998
 999
-cds
-exon
-five_prime_utr
-gene
-mrna
-protein_coding
-rnase_mrp_rna
-three_prime_utr

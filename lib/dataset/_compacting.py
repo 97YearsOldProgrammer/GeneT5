@@ -2,26 +2,74 @@ import random
 
 
 #######################
+#####  Constants  #####
+#######################
+
+
+COMPACT_SEP = "[SEP]"
+
+
+#######################
 #####  Utilities  #####
 #######################
 
 
-def estimate_chunk_tokens(chunk, bp_per_token=4.5):
-    """Estimate input tokens for a single chunk"""
+def estimate_chunk_tokens(chunk, tokenizer=None):
+    """
+    Get actual token count for a chunk.
+    
+    If tokenizer provided: returns exact count
+    Otherwise: rough estimate (not recommended for compacting)
+    """
 
-    seq_tokens  = len(chunk.sequence) / bp_per_token
+    if tokenizer is not None:
+        # Build input text same as in dataloader
+        input_text = chunk.sequence
+        if chunk.has_hints and chunk.hints:
+            input_text += "\n[HIT]"
+            for h in sorted(chunk.hints, key=lambda x: x.get("start", 0)):
+                htype   = h.get("type", "exon").lower()
+                hstart  = h.get("start", 0)
+                hend    = h.get("end", 0)
+                hstrand = h.get("strand", "+")
+                input_text += f"\n{htype}\t{hstart}\t{hend}\t{hstrand}"
+
+        input_ids = tokenizer.encode(input_text, add_special_tokens=False)
+        return len(input_ids)
+
+    # Fallback: rough estimate (discouraged)
+    seq_tokens  = len(chunk.sequence) / 4.5
     hint_tokens = len(chunk.hints) * 5 if chunk.has_hints else 0
     overhead    = 5
 
     return int(seq_tokens + hint_tokens + overhead)
 
 
-def compact_chunks(chunks, target_length, hard_limit=None, bp_per_token=4.5, seed=42):
-    """Compact chunks using first-fit-decreasing bin packing"""
+def compact_chunks(chunks, target_length, hard_limit=None, tokenizer=None, seed=42):
+    """
+    Compact chunks using first-fit-decreasing bin packing.
+    
+    Args:
+        chunks:        List of BinaryChunk objects
+        target_length: Target token count per group
+        hard_limit:    Maximum token count (default: target * 1.1)
+        tokenizer:     Tokenizer for accurate token counting (recommended)
+        seed:          Random seed for reproducibility
+    
+    Returns:
+        compacted_groups: List of chunk groups
+        compact_stats:    Statistics dict
+    
+    Note: When using compacted data, add COMPACT_SEP between samples
+          and use block-diagonal decoder attention mask.
+    """
 
     random.seed(seed)
 
     hard_limit = hard_limit or int(target_length * 1.1)
+
+    if tokenizer is None:
+        print("  WARNING: No tokenizer provided, using rough estimates")
 
     raw_chunks = [c for c in chunks if not c.is_augmented]
     aug_chunks = [c for c in chunks if c.is_augmented]
@@ -39,8 +87,9 @@ def compact_chunks(chunks, target_length, hard_limit=None, bp_per_token=4.5, see
         if not chunk_list:
             continue
 
+        # Get actual token lengths
         with_lengths = [
-            (c, estimate_chunk_tokens(c, bp_per_token))
+            (c, estimate_chunk_tokens(c, tokenizer))
             for c in chunk_list
         ]
         with_lengths.sort(key=lambda x: -x[1])
@@ -49,7 +98,10 @@ def compact_chunks(chunks, target_length, hard_limit=None, bp_per_token=4.5, see
         bin_totals = []
 
         for chunk, length in with_lengths:
-            if length > hard_limit:
+            # Account for separator token between samples
+            effective_length = length + 1  # +1 for [SEP]
+
+            if effective_length > hard_limit:
                 bins.append([chunk])
                 bin_totals.append(length)
                 compact_stats["overflow_count"] += 1
@@ -58,26 +110,29 @@ def compact_chunks(chunks, target_length, hard_limit=None, bp_per_token=4.5, see
             best_bin   = -1
             best_space = hard_limit + 1
 
+            # Try to fit in existing bin (prefer target over hard limit)
             for i, total in enumerate(bin_totals):
                 remaining = target_length - total
-                if remaining >= length and remaining < best_space:
+                if remaining >= effective_length and remaining < best_space:
                     best_bin   = i
                     best_space = remaining
 
+            # If no fit under target, try hard limit
             if best_bin == -1:
                 for i, total in enumerate(bin_totals):
                     remaining = hard_limit - total
-                    if remaining >= length and remaining < best_space:
+                    if remaining >= effective_length and remaining < best_space:
                         best_bin   = i
                         best_space = remaining
 
             if best_bin >= 0:
                 bins[best_bin].append(chunk)
-                bin_totals[best_bin] += length
+                bin_totals[best_bin] += effective_length
             else:
                 bins.append([chunk])
                 bin_totals.append(length)
 
+        # Record stats
         for i, group in enumerate(bins):
             all_compacted.append(group)
 
@@ -116,12 +171,12 @@ def flatten_groups(compacted_groups):
     return flattened
 
 
-def estimate_efficiency(chunks, target_length=10000, bp_per_token=4.5):
+def estimate_efficiency(chunks, target_length, tokenizer=None):
     """Estimate efficiency of compacting without actually compacting"""
 
-    total_tokens = sum(estimate_chunk_tokens(c, bp_per_token) for c in chunks)
+    total_tokens = sum(estimate_chunk_tokens(c, tokenizer) for c in chunks)
 
-    compacted, stats = compact_chunks(chunks, target_length, bp_per_token=bp_per_token)
+    compacted, stats = compact_chunks(chunks, target_length, tokenizer=tokenizer)
     num_groups       = len(compacted)
 
     return {
@@ -134,18 +189,43 @@ def estimate_efficiency(chunks, target_length=10000, bp_per_token=4.5):
     }
 
 
-def estimate_scenario_tokens(scenario, bp_per_token=4.5):
+###############################
+#####  Validation Compact #####
+###############################
+
+
+def estimate_scenario_tokens(scenario, tokenizer=None):
     """Estimate input tokens for a validation scenario"""
 
+    if tokenizer is not None:
+        # Build input text
+        seq_len = scenario.get("end", 0) - scenario.get("start", 0)
+        # For validation, we don't have the actual sequence in scenario
+        # Just estimate based on length
+        input_text = "N" * seq_len  # Placeholder
+
+        hints = scenario.get("hints", [])
+        if hints:
+            input_text += "\n[HIT]"
+            for h in sorted(hints, key=lambda x: x.get("start", 0)):
+                htype   = h.get("type", "exon").lower()
+                hstart  = h.get("start", 0)
+                hend    = h.get("end", 0)
+                hstrand = h.get("strand", "+")
+                input_text += f"\n{htype}\t{hstart}\t{hend}\t{hstrand}"
+
+        return len(tokenizer.encode(input_text, add_special_tokens=False))
+
+    # Fallback estimate
     seq_len     = scenario.get("end", 0) - scenario.get("start", 0)
-    seq_tokens  = seq_len / bp_per_token
+    seq_tokens  = seq_len / 4.5
     hint_tokens = len(scenario.get("hints", [])) * 5
     overhead    = 10
 
     return int(seq_tokens + hint_tokens + overhead)
 
 
-def compact_scenarios(scenarios, target_length, hard_limit=None, bp_per_token=4.5, seed=42):
+def compact_scenarios(scenarios, target_length, hard_limit=None, tokenizer=None, seed=42):
     """Compact validation scenarios using first-fit-decreasing bin packing"""
 
     random.seed(seed)
@@ -153,7 +233,7 @@ def compact_scenarios(scenarios, target_length, hard_limit=None, bp_per_token=4.
     hard_limit = hard_limit or int(target_length * 1.1)
 
     with_lengths = [
-        (s, estimate_scenario_tokens(s, bp_per_token))
+        (s, estimate_scenario_tokens(s, tokenizer))
         for s in scenarios
     ]
     with_lengths.sort(key=lambda x: -x[1])
@@ -162,7 +242,9 @@ def compact_scenarios(scenarios, target_length, hard_limit=None, bp_per_token=4.
     bin_totals = []
 
     for scenario, length in with_lengths:
-        if length > hard_limit:
+        effective_length = length + 1  # +1 for separator
+
+        if effective_length > hard_limit:
             bins.append([scenario])
             bin_totals.append(length)
             continue
@@ -172,20 +254,20 @@ def compact_scenarios(scenarios, target_length, hard_limit=None, bp_per_token=4.
 
         for i, total in enumerate(bin_totals):
             remaining = target_length - total
-            if remaining >= length and remaining < best_space:
+            if remaining >= effective_length and remaining < best_space:
                 best_bin   = i
                 best_space = remaining
 
         if best_bin == -1:
             for i, total in enumerate(bin_totals):
                 remaining = hard_limit - total
-                if remaining >= length and remaining < best_space:
+                if remaining >= effective_length and remaining < best_space:
                     best_bin   = i
                     best_space = remaining
 
         if best_bin >= 0:
             bins[best_bin].append(scenario)
-            bin_totals[best_bin] += length
+            bin_totals[best_bin] += effective_length
         else:
             bins.append([scenario])
             bin_totals.append(length)

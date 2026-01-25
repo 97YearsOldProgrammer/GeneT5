@@ -4,6 +4,20 @@ import zlib
 import pathlib
 
 
+#######################
+#####  Constants  #####
+#######################
+
+
+MAGIC_HEADER   = b'GT5B'  # GeneT5 Binary
+FORMAT_VERSION = 1
+
+
+#########################
+#####  BinaryChunk  #####
+#########################
+
+
 class BinaryChunk:
     """Single training chunk with serialization support"""
 
@@ -108,10 +122,54 @@ class BinaryChunk:
             compact_group = meta.get("compact_group"),
         )
 
-    def estimate_input_tokens(self, bp_per_token=4.5):
-        """Estimate input token count for this chunk"""
+    def get_input_text(self):
+        """Format chunk as input text for tokenization"""
 
-        seq_tokens  = len(self.sequence) / bp_per_token
+        input_text = self.sequence
+
+        if self.has_hints and self.hints:
+            input_text += "\n[HIT]"
+            for h in sorted(self.hints, key=lambda x: x.get("start", 0)):
+                htype   = h.get("type", "exon").lower()
+                hstart  = h.get("start", 0)
+                hend    = h.get("end", 0)
+                hstrand = h.get("strand", "+")
+                input_text += f"\n{htype}\t{hstart}\t{hend}\t{hstrand}"
+
+        return input_text
+
+    def get_target_text(self):
+        """Format chunk as target text for tokenization"""
+
+        target_text = "<BOS>"
+
+        for f in sorted(self.features, key=lambda x: x.get("start", 0)):
+            ftype   = f.get("type", "exon").lower()
+            fstart  = f.get("start", 0)
+            fend    = f.get("end", 0)
+            fstrand = f.get("strand", "+")
+            fphase  = f.get("phase", ".")
+            target_text += f"\n{ftype}\t{fstart}\t{fend}\t{fstrand}\t{fphase}"
+
+        target_text += "\n<EOS>"
+
+        return target_text
+
+    def estimate_input_tokens(self, tokenizer=None):
+        """
+        Estimate input token count for this chunk.
+        
+        If tokenizer provided: returns exact count
+        Otherwise: rough estimate (not recommended)
+        """
+
+        input_text = self.get_input_text()
+
+        if tokenizer is not None:
+            return len(tokenizer.encode(input_text, add_special_tokens=False))
+
+        # Fallback: rough estimate
+        seq_tokens  = len(self.sequence) / 4.5
         hint_tokens = len(self.hints) * 5 if self.has_hints else 0
         overhead    = 5
 
