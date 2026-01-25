@@ -1,13 +1,15 @@
-import lib.dataset.parser     as parser
-import lib.dataset.binary     as binary
-import lib.dataset.chunking   as chunking
-import lib.dataset.compacting as compacting
-import lib.dataset.validation as validation
-import lib.dataset.dataload   as dataload
-import lib.dataset.util       as util
+import lib.dataset._parser     as parser
+import lib.dataset._binary     as binary
+import lib.dataset._chunking   as chunking
+import lib.dataset._compacting as compacting
+import lib.dataset._validation as validation
+import lib.dataset._dataload   as dataload
+import lib.dataset._util       as util
 
 
-#####################  Parser Exports  #####################
+#####################
+#####  Parser   #####
+#####################
 
 
 parse_fasta           = parser.parse_fasta
@@ -17,45 +19,57 @@ extract_feature_types = parser.extract_feature_types
 extract_biotypes      = parser.extract_biotypes
 
 
-#####################  Binary Exports  #####################
+#####################
+#####  Binary   #####
+#####################
 
 
-BinaryChunk        = binary.BinaryChunk
-write_binary       = binary.write_binary
-read_binary        = binary.read_binary
-get_binary_info    = binary.get_binary_info
+BinaryChunk         = binary.BinaryChunk
+write_binary        = binary.write_binary
+read_binary         = binary.read_binary
+get_binary_info     = binary.get_binary_info
 read_chunk_at_index = binary.read_chunk_at_index
 
 
-#####################  Chunking Exports  #####################
+#####################
+#####  Chunking #####
+#####################
 
 
 dynamic_chunking   = chunking.dynamic_chunking
 augment_with_hints = chunking.augment_with_hints
 
 
-#####################  Compacting Exports  #####################
+######################
+#####  Compacting ####
+######################
 
 
-compact_chunks  = compacting.compact_chunks
-flatten_groups  = compacting.flatten_groups
+compact_chunks = compacting.compact_chunks
+flatten_groups = compacting.flatten_groups
 
 
-#####################  Validation Exports  #####################
+######################
+#####  Validation ####
+######################
 
 
 build_validation_set = validation.build_validation_set
 save_validation_set  = validation.save_validation_set
 
 
-#####################  Dataload Exports  #####################
+#####################
+#####  Dataload #####
+#####################
 
 
 BinaryDatasetReader = dataload.BinaryDatasetReader
 build_length_index  = dataload.build_length_index
 
 
-#####################  Util Exports  #####################
+###################
+#####  Util   #####
+###################
 
 
 append_tokens_to_txt = util.append_tokens_to_txt

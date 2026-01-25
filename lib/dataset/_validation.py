@@ -3,6 +3,8 @@ import math
 import random
 import pathlib
 
+import lib.nosing.nosing as nosing
+
 
 ########################
 #####  Complexity  #####
@@ -175,65 +177,9 @@ def select_rare_samples(gene_groups, exclude_ids, num_samples=10, seed=42):
     return [(gid, gdata) for gid, gdata, _ in selected]
 
 
-
-def generate_hints(features, scenario="mixed", seed=None):
-    """Generate noised hints for validation scenarios"""
-
-    if seed is not None:
-        random.seed(seed)
-
-    if scenario == "empty":
-        return [], "empty"
-
-    if scenario == "perfect":
-        return [f.copy() for f in features], "perfect"
-
-    if scenario == "mixed":
-        scenario = random.choice(["good", "bad", "perfect", "empty"])
-        if scenario == "empty":
-            return [], "empty"
-        if scenario == "perfect":
-            return [f.copy() for f in features], "perfect"
-
-    hints      = []
-    is_good    = (scenario == "good")
-    drop_rate  = 0.05 if is_good else 0.30
-    jitter_std = 5    if is_good else 30
-    fake_rate  = 0.02 if is_good else 0.15
-
-    for feat in features:
-        if random.random() < drop_rate:
-            continue
-
-        hint = feat.copy()
-
-        jitter_start  = int(random.gauss(0, jitter_std))
-        jitter_end    = int(random.gauss(0, jitter_std))
-        hint["start"] = max(1, hint["start"] + jitter_start)
-        hint["end"]   = hint["end"] + jitter_end
-
-        if hint["end"] <= hint["start"]:
-            hint["end"] = hint["start"] + 10
-
-        hints.append(hint)
-
-    if features and random.random() < fake_rate:
-        max_pos    = max(f["end"] for f in features)
-        fake_start = random.randint(1, max(1, max_pos - 200))
-        fake_end   = fake_start + random.randint(50, 200)
-
-        hints.append({
-            "type":   random.choice(["exon", "intron", "CDS"]),
-            "start":  fake_start,
-            "end":    fake_end,
-            "strand": random.choice(["+", "-"]),
-            "fake":   True,
-        })
-
-    return hints, scenario
-
-
-#####################  Scenario Building  #####################
+#####################
+#####  Scenario  #####
+#####################
 
 
 def build_scenarios(gene_id, gene_data, seed=42):
@@ -241,20 +187,24 @@ def build_scenarios(gene_id, gene_data, seed=42):
 
     random.seed(seed)
 
+    noiser         = nosing.GFFNoiser()
     features       = gene_data.get("features", [])
     scenarios      = []
     scenario_types = ["perfect", "good", "bad", "empty"]
 
     for stype in scenario_types:
-        hints, actual_type = generate_hints(
-            features,
-            scenario = stype,
-            seed     = seed + hash(stype) % 10000,
-        )
+        random.seed(seed + hash(stype) % 10000)
+
+        if stype == "empty":
+            hints = []
+        elif stype == "perfect":
+            hints = [f.copy() for f in features]
+        else:
+            hints, _, _ = noiser.noise_features(features, "", scenario=stype)
 
         scenarios.append({
             "gene_id":       gene_id,
-            "scenario_type": actual_type,
+            "scenario_type": stype,
             "features":      [f.copy() for f in features],
             "hints":         hints,
             "start":         gene_data.get("start", 0),
@@ -350,7 +300,9 @@ def build_validation_set(
     return validation
 
 
-#####################  I/O  #####################
+#################
+#####  I/O  #####
+#################
 
 
 def save_validation_set(validation, output_path):

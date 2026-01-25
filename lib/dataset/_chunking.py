@@ -1,6 +1,7 @@
 import random
 
 import lib.dataset._binary as binary
+import lib.nosing.nosing   as nosing
 
 
 #######################
@@ -162,54 +163,20 @@ def dynamic_chunking(sequences, gene_index, limit_bp=25000, overlap_bp=5000, anc
 ###################
 
 
-def generate_hints_from_features(features, noise_rate=0.1):
-    """Generate noised hints from features"""
-
-    hints = []
-
-    for feat in features:
-        if random.random() < noise_rate:
-            continue
-
-        jitter_start = int(random.gauss(0, 15))
-        jitter_end   = int(random.gauss(0, 15))
-
-        hint = {
-            "type":   feat["type"],
-            "start":  max(0, feat["start"] + jitter_start),
-            "end":    feat["end"] + jitter_end,
-            "strand": feat["strand"],
-        }
-        hints.append(hint)
-
-    if random.random() < 0.05 and features:
-        max_pos    = max(f["end"] for f in features)
-        fake_start = random.randint(0, max(0, max_pos - 200))
-        fake_end   = fake_start + random.randint(50, 200)
-
-        hints.append({
-            "type":   "exon",
-            "start":  fake_start,
-            "end":    fake_end,
-            "strand": random.choice(["+", "-"]),
-        })
-
-    return hints
-
-
 def augment_with_hints(chunks, hint_ratio=0.5, seed=42):
-    """Create augmented copies with hints"""
+    """Create augmented copies with hints using GFFNoiser"""
 
     random.seed(seed)
 
+    noiser         = nosing.GFFNoiser()
     num_to_augment = int(len(chunks) * hint_ratio)
     indices        = random.sample(range(len(chunks)), min(num_to_augment, len(chunks)))
 
     augmented = []
 
     for idx in indices:
-        original = chunks[idx]
-        hints    = generate_hints_from_features(original.features)
+        original    = chunks[idx]
+        hints, _, _ = noiser.noise_features(original.features, original.sequence)
 
         aug_chunk = binary.BinaryChunk(
             seqid        = original.seqid,

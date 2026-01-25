@@ -1,7 +1,7 @@
 import json
 import random
 
-import lib.dataset.binary as binary
+import lib.dataset._binary as binary
 
 
 #################
