@@ -30,3 +30,9 @@ env/
 # ignore all pycache
 *.pyc
 __pycache__/
+
+
+# ignore all data prep files
+*.bin
+*.json
+*.jsonl

@@ -30,9 +30,9 @@ parser.add_argument('--long_threshold', required=False, type=int, default=50000,
     metavar='<int>', help='long gene threshold [%(default)i]')
 parser.add_argument('--top_k_complex', required=False, type=int, default=5,
     metavar='<int>', help='top K complex genes for validation [%(default)i]')
-parser.add_argument('--num_rare', required=False, type=int, default=10,
+parser.add_argument('--num_rare', required=False, type=int, default=5,
     metavar='<int>', help='number of rare biotype genes [%(default)i]')
-parser.add_argument('--num_easy', required=False, type=int, default=10,
+parser.add_argument('--num_easy', required=False, type=int, default=5,
     metavar='<int>', help='number of easy genes [%(default)i]')
 parser.add_argument('--compress', action='store_true', default=True,
     help='compress output binary')

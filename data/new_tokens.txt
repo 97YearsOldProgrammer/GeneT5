@@ -1034,3 +1034,10 @@ transposable_element
 997
 998
 999
+cds
+exon
+mrna
+five_prime_utr
+three_prime_utr
+lncrna
+mirna

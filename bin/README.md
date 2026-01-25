@@ -35,16 +35,31 @@ python3 bin/init_model.py \
 
 ### Data Baking
 
-To prepare fine-tuning data, using [data_baker](bake_data.py)
+To prepare fine-tuning data, using [data_baker](bake_data.py).  
 
+**The General Command Line**
 ```python3
 python3 bin/bake_data.py \
-  ../Data/genome/raw/C.crescentus/GCF_000022005.1_ASM2200v1_genomic.fna.gz\
-  ../Data/genome/raw/C.crescentus/GCF_000022005.1_ASM2200v1_genomic.gff.gz  \
-  ../Data/genome/processed/C.crescentus/ \
+  fasta   \
+  gff     \
+  out_dir \
   --extract_tokens data/new_tokens.txt \
-  2>&1 | tee -a ../Data/logs/baker/C.crescentus.txt
+  2>&1 | tee -a ../logs/baker/[name].txt 
 ```
+
+For sake of saving life, please use the [bake_data_wrapper](run_bake_data.py) instead for that general command line input. Here is some hyperparameter for how different data is being baked.   
+
+```python3
+python3 bin/run_bake_data.py H.archaea E.coli --limit 9000 --threshold 50000
+```
+
+| Taxa           | Limit    | Long Gene Upper Bound | Token Est. (@4.5bp) |
+| :------------: | :------: | :-------------------- | :------------------ |
+| Prokaryotes    | 9,000    | 50,000                | ~2k                 |
+| Unicellular    | 22,500   | 50,000                | ~5k                 |
+| Invertebrates  | 45,000   | 80,000                | ~10k                |
+| Vertebrates    | 90,000   | 150,000               | ~20k                |
+| Plants         | 45,000   | 60,000                | ~10k                |
 
 
 ---
@@ -62,7 +77,7 @@ python3 bin/init_tk.py data/new_tokens.txt
 Since we can't 100% ensure that we can include all weird types from Gff files. We would also have a pipeline for updating tokens into the model toeknizer. To append new tokens into the tokenizer.json, run this:
 
 ```python3
-python3 bin/append_tk.py data/new_tokens.txt ../Data/model/init/tokenizer.json
+python3 bin/append_tk.py data/new_tokens.txt ../model/init/tokenizer.json
 ```
 
 **Resizing the Embedding Space**
