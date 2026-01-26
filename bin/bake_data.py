@@ -1,182 +1,367 @@
 #!/usr/bin/env python3
 
+from __future__ import annotations
+
 import argparse
-import pathlib
+import subprocess
+import multiprocessing
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
-import lib.dataset as ds
+
+def main():
+    
+    parser = argparse.ArgumentParser(
+        description="Bake all species data with taxa-specific parameters", formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--raw_dir", type=str, default="../raw",
+        help="Directory containing species subdirectories [%(default)s]")
+    parser.add_argument("--baked_dir", type=str, default="../baked",
+        help="Output directory for baked data [%(default)s]")
+    parser.add_argument("--log_dir", type=str, default="../logs/baker",
+        help="Directory for log files [%(default)s]")
+    parser.add_argument("--taxa", type=str, nargs='+', default=None,
+        help="Process only specific taxa (default: all)")
+    parser.add_argument("--species", type=str, nargs='+', default=None,
+        help="Process only specific species (default: all)")
+    parser.add_argument("--n_workers", type=int, default=None,
+        help="Parallel workers for species processing [auto]")
+    parser.add_argument("--n_workers_per_species", type=int, default=1,
+        help="Workers per species for chunking [%(default)s]")
+    parser.add_argument("--compact", action="store_true",
+        help="Compact all training.bin files after baking")
+    parser.add_argument("--tokenizer", type=str, default=None,
+        help="Tokenizer path for compacting")
+    parser.add_argument("--compact_target", type=int, default=8192,
+        help="Target tokens for compacting [%(default)s]")
+    
+    args = parser.parse_args()
+    
+    # Determine number of workers
+    n_workers = args.n_workers or max(1, multiprocessing.cpu_count() - 1)
+    
+    # Build species list
+    species_to_process = []
+    
+    if args.species:
+        # Specific species requested
+        for sp in args.species:
+            if sp in SPECIES_LOOKUP:
+                taxa, limit = SPECIES_LOOKUP[sp]
+                species_to_process.append((sp, limit, taxa))
+            else:
+                print(f"  WARNING: Unknown species '{sp}', skipping")
+    
+    elif args.taxa:
+        # Specific taxa requested
+        for taxa in args.taxa:
+            if taxa in TAXA_CONFIG:
+                config = TAXA_CONFIG[taxa]
+                for sp in config["species"]:
+                    species_to_process.append((sp, config["limit"], taxa))
+            else:
+                print(f"  WARNING: Unknown taxa '{taxa}', skipping")
+    
+    else:
+        # All species
+        for taxa, config in TAXA_CONFIG.items():
+            for sp in config["species"]:
+                species_to_process.append((sp, config["limit"], taxa))
+    
+    if not species_to_process:
+        print("No species to process!")
+        return
+    
+    # Setup directories
+    raw_dir   = Path(args.raw_dir)
+    baked_dir = Path(args.baked_dir)
+    log_dir   = Path(args.log_dir)
+    
+    baked_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\n{' GeneT5 Data Baker ':=^60}")
+    print(f"  Raw directory:   {raw_dir}")
+    print(f"  Baked directory: {baked_dir}")
+    print(f"  Log directory:   {log_dir}")
+    print(f"  Workers:         {n_workers}")
+    print(f"  Species:         {len(species_to_process)}")
+    
+    # Print taxa summary
+    print(f"\n{' Taxa Summary ':=^60}")
+    taxa_counts = {}
+    for sp, limit, taxa in species_to_process:
+        if taxa not in taxa_counts:
+            taxa_counts[taxa] = {"count": 0, "limit": limit}
+        taxa_counts[taxa]["count"] += 1
+    
+    for taxa, info in taxa_counts.items():
+        print(f"  {taxa:15s}: {info['count']:2d} species @ {info['limit']:,} bp")
+    
+    # Prepare work items
+    work_items = [
+        (sp, raw_dir, baked_dir, log_dir, limit, args.n_workers_per_species)
+        for sp, limit, taxa in species_to_process
+    ]
+    
+    # Process species in parallel
+    print(f"\n{' Processing Species ':=^60}")
+    
+    results  = []
+    success  = 0
+    failed   = 0
+    
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        futures = {executor.submit(process_species, item): item[0] for item in work_items}
+        
+        for future in as_completed(futures):
+            species_name = futures[future]
+            try:
+                result = future.result()
+                results.append(result)
+                
+                if result["success"]:
+                    success += 1
+                    print(f"  ✓ {species_name}")
+                else:
+                    failed += 1
+                    error = result.get("error", "Unknown error")
+                    print(f"  ✗ {species_name}: {error}")
+            
+            except Exception as e:
+                failed += 1
+                print(f"  ✗ {species_name}: {e}")
+    
+    print(f"\n{' Results ':=^60}")
+    print(f"  Success: {success}")
+    print(f"  Failed:  {failed}")
+    
+    # Compact if requested
+    if args.compact and success > 0:
+        print(f"\n{' Compacting ':=^60}")
+        
+        training_files = list(baked_dir.glob("*/training.bin"))
+        
+        if not training_files:
+            print("  No training.bin files found!")
+        else:
+            print(f"  Found {len(training_files)} training files")
+            
+            compact_cmd = [
+                "python3", "bin/compact.py",
+            ] + [str(f) for f in training_files] + [
+                "-o", str(baked_dir / "all_training.bin"),
+            ]
+            
+            if args.tokenizer:
+                compact_cmd.extend([
+                    "--tokenizer", args.tokenizer,
+                    "--compact_target", str(args.compact_target),
+                ])
+            
+            print(f"  Running compact...")
+            subprocess.run(compact_cmd)
+    
+    print(f"\n{'='*60}")
+    print("Done!")
+    print(f"{'='*60}")
 
 
-parser = argparse.ArgumentParser(
-    description='Parse GFF3/FASTA for GeneT5')
-parser.add_argument('fasta', type=str, metavar='<fasta>',
-    help='path to FASTA file')
-parser.add_argument('gff', type=str, metavar='<gff>',
-    help='path to GFF3 annotation file')
-parser.add_argument('output_dir', type=str, metavar='<output>',
-    help='output directory')
-parser.add_argument('--limit', required=False, type=int, default=25000,
-    metavar='<int>', help='chunk size limit in bp [%(default)i]')
-parser.add_argument('--overlap_ratio', required=False, type=float, default=1/2.718281828,
-    metavar='<float>', help='overlap ratio [%(default).4f]')
-parser.add_argument('--anchor_pad_ratio', required=False, type=float, default=1/2.718281828,
-    metavar='<float>', help='anchor padding ratio [%(default).4f]')
-parser.add_argument('--hint_ratio', required=False, type=float, default=0.5,
-    metavar='<float>', help='hint augmentation ratio [%(default).2f]')
-parser.add_argument('--seed', required=False, type=int, default=42,
-    metavar='<int>', help='random seed [%(default)i]')
-parser.add_argument('--extract_tokens', required=False, type=str, default=None,
-    metavar='<file>', help='extract tokens to file')
-parser.add_argument('--top_k_long', required=False, type=int, default=5,
-    metavar='<int>', help='top K long genes for validation [%(default)i]')
-parser.add_argument('--top_k_complex', required=False, type=int, default=5,
-    metavar='<int>', help='top K complex genes for validation [%(default)i]')
-parser.add_argument('--num_rare', required=False, type=int, default=5,
-    metavar='<int>', help='number of rare biotype genes [%(default)i]')
-parser.add_argument('--num_easy', required=False, type=int, default=5,
-    metavar='<int>', help='number of easy genes [%(default)i]')
-parser.add_argument('--compress', action='store_true', default=True,
-    help='compress output binary')
-parser.add_argument('--no_compress', action='store_false', dest='compress',
-    help='do not compress output binary')
+if __name__ == "__main__":
+    main()
+    
 
-args = parser.parse_args()
+####################
+#####  Config  #####
+####################
 
-print(f"\n{' GFF3/FASTA Processing ':=^60}")
 
-sequences  = ds.parse_fasta(args.fasta)
-features   = ds.parse_gff(args.gff)
-gene_index = ds.build_gene_index(features)
-
-print(f"\n  Sequences: {len(sequences)}")
-print(f"  Features:  {len(features)}")
-print(f"  Genes:     {len(gene_index)}")
-
-# extract tokens if requested
-if args.extract_tokens:
-    feature_types = ds.extract_feature_types(features)
-    biotypes      = ds.extract_biotypes(features)
-    all_types     = feature_types | biotypes
-    added         = ds.append_tokens_to_txt(sorted(all_types), args.extract_tokens)
-    if added:
-        print(f"  Added {len(added)} new tokens")
-
-# build validation set
-print(f"\n{' Building Validation Set ':=^60}")
-
-validation = ds.build_validation_set(
-    gene_index,
-    args.top_k_long,
-    args.top_k_complex,
-    args.num_rare,
-    args.num_easy,
-    args.seed,
-)
-
-print(f"  Validation genes:     {len(validation['all_ids'])}")
-print(f"  Validation scenarios: {len(validation['scenarios'])}")
-
-existing_val_ids = set()
-
-# build training chunks
-print(f"\n{' Dynamic Chunking ':=^60}")
-
-overlap    = int(args.limit * args.overlap_ratio)
-anchor_pad = int(args.limit * args.anchor_pad_ratio)
-
-print(f"  Limit:   {args.limit/1000:.1f} kb")
-print(f"  Overlap: {overlap/1000:.1f} kb")
-
-all_validation_ids = validation['all_ids'] | existing_val_ids
-train_gene_index   = {
-    gid: gdata for gid, gdata in gene_index.items()
-    if gid not in all_validation_ids
+TAXA_CONFIG = {
+    "Prokaryotes": {
+        "limit": 9000,
+        "species": [
+            "E.coli",
+            "B.subtilis", 
+            "C.crescentus",
+            "PCC6803",
+            "H.archaea",
+            "V.fischeri",
+        ],
+    },
+    "Unicellular": {
+        "limit": 22500,
+        "species": [
+            "S.cerevisiae",
+            "S.pombe",
+            "C.reinhardtii",
+            "N.crassa",
+            "D.discoideum",
+            "T.thermophila",
+        ],
+    },
+    "Invertebrates": {
+        "limit": 45000,
+        "species": [
+            "C.elegan",
+            "Fly",
+            "S.anemone",
+            "S.urchin",
+            "H.vulgaris",
+            "Bee",
+            "Silkworm",
+        ],
+    },
+    "Vertebrates": {
+        "limit": 90000,
+        "species": [
+            "Axolotl",
+            "C.jacchus",
+            "Chicken",
+            "C.porcellus",
+            "Frog",
+            "Human",
+            "Medaka",
+            "Mouse",
+            "Rat",
+            "Zebrafish",
+        ],
+    },
+    "Plants": {
+        "limit": 45000,
+        "species": [
+            "Earthmoss",
+            "Maize",
+            "M.truncatula",
+            "Rice",
+            "T.cress",
+        ],
+    },
 }
 
-print(f"  Training genes: {len(train_gene_index)}")
+SPECIES_LOOKUP = build_species_lookup()
 
-train_chunks, chunk_stats = ds.dynamic_chunking(
-    sequences, train_gene_index, args.limit, overlap, anchor_pad
-)
 
-print(f"  Created {len(train_chunks)} raw chunks")
+#######################
+#####  Utilities  #####
+#######################
 
-# augment with hints
-all_chunks = ds.augment_with_hints(train_chunks, args.hint_ratio, args.seed)
 
-raw_count = sum(1 for c in all_chunks if not c.is_augmented)
-aug_count = sum(1 for c in all_chunks if c.is_augmented)
-print(f"\n  Raw chunks:       {raw_count}")
-print(f"  Augmented chunks: {aug_count}")
+def build_species_lookup():
+    """Build species -> (taxa, limit) lookup"""
+    
+    lookup = {}
+    for taxa, config in TAXA_CONFIG.items():
+        limit = config["limit"]
+        for species in config["species"]:
+            lookup[species] = (taxa, limit)
+    return lookup
 
-# write outputs
-output_dir = pathlib.Path(args.output_dir)
-output_dir.mkdir(parents=True, exist_ok=True)
 
-print(f"\n{' Writing Outputs ':=^60}")
+def find_genome_files(species_dir):
+    """Find GFF and FASTA files in species directory"""
+    
+    species_dir = Path(species_dir)
+    
+    gff_file   = None
+    fasta_file = None
+    
+    for f in species_dir.iterdir():
+        name_lower = f.name.lower()
+        if name_lower.endswith('.gff.gz') or name_lower.endswith('.gff3.gz'):
+            gff_file = f
+        elif name_lower.endswith('.fna.gz') or name_lower.endswith('.fasta.gz') or name_lower.endswith('.fa.gz'):
+            fasta_file = f
+    
+    # Fallback: check for common names
+    if gff_file is None:
+        for name in ['gff.gz', 'annotation.gff.gz', 'genes.gff.gz']:
+            candidate = species_dir / name
+            if candidate.exists():
+                gff_file = candidate
+                break
+    
+    if fasta_file is None:
+        for name in ['fna.gz', 'fasta.gz', 'genome.fna.gz', 'genome.fasta.gz']:
+            candidate = species_dir / name
+            if candidate.exists():
+                fasta_file = candidate
+                break
+    
+    return fasta_file, gff_file
 
-# write training
-train_path = output_dir / 'training.bin'
-ds.write_binary(all_chunks, train_path, args.compress)
-train_size = train_path.stat().st_size
-print(f"  Training:   {train_path} ({ds.format_size(train_size)})")
 
-# build validation chunks
-val_chunks = []
-for scenario in validation.get('scenarios', []):
-    gene_id  = scenario.get('gene_id', 'unknown')
-    start    = scenario.get('start', 0)
-    end      = scenario.get('end', 0)
-    strand   = scenario.get('strand', '+')
-    feats    = scenario.get('features', [])
-    hints    = scenario.get('hints', [])
-    stype    = scenario.get('scenario_type', 'unknown')
+def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_dir, n_workers=1):
+    """Run parse_data.py for a single species"""
+    
+    cmd = [
+        "python3", "bin/parse_data.py",
+        str(fasta_path),
+        str(gff_path),
+        str(output_dir),
+        "--limit", str(limit),
+        "--n_workers", str(n_workers),
+        "--extract_tokens", "data/new_tokens.txt",
+    ]
+    
+    log_file = log_dir / f"{species_name}.log"
+    
+    try:
+        with open(log_file, 'w') as log:
+            log.write(f"{'='*20} PARSING: {species_name} {'='*20}\n")
+            log.write(f"FASTA: {fasta_path}\n")
+            log.write(f"GFF:   {gff_path}\n")
+            log.write(f"Limit: {limit} bp\n")
+            log.write(f"{'='*60}\n\n")
+            log.flush()
+            
+            result = subprocess.run(
+                cmd,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        
+        return {
+            "species":  species_name,
+            "success":  result.returncode == 0,
+            "log_file": str(log_file),
+            "output":   str(output_dir),
+        }
+    
+    except Exception as e:
+        return {
+            "species":  species_name,
+            "success":  False,
+            "error":    str(e),
+            "log_file": str(log_file),
+        }
 
-    seq = ''
-    for seqid, full_seq in sequences.items():
-        if start < len(full_seq) and end <= len(full_seq):
-            seq = full_seq[start:end]
-            break
 
-    chunk = ds.BinaryChunk(
-        seqid        = gene_id,
-        start        = start,
-        end          = end,
-        strand       = strand,
-        sequence     = seq,
-        features     = feats,
-        biotype      = stype,
-        gene_ids     = [gene_id],
-        has_hints    = len(hints) > 0,
-        hints        = hints,
-        chunk_index  = 0,
-        is_augmented = False,
+def process_species(args):
+    """Worker function for parallel species processing"""
+    
+    species_name, raw_dir, baked_dir, log_dir, limit, n_workers = args
+    
+    species_raw_dir = Path(raw_dir) / species_name
+    
+    if not species_raw_dir.exists():
+        return {
+            "species": species_name,
+            "success": False,
+            "error":   f"Directory not found: {species_raw_dir}",
+        }
+    
+    fasta_file, gff_file = find_genome_files(species_raw_dir)
+    
+    if fasta_file is None or gff_file is None:
+        return {
+            "species": species_name,
+            "success": False,
+            "error":   f"Missing FASTA or GFF in: {species_raw_dir}",
+        }
+    
+    output_dir = Path(baked_dir) / species_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    return run_parse_data(
+        species_name, fasta_file, gff_file, output_dir, limit, log_dir, n_workers
     )
-    val_chunks.append(chunk)
-
-# write validation
-val_path = output_dir / 'validation.bin'
-ds.write_binary(val_chunks, val_path, args.compress)
-val_size = val_path.stat().st_size
-print(f"  Validation: {val_path} ({ds.format_size(val_size)})")
-
-# write validation metadata
-val_meta_path = output_dir / 'validation.json'
-ds.save_validation_set(validation, val_meta_path)
-
-# print stats
-run_stats = {
-    'raw_count':     raw_count,
-    'aug_count':     aug_count,
-    'total_samples': len(all_chunks),
-    'file_size':     train_size,
-}
-
-ds.print_run_stats(run_stats, chunk_stats, validation, train_path)
-
-print(f"\n{'='*60}")
-print('Done!')
-print()
-print('Next steps:')
-print('  1. Update tokenizer with extracted tokens (if --extract_tokens used)')
-print('  2. Optionally compact with: bin/compact.py --tokenizer <path>')
-print(f"{'='*60}")

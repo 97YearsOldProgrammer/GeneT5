@@ -57,7 +57,7 @@ def print_run_stats(run_stats, chunk_stats, validation, output_path):
         print(f"\n  Validation:")
         print(f"    Long genes:   {len(validation['long_genes'])}")
         print(f"    Complex loci: {len(validation['complex_loci'])}")
-        print(f"    Rare samples: {len(validation['rare_samples'])}")
+        print(f"    Normal genes: {len(validation.get('normal_genes', []))}")
         print(f"    Easy samples: {len(validation.get('easy_samples', []))}")
         print(f"    Total genes:  {len(validation['all_ids'])}")
         print(f"    Scenarios:    {len(validation.get('scenarios', []))}")

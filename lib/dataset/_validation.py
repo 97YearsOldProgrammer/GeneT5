@@ -2,6 +2,7 @@ import json
 import math
 import random
 import pathlib
+import statistics
 
 import lib.nosing.nosing as nosing
 
@@ -68,12 +69,21 @@ def calculate_complexity(gene_data):
     return complexity
 
 
+def compute_all_complexities(gene_groups):
+    """Compute complexity scores for all genes (cached for reuse)"""
+
+    return {
+        gene_id: calculate_complexity(gene_data)
+        for gene_id, gene_data in gene_groups.items()
+    }
+
+
 #######################
 #####  Selection  #####
 #######################
 
 
-def identify_long_genes(gene_groups, top_k=5):
+def identify_long_genes(gene_groups, complexity_cache, top_k=5):
     """Identify top-k longest genes"""
 
     scored = []
@@ -90,21 +100,20 @@ def identify_long_genes(gene_groups, top_k=5):
     return scored[:top_k]
 
 
-def identify_complex_loci(gene_groups, top_k=5):
-    """Identify top-K most complex loci based on entropy complexity score"""
+def identify_complex_loci(gene_groups, complexity_cache, top_k=5):
+    """Identify top-K most complex loci using precomputed complexity scores"""
 
-    scored = []
-
-    for gene_id, gene_data in gene_groups.items():
-        score = calculate_complexity(gene_data)
-        scored.append((gene_id, gene_data, score))
+    scored = [
+        (gene_id, gene_data, complexity_cache[gene_id])
+        for gene_id, gene_data in gene_groups.items()
+    ]
 
     scored.sort(key=lambda x: -x[2])
 
     return scored[:top_k]
 
 
-def identify_easy_genes(gene_groups, num_samples=10, seed=42):
+def identify_easy_genes(gene_groups, complexity_cache, num_samples=5, seed=42):
     """Identify easy genes with simple structure"""
 
     random.seed(seed)
@@ -122,7 +131,7 @@ def identify_easy_genes(gene_groups, num_samples=10, seed=42):
         gene_len   = gene_end - gene_start + 1
 
         if num_trans <= 1 and num_features <= 6 and gene_len < 10000:
-            complexity = calculate_complexity(gene_data)
+            complexity = complexity_cache[gene_id]
             easy_candidates.append((gene_id, gene_data, complexity))
 
     easy_candidates.sort(key=lambda x: x[2])
@@ -134,8 +143,8 @@ def identify_easy_genes(gene_groups, num_samples=10, seed=42):
     return [(gid, gdata) for gid, gdata, _ in selected]
 
 
-def select_rare_samples(gene_groups, exclude_ids, num_samples=10, seed=42):
-    """Randomly select rare samples excluding specified gene IDs"""
+def identify_mean_complexity_genes(gene_groups, complexity_cache, exclude_ids, num_samples=5, seed=42):
+    """Select genes closest to mean complexity for representative normal samples"""
 
     random.seed(seed)
 
@@ -147,34 +156,28 @@ def select_rare_samples(gene_groups, exclude_ids, num_samples=10, seed=42):
     if not candidates:
         return []
 
-    rare_biotypes = {"pseudogene", "lncrna", "snorna", "mirna", "guide_rna", "rrna", "trna"}
+    candidate_scores = [
+        (gid, gdata, complexity_cache[gid])
+        for gid, gdata in candidates.items()
+    ]
 
-    rarity_scored = []
-    for gene_id, gene_data in candidates.items():
-        features     = gene_data.get("features", [])
-        num_features = len(features)
+    if len(candidate_scores) < num_samples:
+        return [(gid, gdata) for gid, gdata, _ in candidate_scores]
 
-        biotypes = set()
-        for t_id, t_data in gene_data.get("transcripts", {}).items():
-            bt = t_data.get("biotype", "").lower()
-            if bt:
-                biotypes.add(bt)
+    scores_only = [s for _, _, s in candidate_scores]
+    mean_score  = statistics.mean(scores_only)
 
-        is_rare_biotype = bool(biotypes & rare_biotypes)
+    # Sort by distance from mean
+    candidate_scores.sort(key=lambda x: abs(x[2] - mean_score))
 
-        rarity = 1.0 / max(num_features, 1)
-        if is_rare_biotype:
-            rarity *= 3.0
+    # Take genes closest to mean with small pool for diversity
+    pool_size = min(num_samples * 3, len(candidate_scores))
+    pool      = candidate_scores[:pool_size]
 
-        rarity_scored.append((gene_id, gene_data, rarity))
+    if len(pool) <= num_samples:
+        return [(gid, gdata) for gid, gdata, _ in pool]
 
-    rarity_scored.sort(key=lambda x: -x[2])
-    top_rare = rarity_scored[:min(num_samples * 3, len(rarity_scored))]
-
-    if len(top_rare) <= num_samples:
-        return [(gid, gdata) for gid, gdata, _ in top_rare]
-
-    selected = random.sample(top_rare, num_samples)
+    selected = random.sample(pool, num_samples)
     return [(gid, gdata) for gid, gdata, _ in selected]
 
 
@@ -194,7 +197,6 @@ def build_scenarios(gene_id, gene_data, seed=42):
     scenarios      = []
     scenario_types = ["perfect", "good", "bad", "empty"]
 
-    # Enrich features with transcript_id and biotype
     enriched_features = []
     for feat in features:
         transcript_id = feat.get("attributes", {}).get("Parent", "")
@@ -238,25 +240,28 @@ def build_scenarios(gene_id, gene_data, seed=42):
 
 def build_validation_set(
     gene_groups,
-    top_k_long       = 5,
-    top_k_complex    = 5,
-    num_rare_samples = 10,
-    num_easy_samples = 10,
-    seed             = 42,
+    top_k_long      = 5,
+    top_k_complex   = 5,
+    num_normal      = 5,
+    num_easy        = 5,
+    seed            = 42,
 ):
-    """Build validation set using feature-based selection"""
+    """Build validation set using feature-based selection with cached complexity"""
+
+    # Compute complexity once for all genes
+    complexity_cache = compute_all_complexities(gene_groups)
 
     validation = {
-        "long_genes":   [],
-        "complex_loci": [],
-        "rare_samples": [],
-        "easy_samples": [],
-        "all_ids":      set(),
-        "scenarios":    [],
+        "long_genes":    [],
+        "complex_loci":  [],
+        "normal_genes":  [],
+        "easy_samples":  [],
+        "all_ids":       set(),
+        "scenarios":     [],
     }
 
     # Get top K long genes
-    long_genes = identify_long_genes(gene_groups, top_k_long)
+    long_genes = identify_long_genes(gene_groups, complexity_cache, top_k_long)
     for gene_id, gene_data, length in long_genes:
         validation["long_genes"].append({
             "gene_id": gene_id,
@@ -269,11 +274,12 @@ def build_validation_set(
         scenarios = build_scenarios(gene_id, gene_data, seed)
         validation["scenarios"].extend(scenarios)
 
+    # Get top K complex loci
     remaining = {
         gid: gdata for gid, gdata in gene_groups.items()
         if gid not in validation["all_ids"]
     }
-    complex_loci = identify_complex_loci(remaining, top_k_complex)
+    complex_loci = identify_complex_loci(remaining, complexity_cache, top_k_complex)
     for gene_id, gene_data, score in complex_loci:
         validation["complex_loci"].append({
             "gene_id":    gene_id,
@@ -286,11 +292,12 @@ def build_validation_set(
         scenarios = build_scenarios(gene_id, gene_data, seed)
         validation["scenarios"].extend(scenarios)
 
+    # Get easy samples
     remaining = {
         gid: gdata for gid, gdata in gene_groups.items()
         if gid not in validation["all_ids"]
     }
-    easy_samples = identify_easy_genes(remaining, num_easy_samples, seed)
+    easy_samples = identify_easy_genes(remaining, complexity_cache, num_easy, seed)
     for gene_id, gene_data in easy_samples:
         validation["easy_samples"].append({
             "gene_id": gene_id,
@@ -302,17 +309,20 @@ def build_validation_set(
         scenarios = build_scenarios(gene_id, gene_data, seed)
         validation["scenarios"].extend(scenarios)
 
-    rare_samples = select_rare_samples(
+    # Get normal genes (around mean complexity)
+    normal_genes = identify_mean_complexity_genes(
         gene_groups,
+        complexity_cache,
         validation["all_ids"],
-        num_rare_samples,
+        num_normal,
         seed,
     )
-    for gene_id, gene_data in rare_samples:
-        validation["rare_samples"].append({
-            "gene_id": gene_id,
-            "start":   gene_data.get("start", 0),
-            "end":     gene_data.get("end", 0),
+    for gene_id, gene_data in normal_genes:
+        validation["normal_genes"].append({
+            "gene_id":    gene_id,
+            "complexity": complexity_cache[gene_id],
+            "start":      gene_data.get("start", 0),
+            "end":        gene_data.get("end", 0),
         })
         validation["all_ids"].add(gene_id)
 
@@ -336,7 +346,7 @@ def save_validation_set(validation, output_path):
     save_data = {
         "long_genes":   validation["long_genes"],
         "complex_loci": validation["complex_loci"],
-        "rare_samples": validation["rare_samples"],
+        "normal_genes": validation["normal_genes"],
         "easy_samples": validation["easy_samples"],
         "all_ids":      list(validation["all_ids"]),
         "scenarios":    validation["scenarios"],
@@ -346,11 +356,11 @@ def save_validation_set(validation, output_path):
         json.dump(save_data, f, indent=2)
 
     print(f"\n  Validation Set:")
-    print(f"    Long genes:     {len(validation['long_genes'])}")
-    print(f"    Complex loci:   {len(validation['complex_loci'])}")
-    print(f"    Rare samples:   {len(validation['rare_samples'])}")
-    print(f"    Easy samples:   {len(validation['easy_samples'])}")
-    print(f"    Total genes:    {len(validation['all_ids'])}")
-    print(f"    Scenarios:      {len(validation['scenarios'])}")
+    print(f"    Long genes:    {len(validation['long_genes'])}")
+    print(f"    Complex loci:  {len(validation['complex_loci'])}")
+    print(f"    Normal genes:  {len(validation['normal_genes'])}")
+    print(f"    Easy samples:  {len(validation['easy_samples'])}")
+    print(f"    Total genes:   {len(validation['all_ids'])}")
+    print(f"    Scenarios:     {len(validation['scenarios'])}")
 
     return output_path

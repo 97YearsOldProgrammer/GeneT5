@@ -55,8 +55,10 @@ COMPACT_SEP    = compacting.COMPACT_SEP
 ######################
 
 
-build_validation_set = validation.build_validation_set
-save_validation_set  = validation.save_validation_set
+build_validation_set       = validation.build_validation_set
+save_validation_set        = validation.save_validation_set
+compute_all_complexities   = validation.compute_all_complexities
+identify_mean_complexity_genes = validation.identify_mean_complexity_genes
 
 
 #####################
@@ -64,12 +66,13 @@ save_validation_set  = validation.save_validation_set
 #####################
 
 
-BinaryDatasetReader    = dataload.BinaryDatasetReader
-build_length_index     = dataload.build_length_index
-BinaryTrainDataset     = dataload.BinaryTrainDataset
-DynamicPaddingCollator = dataload.DynamicPaddingCollator
-CompactingCollator     = dataload.CompactingCollator
-SmartBatchSampler      = dataload.SmartBatchSampler
+BinaryDatasetReader     = dataload.BinaryDatasetReader
+build_length_index      = dataload.build_length_index
+BinaryTrainDataset      = dataload.BinaryTrainDataset
+DynamicPaddingCollator  = dataload.DynamicPaddingCollator
+BatchTokenizingCollator = dataload.BatchTokenizingCollator
+CompactingCollator      = dataload.CompactingCollator
+SmartBatchSampler       = dataload.SmartBatchSampler
 
 
 ###################

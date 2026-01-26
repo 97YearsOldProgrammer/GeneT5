@@ -1,5 +1,6 @@
 import json
 import random
+from concurrent.futures import ThreadPoolExecutor
 
 import lib.dataset._binary as binary
 
@@ -10,7 +11,7 @@ import lib.dataset._binary as binary
 
 
 class BinaryDatasetReader:
-    """Lazy reader for binary training files"""
+    """Lazy reader for binary training files with batch tokenization support"""
 
     def __init__(self, binary_path, tokenizer=None):
 
@@ -26,21 +27,35 @@ class BinaryDatasetReader:
 
     @property
     def lengths(self):
-        """Get actual token lengths (requires tokenizer)"""
+        """Get actual token lengths using batch tokenization"""
 
         if self._lengths is None:
-            self._lengths = []
-            for i in range(self._num_chunks):
-                chunk  = binary.read_chunk_at_index(self.binary_path, i)
-                sample = self._format_sample(chunk)
-
-                if self.tokenizer:
-                    input_ids = self.tokenizer.encode(sample["input_text"], add_special_tokens=False)
-                    self._lengths.append(len(input_ids))
-                else:
-                    self._lengths.append(len(sample["input_text"]) // 4)
-
+            self._lengths = self._compute_lengths_batched()
         return self._lengths
+
+    def _compute_lengths_batched(self, batch_size=256):
+        """Compute lengths using batched tokenization for efficiency"""
+
+        lengths = []
+
+        # Collect all input texts first
+        all_texts = []
+        for i in range(self._num_chunks):
+            chunk = binary.read_chunk_at_index(self.binary_path, i)
+            all_texts.append(chunk.get_input_text())
+
+        if self.tokenizer is None:
+            # Fallback: rough estimate
+            lengths = [len(text) // 4 for text in all_texts]
+        else:
+            # Batch tokenize for efficiency
+            for i in range(0, len(all_texts), batch_size):
+                batch       = all_texts[i:i + batch_size]
+                encoded     = self.tokenizer(batch, add_special_tokens=False, padding=False, truncation=False)
+                batch_lens  = [len(ids) for ids in encoded["input_ids"]]
+                lengths.extend(batch_lens)
+
+        return lengths
 
     def _format_sample(self, chunk):
         """Format chunk as input/target text using BinaryChunk methods"""
@@ -68,9 +83,16 @@ class BinaryDatasetReader:
         chunk = self.get_chunk(idx)
         return self._format_sample(chunk)
 
+    def get_samples_batched(self, indices):
+        """Get multiple samples with batched tokenization"""
 
-def build_length_index(binary_path, tokenizer=None):
-    """Build length index for smart batching"""
+        chunks  = [self.get_chunk(i) for i in indices]
+        samples = [self._format_sample(c) for c in chunks]
+        return samples
+
+
+def build_length_index(binary_path, tokenizer=None, batch_size=256):
+    """Build length index for smart batching using batch tokenization"""
 
     reader = BinaryDatasetReader(binary_path, tokenizer)
     return reader.lengths
@@ -118,7 +140,7 @@ def get_binary_stats(binary_path):
 
 
 class BinaryTrainDataset:
-    """Dataset wrapper for binary training files"""
+    """Dataset wrapper for binary training files with batch tokenization"""
 
     def __init__(self, binary_path, tokenizer, max_input_len, max_target_len, seed=42):
 
@@ -134,6 +156,10 @@ class BinaryTrainDataset:
         self._reader = BinaryDatasetReader(binary_path, tokenizer)
         self.lengths = None
 
+        # Cache for batched samples
+        self._sample_cache = {}
+        self._cache_size   = 1000
+
     def build_length_index(self):
         """Build length index for smart batching"""
 
@@ -144,6 +170,7 @@ class BinaryTrainDataset:
     def set_epoch(self, epoch):
 
         self.epoch = epoch
+        self._sample_cache.clear()
 
     def __len__(self):
 
@@ -169,6 +196,36 @@ class BinaryTrainDataset:
             "attention_mask": [1] * len(input_ids),
             "labels":         target_ids,
         }
+
+    def get_batch_tokenized(self, indices):
+        """Get a batch of samples with batched tokenization (more efficient)"""
+
+        samples     = self._reader.get_samples_batched(indices)
+        input_texts = [s["input_text"] for s in samples]
+        target_texts = [s["target_text"] for s in samples]
+
+        # Batch tokenize
+        input_enc  = self.tokenizer(input_texts, add_special_tokens=False, padding=False, truncation=False)
+        target_enc = self.tokenizer(target_texts, add_special_tokens=False, padding=False, truncation=False)
+
+        results = []
+        for i in range(len(indices)):
+            input_ids  = input_enc["input_ids"][i]
+            target_ids = target_enc["input_ids"][i]
+
+            if len(input_ids) > self.max_input_len:
+                input_ids = input_ids[:self.max_input_len]
+
+            if len(target_ids) > self.max_target_len:
+                target_ids = target_ids[:self.max_target_len]
+
+            results.append({
+                "input_ids":      input_ids,
+                "attention_mask": [1] * len(input_ids),
+                "labels":         target_ids,
+            })
+
+        return results
 
 
 ######################
@@ -205,7 +262,53 @@ class DynamicPaddingCollator:
                 lbl_pad = max_target_len - lbl_len
                 labels.append(b["labels"] + [self.label_pad] * lbl_pad)
 
-        # Return as lists - caller converts to tensors
+        result = {
+            "input_ids":      input_ids,
+            "attention_mask": attention_mask,
+        }
+
+        if labels:
+            result["labels"] = labels
+
+        return result
+
+
+class BatchTokenizingCollator:
+    """Collator that uses batch tokenization for efficiency"""
+
+    def __init__(self, tokenizer, dataset, pad_token_id=None, label_pad=-100):
+
+        self.tokenizer    = tokenizer
+        self.dataset      = dataset
+        self.pad_token_id = pad_token_id or tokenizer.pad_token_id
+        self.label_pad    = label_pad
+
+    def __call__(self, indices):
+        """Collate using batch tokenization"""
+
+        # Get batch with batched tokenization
+        batch = self.dataset.get_batch_tokenized(indices)
+
+        # Dynamic padding
+        max_input_len  = max(len(b["input_ids"]) for b in batch)
+        max_target_len = max(len(b["labels"]) for b in batch) if batch[0]["labels"] else 0
+
+        input_ids      = []
+        attention_mask = []
+        labels         = []
+
+        for b in batch:
+            inp_len = len(b["input_ids"])
+            pad_len = max_input_len - inp_len
+
+            input_ids.append(b["input_ids"] + [self.pad_token_id] * pad_len)
+            attention_mask.append(b["attention_mask"] + [0] * pad_len)
+
+            if max_target_len > 0:
+                lbl_len = len(b["labels"])
+                lbl_pad = max_target_len - lbl_len
+                labels.append(b["labels"] + [self.label_pad] * lbl_pad)
+
         result = {
             "input_ids":      input_ids,
             "attention_mask": attention_mask,
@@ -231,7 +334,6 @@ class CompactingCollator:
     def __call__(self, batch):
         """Collate batch with proper attention masks for compacted samples"""
 
-        # Group by compact_group
         groups = {}
         for item in batch:
             group_id = item.get("compact_group", id(item))
@@ -267,7 +369,6 @@ class CompactingCollator:
 
                 segment_starts.append(len(packed_input))
 
-                # Build block-diagonal decoder mask
                 seq_len      = len(packed_labels)
                 decoder_mask = [[0] * seq_len for _ in range(seq_len)]
 
@@ -285,7 +386,6 @@ class CompactingCollator:
                 all_labels.append(packed_labels)
                 all_decoder_masks.append(decoder_mask)
 
-        # Pad to max length
         max_input_len = max(len(x) for x in all_input_ids)
         max_label_len = max(len(x) for x in all_labels)
 

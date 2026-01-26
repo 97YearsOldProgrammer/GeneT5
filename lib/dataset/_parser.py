@@ -1,393 +1,236 @@
-import json
-import random
+import gzip
+import re
+from collections import defaultdict
 
-import lib.dataset._binary as binary
+
+###################
+#####  FASTA  #####
+###################
+
+
+def parse_fasta(fasta_path):
+    """Parse FASTA file (handles gzipped files)"""
+
+    sequences = {}
+    current_id = None
+    current_seq = []
+
+    open_func = gzip.open if str(fasta_path).endswith('.gz') else open
+    mode = 'rt' if str(fasta_path).endswith('.gz') else 'r'
+
+    with open_func(fasta_path, mode) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+
+            if line.startswith('>'):
+                if current_id is not None:
+                    sequences[current_id] = ''.join(current_seq)
+
+                # Parse header: >seqid description
+                header = line[1:].split()[0]
+                current_id = header
+                current_seq = []
+            else:
+                current_seq.append(line.upper())
+
+    # Add last sequence
+    if current_id is not None:
+        sequences[current_id] = ''.join(current_seq)
+
+    return sequences
 
 
 #################
-#####  I/O  #####
+#####  GFF  #####
 #################
 
 
-class BinaryDatasetReader:
-    """Lazy reader for binary training files"""
+def parse_gff_attributes(attr_string):
+    """Parse GFF3 attribute string into dict"""
+
+    attrs = {}
+    if not attr_string or attr_string == '.':
+        return attrs
+
+    for part in attr_string.split(';'):
+        part = part.strip()
+        if not part:
+            continue
+
+        if '=' in part:
+            key, value = part.split('=', 1)
+            attrs[key] = value
+
+    return attrs
+
+
+def parse_gff(gff_path):
+    """Parse GFF3 file (handles gzipped files)"""
+
+    features = []
+
+    open_func = gzip.open if str(gff_path).endswith('.gz') else open
+    mode = 'rt' if str(gff_path).endswith('.gz') else 'r'
+
+    with open_func(gff_path, mode) as f:
+        for line in f:
+            line = line.strip()
+
+            # Skip empty lines and comments
+            if not line or line.startswith('#'):
+                continue
+
+            parts = line.split('\t')
+            if len(parts) < 9:
+                continue
+
+            seqid   = parts[0]
+            source  = parts[1]
+            ftype   = parts[2]
+            start   = int(parts[3])
+            end     = int(parts[4])
+            score   = parts[5]
+            strand  = parts[6]
+            phase   = parts[7]
+            attrs   = parse_gff_attributes(parts[8])
+
+            feature = {
+                "seqid":      seqid,
+                "source":     source,
+                "type":       ftype,
+                "start":      start,
+                "end":        end,
+                "score":      score,
+                "strand":     strand,
+                "phase":      phase,
+                "attributes": attrs,
+            }
+
+            features.append(feature)
+
+    return features
+
+
+########################
+#####  Gene Index  #####
+########################
+
+
+def build_gene_index(features):
+    """Build hierarchical gene index from GFF features"""
+
+    gene_index = {}
+    transcript_map = {}
+
+    # First pass: collect genes and transcripts
+    for feat in features:
+        ftype = feat["type"].lower()
+        attrs = feat.get("attributes", {})
+
+        if ftype == "gene":
+            gene_id = attrs.get("ID", "")
+            if gene_id:
+                gene_index[gene_id] = {
+                    "seqid":       feat["seqid"],
+                    "start":       feat["start"],
+                    "end":         feat["end"],
+                    "strand":      feat["strand"],
+                    "transcripts": {},
+                    "features":    [],
+                    "attributes":  attrs,
+                }
+
+        elif ftype in ("mrna", "transcript", "ncrna", "lncrna", "rrna", "trna", "snorna", "mirna", "pseudogenic_transcript"):
+            transcript_id = attrs.get("ID", "")
+            parent_gene   = attrs.get("Parent", "")
+
+            if transcript_id and parent_gene:
+                biotype = attrs.get("biotype", attrs.get("transcript_biotype", ftype))
 
-    def __init__(self, binary_path, tokenizer=None):
+                transcript_map[transcript_id] = {
+                    "gene_id":  parent_gene,
+                    "biotype":  biotype,
+                    "start":    feat["start"],
+                    "end":      feat["end"],
+                    "strand":   feat["strand"],
+                    "features": [],
+                }
 
-        self.binary_path = binary_path
-        self.tokenizer   = tokenizer
-        self._info       = binary.get_binary_info(binary_path)
-        self._num_chunks = self._info["num_chunks"]
-        self._lengths    = None
+    # Second pass: assign transcripts to genes
+    for t_id, t_data in transcript_map.items():
+        gene_id = t_data["gene_id"]
+        if gene_id in gene_index:
+            gene_index[gene_id]["transcripts"][t_id] = {
+                "biotype":  t_data["biotype"],
+                "start":    t_data["start"],
+                "end":      t_data["end"],
+                "strand":   t_data["strand"],
+                "features": [],
+            }
 
-    def __len__(self):
+    # Third pass: assign child features (exons, CDS, etc.) to transcripts and genes
+    child_types = {"exon", "cds", "five_prime_utr", "three_prime_utr", "start_codon", "stop_codon", "intron"}
 
-        return self._num_chunks
+    for feat in features:
+        ftype = feat["type"].lower()
 
-    @property
-    def lengths(self):
-        """Get actual token lengths (requires tokenizer)"""
+        if ftype not in child_types:
+            continue
 
-        if self._lengths is None:
-            self._lengths = []
-            for i in range(self._num_chunks):
-                chunk  = binary.read_chunk_at_index(self.binary_path, i)
-                sample = self._format_sample(chunk)
+        attrs  = feat.get("attributes", {})
+        parent = attrs.get("Parent", "")
 
-                if self.tokenizer:
-                    input_ids = self.tokenizer.encode(sample["input_text"], add_special_tokens=False)
-                    self._lengths.append(len(input_ids))
-                else:
-                    self._lengths.append(len(sample["input_text"]) // 4)
+        if not parent:
+            continue
 
-        return self._lengths
+        # Parent could be transcript
+        if parent in transcript_map:
+            t_data  = transcript_map[parent]
+            gene_id = t_data["gene_id"]
 
-    def _format_sample(self, chunk):
-        """Format chunk as input/target text using BinaryChunk methods"""
+            if gene_id in gene_index:
+                # Add to gene's features
+                gene_index[gene_id]["features"].append(feat)
 
-        input_text  = chunk.get_input_text()
-        target_text = chunk.get_target_text()
+                # Add to transcript's features
+                if parent in gene_index[gene_id]["transcripts"]:
+                    gene_index[gene_id]["transcripts"][parent]["features"].append(feat)
 
-        return {
-            "input_text":  input_text,
-            "target_text": target_text,
-            "gene_ids":    chunk.gene_ids,
-            "seqid":       chunk.seqid,
-            "start":       chunk.start,
-            "end":         chunk.end,
-        }
+        # Parent could be gene directly (some GFF formats)
+        elif parent in gene_index:
+            gene_index[parent]["features"].append(feat)
 
-    def get_chunk(self, idx):
-        """Get raw chunk at index"""
+    return gene_index
 
-        return binary.read_chunk_at_index(self.binary_path, idx)
 
-    def get_sample(self, idx):
-        """Get formatted sample at index"""
+###########################
+#####  Token Extract  #####
+###########################
 
-        chunk = self.get_chunk(idx)
-        return self._format_sample(chunk)
 
+def extract_feature_types(features):
+    """Extract unique feature types from features list"""
 
-def build_length_index(binary_path, tokenizer=None):
-    """Build length index for smart batching"""
+    types = set()
+    for feat in features:
+        ftype = feat.get("type", "").lower()
+        if ftype:
+            types.add(ftype)
+    return types
 
-    reader = BinaryDatasetReader(binary_path, tokenizer)
-    return reader.lengths
 
+def extract_biotypes(features):
+    """Extract unique biotypes from features list"""
 
-#######################
-#####  Utilities  #####
-#######################
+    biotypes = set()
+    for feat in features:
+        attrs = feat.get("attributes", {})
 
+        for key in ("biotype", "transcript_biotype", "gene_biotype"):
+            bt = attrs.get(key, "")
+            if bt:
+                biotypes.add(bt.lower())
 
-def get_binary_stats(binary_path):
-    """Get statistics about a binary dataset file"""
-
-    info       = binary.get_binary_info(binary_path)
-    num_chunks = info["num_chunks"]
-
-    raw_count      = 0
-    aug_count      = 0
-    total_features = 0
-    total_hints    = 0
-
-    for i in range(num_chunks):
-        chunk = binary.read_chunk_at_index(binary_path, i)
-        if chunk.is_augmented:
-            aug_count += 1
-        else:
-            raw_count += 1
-        total_features += len(chunk.features)
-        total_hints    += len(chunk.hints) if chunk.has_hints else 0
-
-    return {
-        "num_chunks":     num_chunks,
-        "raw_count":      raw_count,
-        "aug_count":      aug_count,
-        "total_features": total_features,
-        "total_hints":    total_hints,
-        "compressed":     info["compressed"],
-        "total_size":     info["total_size"],
-    }
-
-
-#####################
-#####  Dataset  #####
-#####################
-
-
-class BinaryTrainDataset:
-    """Dataset wrapper for binary training files"""
-
-    def __init__(self, binary_path, tokenizer, max_input_len, max_target_len, seed=42):
-
-        self.binary_path    = binary_path
-        self.tokenizer      = tokenizer
-        self.max_input_len  = max_input_len
-        self.max_target_len = max_target_len
-        self.seed           = seed
-        self.epoch          = 0
-
-        self._info   = binary.get_binary_info(binary_path)
-        self._length = self._info["num_chunks"]
-        self._reader = BinaryDatasetReader(binary_path, tokenizer)
-        self.lengths = None
-
-    def build_length_index(self):
-        """Build length index for smart batching"""
-
-        if self.lengths is None:
-            self.lengths = self._reader.lengths
-        return self.lengths
-
-    def set_epoch(self, epoch):
-
-        self.epoch = epoch
-
-    def __len__(self):
-
-        return self._length
-
-    def __getitem__(self, idx):
-
-        random.seed(self.seed + self.epoch * len(self) + idx)
-
-        sample = self._reader.get_sample(idx)
-
-        input_ids  = self.tokenizer.encode(sample["input_text"], add_special_tokens=False)
-        target_ids = self.tokenizer.encode(sample["target_text"], add_special_tokens=False)
-
-        if len(input_ids) > self.max_input_len:
-            input_ids = input_ids[:self.max_input_len]
-
-        if len(target_ids) > self.max_target_len:
-            target_ids = target_ids[:self.max_target_len]
-
-        return {
-            "input_ids":      input_ids,
-            "attention_mask": [1] * len(input_ids),
-            "labels":         target_ids,
-        }
-
-
-######################
-#####  Collator  #####
-######################
-
-
-class DynamicPaddingCollator:
-    """Collator that pads batches dynamically"""
-
-    def __init__(self, pad_token_id, label_pad=-100):
-
-        self.pad_token_id = pad_token_id
-        self.label_pad    = label_pad
-
-    def __call__(self, batch):
-
-        max_input_len  = max(len(b["input_ids"]) for b in batch)
-        max_target_len = max(len(b["labels"]) for b in batch) if batch[0]["labels"] else 0
-
-        input_ids      = []
-        attention_mask = []
-        labels         = []
-
-        for b in batch:
-            inp_len = len(b["input_ids"])
-            pad_len = max_input_len - inp_len
-
-            input_ids.append(b["input_ids"] + [self.pad_token_id] * pad_len)
-            attention_mask.append(b["attention_mask"] + [0] * pad_len)
-
-            if max_target_len > 0:
-                lbl_len = len(b["labels"])
-                lbl_pad = max_target_len - lbl_len
-                labels.append(b["labels"] + [self.label_pad] * lbl_pad)
-
-        # Return as lists - caller converts to tensors
-        result = {
-            "input_ids":      input_ids,
-            "attention_mask": attention_mask,
-        }
-
-        if labels:
-            result["labels"] = labels
-
-        return result
-
-
-class CompactingCollator:
-    """Collator for compacted samples with block-diagonal decoder attention"""
-
-    def __init__(self, tokenizer, pad_token_id=None, label_pad=-100, sep_token="[SEP]"):
-
-        self.tokenizer    = tokenizer
-        self.pad_token_id = pad_token_id or tokenizer.pad_token_id
-        self.label_pad    = label_pad
-        self.sep_token    = sep_token
-        self.sep_token_id = tokenizer.convert_tokens_to_ids(sep_token)
-
-    def __call__(self, batch):
-        """Collate batch with proper attention masks for compacted samples"""
-
-        # Group by compact_group
-        groups = {}
-        for item in batch:
-            group_id = item.get("compact_group", id(item))
-            if group_id not in groups:
-                groups[group_id] = []
-            groups[group_id].append(item)
-
-        all_input_ids       = []
-        all_attention_masks = []
-        all_labels          = []
-        all_decoder_masks   = []
-
-        for group_id, items in groups.items():
-            if len(items) == 1:
-                item = items[0]
-                all_input_ids.append(item["input_ids"])
-                all_attention_masks.append([1] * len(item["input_ids"]))
-                all_labels.append(item["labels"])
-                all_decoder_masks.append(None)
-            else:
-                packed_input   = []
-                packed_labels  = []
-                segment_starts = []
-
-                for i, item in enumerate(items):
-                    if i > 0:
-                        packed_input.append(self.sep_token_id)
-                        packed_labels.append(self.label_pad)
-
-                    segment_starts.append(len(packed_input))
-                    packed_input.extend(item["input_ids"])
-                    packed_labels.extend(item["labels"])
-
-                segment_starts.append(len(packed_input))
-
-                # Build block-diagonal decoder mask
-                seq_len      = len(packed_labels)
-                decoder_mask = [[0] * seq_len for _ in range(seq_len)]
-
-                for seg_idx in range(len(segment_starts) - 1):
-                    start = segment_starts[seg_idx]
-                    end   = segment_starts[seg_idx + 1]
-
-                    for i in range(start, end):
-                        for j in range(start, end):
-                            if j <= i:
-                                decoder_mask[i][j] = 1
-
-                all_input_ids.append(packed_input)
-                all_attention_masks.append([1] * len(packed_input))
-                all_labels.append(packed_labels)
-                all_decoder_masks.append(decoder_mask)
-
-        # Pad to max length
-        max_input_len = max(len(x) for x in all_input_ids)
-        max_label_len = max(len(x) for x in all_labels)
-
-        padded_inputs    = []
-        padded_masks     = []
-        padded_labels    = []
-        padded_dec_masks = []
-
-        for i in range(len(all_input_ids)):
-            inp_len = len(all_input_ids[i])
-            lbl_len = len(all_labels[i])
-
-            inp_pad = max_input_len - inp_len
-            lbl_pad = max_label_len - lbl_len
-
-            padded_inputs.append(all_input_ids[i] + [self.pad_token_id] * inp_pad)
-            padded_masks.append(all_attention_masks[i] + [0] * inp_pad)
-            padded_labels.append(all_labels[i] + [self.label_pad] * lbl_pad)
-
-            if all_decoder_masks[i] is not None:
-                dec_mask = all_decoder_masks[i]
-                for row in dec_mask:
-                    row.extend([0] * lbl_pad)
-                for _ in range(lbl_pad):
-                    dec_mask.append([0] * max_label_len)
-                padded_dec_masks.append(dec_mask)
-            else:
-                padded_dec_masks.append(None)
-
-        result = {
-            "input_ids":      padded_inputs,
-            "attention_mask": padded_masks,
-            "labels":         padded_labels,
-        }
-
-        if any(m is not None for m in padded_dec_masks):
-            final_dec_masks = []
-            for i, mask in enumerate(padded_dec_masks):
-                if mask is None:
-                    seq_len = max_label_len
-                    causal  = [[1 if j <= i else 0 for j in range(seq_len)] for i in range(seq_len)]
-                    final_dec_masks.append(causal)
-                else:
-                    final_dec_masks.append(mask)
-
-            result["decoder_attention_mask"] = final_dec_masks
-
-        return result
-
-
-#####################
-#####  Sampler  #####
-#####################
-
-
-class SmartBatchSampler:
-    """Batch sampler that groups similar-length sequences"""
-
-    def __init__(self, lengths, batch_size, bucket_size=100, drop_last=False, shuffle=True):
-
-        self.lengths        = lengths
-        self.batch_size     = batch_size
-        self.bucket_size    = bucket_size
-        self.drop_last      = drop_last
-        self.shuffle        = shuffle
-        self.sorted_indices = sorted(range(len(lengths)), key=lambda i: lengths[i])
-
-    def __iter__(self):
-
-        buckets = []
-        bucket  = []
-
-        for idx in self.sorted_indices:
-            bucket.append(idx)
-            if len(bucket) >= self.bucket_size:
-                buckets.append(bucket)
-                bucket = []
-
-        if bucket:
-            buckets.append(bucket)
-
-        if self.shuffle:
-            random.shuffle(buckets)
-            for b in buckets:
-                random.shuffle(b)
-
-        all_indices = [idx for bucket in buckets for idx in bucket]
-        batches     = []
-
-        for i in range(0, len(all_indices), self.batch_size):
-            batch = all_indices[i:i + self.batch_size]
-            if len(batch) == self.batch_size or not self.drop_last:
-                batches.append(batch)
-
-        if self.shuffle:
-            random.shuffle(batches)
-
-        for batch in batches:
-            yield batch
-
-    def __len__(self):
-
-        if self.drop_last:
-            return len(self.lengths) // self.batch_size
-        return (len(self.lengths) + self.batch_size - 1) // self.batch_size
+    return biotypes

@@ -53,13 +53,13 @@ For sake of saving life, please use the [bake_data_wrapper](run_bake_data.py) in
 python3 bin/run_bake_data.py H.archaea E.coli --limit 9000 --threshold 50000
 ```
 
-| Taxa           | Limit    | Long Gene Upper Bound | Token Est. (@4.5bp) |
-| :------------: | :------: | :-------------------- | :------------------ |
-| Prokaryotes    | 9,000    | 50,000                | ~2k                 |
-| Unicellular    | 22,500   | 50,000                | ~5k                 |
-| Invertebrates  | 45,000   | 80,000                | ~10k                |
-| Vertebrates    | 90,000   | 150,000               | ~20k                |
-| Plants         | 45,000   | 60,000                | ~10k                |
+| Taxa           | Limit    | Token Est. (@4.5bp) 
+| :------------: | :------: | :------------------
+| Prokaryotes    | 9,000    | ~2k                 
+| Unicellular    | 22,500   | ~5k                 
+| Invertebrates  | 45,000   | ~10k                
+| Vertebrates    | 90,000   | ~20k                
+| Plants         | 45,000   | ~10k                
 
 
 ---

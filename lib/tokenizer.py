@@ -6,6 +6,7 @@ from pathlib import Path
 ##### Auxilary  #####
 #####################
 
+
 def load_tokenizer_config(tokenizer_path):
     """Load tokenizer.json config file"""
     
