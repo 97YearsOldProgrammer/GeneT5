@@ -100,10 +100,6 @@ def find_genome_files(species_dir):
     fasta_file = None
     
     for f in species_dir.iterdir():
-        # Skip macOS resource fork files
-        if f.name.startswith('._'):
-            continue
-        
         name_lower = f.name.lower()
         if name_lower.endswith('.gff.gz') or name_lower.endswith('.gff3.gz'):
             gff_file = f
@@ -171,13 +167,27 @@ def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_di
             try:
                 with open(log_file, 'r') as f:
                     lines = f.readlines()
-                # Find last meaningful lines
+                
+                # Filter out header lines
                 content_lines = [l.strip() for l in lines if l.strip() and not l.startswith('=')]
-                if len(content_lines) <= 4:  # Only header, no output
-                    error_msg = "Crashed immediately (likely OOM)"
+                
+                # Check if only header present (crashed immediately)
+                if len(content_lines) <= 4:
+                    error_msg = "Crashed immediately (likely OOM or file error)"
                 else:
-                    # Get last error line
-                    error_msg = content_lines[-1][:80] if content_lines else f"Exit code {result.returncode}"
+                    # Look for traceback or error
+                    for i, line in enumerate(lines):
+                        if 'Error' in line or 'Exception' in line or 'Killed' in line:
+                            error_msg = line.strip()[:100]
+                            break
+                        if 'MemoryError' in line:
+                            error_msg = "MemoryError (OOM)"
+                            break
+                    
+                    # Fallback: get last non-empty line
+                    if error_msg is None:
+                        non_empty = [l.strip() for l in lines if l.strip()]
+                        error_msg = non_empty[-1][:100] if non_empty else f"Exit code {result.returncode}"
             except Exception:
                 error_msg = f"Exit code {result.returncode}"
         
@@ -196,6 +206,7 @@ def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_di
             "error":    str(e),
             "log_file": str(log_file),
         }
+
 
 def process_species(args):
     """Worker function for parallel species processing"""

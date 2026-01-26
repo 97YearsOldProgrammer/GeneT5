@@ -240,11 +240,11 @@ def build_scenarios(gene_id, gene_data, seed=42):
 
 def build_validation_set(
     gene_groups,
-    top_k_long      = 5,
-    top_k_complex   = 5,
-    num_normal      = 5,
-    num_easy        = 5,
-    seed            = 42,
+    top_k_long    = 5,
+    top_k_complex = 5,
+    num_normal    = 5,
+    num_easy      = 5,
+    seed          = 42,
 ):
     """Build validation set using feature-based selection with cached complexity"""
 
@@ -252,12 +252,12 @@ def build_validation_set(
     complexity_cache = compute_all_complexities(gene_groups)
 
     validation = {
-        "long_genes":    [],
-        "complex_loci":  [],
-        "normal_genes":  [],
-        "easy_samples":  [],
-        "all_ids":       set(),
-        "scenarios":     [],
+        "long_genes":   [],
+        "complex_loci": [],
+        "normal_genes": [],
+        "easy_samples": [],
+        "all_ids":      set(),
+        "scenarios":    [],
     }
 
     # Get top K long genes
@@ -364,3 +364,15 @@ def save_validation_set(validation, output_path):
     print(f"    Scenarios:     {len(validation['scenarios'])}")
 
     return output_path
+
+
+def print_validation_stats(validation):
+    """Print validation statistics"""
+
+    print(f"\n  Validation:")
+    print(f"    Long genes:   {len(validation.get('long_genes', []))}")
+    print(f"    Complex loci: {len(validation.get('complex_loci', []))}")
+    print(f"    Normal genes: {len(validation.get('normal_genes', []))}")
+    print(f"    Easy samples: {len(validation.get('easy_samples', []))}")
+    print(f"    Total genes:  {len(validation.get('all_ids', []))}")
+    print(f"    Scenarios:    {len(validation.get('scenarios', []))}")
