@@ -325,13 +325,11 @@ def build_gt5(
     print(f"\n[8] Random Init Decoder FFN (std={ffn_std}, router_std={router_std})")
     for layer in decoder.layers:
         if decoder_use_moe:
-            # MoE experts
-            if hasattr(layer.ff, 'experts'):
-                for expert in layer.ff.experts:
-                    if hasattr(expert, 'wi_gate'):
-                        nn.init.normal_(expert.wi_gate.weight, mean=0.0, std=ffn_std)
-                        nn.init.normal_(expert.wi_up.weight, mean=0.0, std=ffn_std)
-                        nn.init.normal_(expert.wo.weight, mean=0.0, std=ffn_std)
+            # MoE fused expert weights
+            if hasattr(layer.ff, 'expert_weights'):
+                nn.init.normal_(layer.ff.expert_weights.gate_weights, mean=0.0, std=ffn_std)
+                nn.init.normal_(layer.ff.expert_weights.up_weights, mean=0.0, std=ffn_std)
+                nn.init.normal_(layer.ff.expert_weights.down_weights, mean=0.0, std=ffn_std)
             # MoE router
             if hasattr(layer.ff, 'gate'):
                 nn.init.normal_(layer.ff.gate.weight, mean=0.0, std=router_std)

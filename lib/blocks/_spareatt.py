@@ -40,6 +40,7 @@ def sparse_attention_fwd_kernel(
     block_indices_ptr,
     seq_len, num_heads, head_dim,
     num_global_tokens, blocks_per_query,
+    start_block_idx,
     stride_qb, stride_qh, stride_qs, stride_qd,
     stride_kb, stride_kh, stride_ks, stride_kd,
     stride_vb, stride_vh, stride_vs, stride_vd,
@@ -58,7 +59,7 @@ def sparse_attention_fwd_kernel(
 
     pid_batch   = tl.program_id(0)
     pid_head    = tl.program_id(1)
-    pid_q_block = tl.program_id(2)
+    pid_q_block = tl.program_id(2) + start_block_idx
 
     q_block_start = pid_q_block * BLOCK_M
     offs_m        = q_block_start + tl.arange(0, BLOCK_M)
@@ -428,7 +429,8 @@ class SparseAttention(nn.Module):
         num_blocks       = L_padded // self.block_size
         blocks_per_query = block_indices.shape[1]
 
-        num_nonglobal_blocks = num_blocks - (self.num_global_tokens // self.block_size)
+        num_global_blocks    = self.num_global_tokens // self.block_size
+        num_nonglobal_blocks = num_blocks - num_global_blocks
         grid_sparse          = (B, self.num_heads, num_nonglobal_blocks)
 
         sparse_attention_fwd_kernel[grid_sparse](
@@ -437,6 +439,7 @@ class SparseAttention(nn.Module):
             block_indices,
             L_padded, self.num_heads, self.head_dim,
             self.num_global_tokens, blocks_per_query,
+            num_global_blocks,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
