@@ -11,11 +11,3 @@ from lib.util._databaker import (
     collect_species_stats,
     write_bake_summary,
 )
-
-from lib.util._memory import (
-    get_memory_usage_pct,
-    get_memory_info,
-    wait_for_memory,
-    can_submit_new_work,
-    HAS_PSUTIL,
-)
