@@ -3,7 +3,6 @@ from lib.dataset.wrapper import (
     # Parser
     parse_fasta,
     parse_gff,
-    build_gene_index,
     extract_feature_types,
     extract_biotypes,
     
