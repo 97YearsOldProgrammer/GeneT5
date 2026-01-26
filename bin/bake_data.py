@@ -5,7 +5,6 @@ import argparse
 import subprocess
 import multiprocessing
 import pathlib
-import time
 import concurrent.futures
 
 import lib.util as util
