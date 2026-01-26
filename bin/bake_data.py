@@ -103,41 +103,48 @@ with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
         
         except Exception as e:
             failed += 1
+            results.append({"species": species_name, "success": False, "error": str(e)})
             print(f"  ✗ {species_name}: {e}")
 
 print(f"\n{' Processing Results ':=^60}")
 print(f"  Success: {success}")
 print(f"  Failed:  {failed}")
 
+# Track tokenizer and compact results for summary
+tokenizer_result = None
+compact_result   = None
+
 if args.tokenizer and not args.skip_tokenizer_expansion and success > 0:
     print(f"\n{' Tokenizer Expansion ':=^60}")
     
     if not token_file.exists():
         print(f"  WARNING: Token file not found: {token_file}")
+        tokenizer_result = {"success": False, "error": "Token file not found"}
     else:
         with open(token_file, 'r') as f:
             tokens = [line.strip() for line in f if line.strip()]
         print(f"  Tokens extracted: {len(tokens)}")
         
         if tokens:
-            expansion_result = util.run_tokenizer_expansion(
+            tokenizer_result = util.run_tokenizer_expansion(
                 str(token_file),
                 args.tokenizer,
             )
             
-            if expansion_result["success"]:
+            if tokenizer_result["success"]:
                 print(f"  ✓ Tokenizer expansion complete")
-                if expansion_result.get("stdout"):
-                    for line in expansion_result["stdout"].split('\n'):
+                if tokenizer_result.get("stdout"):
+                    for line in tokenizer_result["stdout"].split('\n'):
                         if line.strip() and not line.startswith('='):
                             print(f"    {line.strip()}")
             else:
-                error = expansion_result.get("error", "Unknown error")
+                error = tokenizer_result.get("error", "Unknown error")
                 print(f"  ✗ Tokenizer expansion failed: {error}")
-                if expansion_result.get("stderr"):
-                    print(f"    {expansion_result['stderr']}")
+                if tokenizer_result.get("stderr"):
+                    print(f"    {tokenizer_result['stderr']}")
         else:
             print(f"  No new tokens to add")
+            tokenizer_result = {"success": True, "tokens_in_file": 0, "message": "No tokens"}
 
 if args.compact and success > 0:
     print(f"\n{' Compacting ':=^60}")
@@ -146,13 +153,15 @@ if args.compact and success > 0:
     
     if not training_files:
         print("  No training.bin files found!")
+        compact_result = {"success": False, "error": "No training.bin files found"}
     else:
         print(f"  Found {len(training_files)} training files")
         
+        output_path = baked_dir / "all_training.bin"
         compact_cmd = [
             "python3", "bin/compact.py",
         ] + [str(f) for f in training_files] + [
-            "-o", str(baked_dir / "all_training.bin"),
+            "-o", str(output_path),
         ]
         
         if args.tokenizer:
@@ -166,10 +175,63 @@ if args.compact and success > 0:
         
         if result.returncode == 0:
             print(f"  ✓ Compacting complete")
+            output_size = output_path.stat().st_size if output_path.exists() else 0
+            compact_result = {
+                "success": True,
+                "output":  str(output_path),
+                "size":    f"{output_size / 1024 / 1024:.2f} MB",
+            }
         else:
             print(f"  ✗ Compacting failed")
             if result.stderr:
                 print(f"    {result.stderr}")
+            compact_result = {"success": False, "error": result.stderr or "Unknown error"}
+
+# Collect stats and write summary
+print(f"\n{' Collecting Statistics ':=^60}")
+
+species_stats = []
+for sp, limit, taxa in species_to_process:
+    stats = util.collect_species_stats(baked_dir, sp)
+    stats["taxa"]  = taxa
+    stats["limit"] = limit
+    species_stats.append(stats)
+
+# Build run config for summary
+run_config = {
+    "raw_dir":        str(raw_dir),
+    "baked_dir":      str(baked_dir),
+    "n_workers":      n_workers,
+    "tokenizer":      args.tokenizer,
+    "compact":        args.compact,
+    "compact_target": args.compact_target,
+}
+
+# Write comprehensive summary
+summary_path = log_dir / "bake_summary.log"
+util.write_bake_summary(
+    summary_path,
+    run_config,
+    results,
+    species_stats,
+    tokenizer_result,
+    compact_result,
+)
+
+print(f"  Summary written: {summary_path}")
+
+# Print quick stats
+total_chunks = sum(s["train_chunks"] for s in species_stats)
+total_val    = sum(s["val_chunks"] for s in species_stats)
+total_long   = sum(s["long_genes"] for s in species_stats)
+total_complex = sum(s["complex_loci"] for s in species_stats)
+
+print(f"\n{' Quick Summary ':=^60}")
+print(f"  Species processed: {success}/{len(species_to_process)}")
+print(f"  Training chunks:   {total_chunks:,}")
+print(f"  Validation chunks: {total_val:,}")
+print(f"  Long genes:        {total_long}")
+print(f"  Complex loci:      {total_complex}")
 
 print(f"\n{'='*60}")
 print("Done!")
