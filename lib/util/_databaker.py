@@ -100,6 +100,10 @@ def find_genome_files(species_dir):
     fasta_file = None
     
     for f in species_dir.iterdir():
+        # Skip hidden files and macOS resource forks (._*)
+        if f.name.startswith('.'):
+            continue
+        
         name_lower = f.name.lower()
         if name_lower.endswith('.gff.gz') or name_lower.endswith('.gff3.gz'):
             gff_file = f
