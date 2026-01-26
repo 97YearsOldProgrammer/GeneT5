@@ -73,25 +73,21 @@ def calculate_complexity(gene_data):
 #######################
 
 
-def identify_long_genes(gene_groups, threshold_bp=50000, top_k=None):
-    """Identify genes longer than threshold"""
+def identify_long_genes(gene_groups, top_k=5):
+    """Identify top-k longest genes"""
 
-    long_genes = []
+    scored = []
 
     for gene_id, gene_data in gene_groups.items():
         gene_start = gene_data.get("start", 0)
         gene_end   = gene_data.get("end", 0)
         gene_len   = gene_end - gene_start + 1
 
-        if gene_len > threshold_bp:
-            long_genes.append((gene_id, gene_data, gene_len))
+        scored.append((gene_id, gene_data, gene_len))
 
-    long_genes = sorted(long_genes, key=lambda x: -x[2])
+    scored.sort(key=lambda x: -x[2])
 
-    if top_k is not None and top_k > 0:
-        long_genes = long_genes[:top_k]
-
-    return long_genes
+    return scored[:top_k]
 
 
 def identify_complex_loci(gene_groups, top_k=5):
@@ -242,7 +238,6 @@ def build_scenarios(gene_id, gene_data, seed=42):
 
 def build_validation_set(
     gene_groups,
-    long_threshold   = 50000,
     top_k_long       = 5,
     top_k_complex    = 5,
     num_rare_samples = 10,
@@ -261,7 +256,7 @@ def build_validation_set(
     }
 
     # Get top K long genes
-    long_genes = identify_long_genes(gene_groups, long_threshold, top_k_long)
+    long_genes = identify_long_genes(gene_groups, top_k_long)
     for gene_id, gene_data, length in long_genes:
         validation["long_genes"].append({
             "gene_id": gene_id,

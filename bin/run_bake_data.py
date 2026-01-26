@@ -4,6 +4,7 @@ import sys
 import subprocess
 from pathlib import Path
 
+
 def main():
 
     parser = argparse.ArgumentParser(
@@ -12,8 +13,6 @@ def main():
         help="List of species names (e.g., H.archaea E.coli)")
     parser.add_argument("--limit", type=int, default=25000, 
         help="Chunk size limit in bp")
-    parser.add_argument("--threshold", type=int, default=50000, 
-        help="Long gene threshold in bp")
     parser.add_argument("--top_k_long", type=int, default=5, 
         help="Top K long genes for validation")
     
@@ -47,7 +46,6 @@ def main():
             str(gff_path),
             str(baked_dir),
             "--limit", str(args.limit),
-            "--long_threshold", str(args.threshold),
             "--top_k_long", str(args.top_k_long),
             "--extract_tokens", "data/new_tokens.txt",
         ]
