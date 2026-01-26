@@ -11,6 +11,9 @@ from transformers     import get_cosine_schedule_with_warmup
 
 import lib.dataset as ds
 
+from lib.tokenizer 	import GeneTokenizer
+from lib.model 		import GeneT5
+
 
 DEFAULTS = {
 	'max_input_len':  4096,
@@ -93,15 +96,11 @@ def main():
 	output_dir.mkdir(parents=True, exist_ok=True)
 
 	# load tokenizer
-	from lib.tokenizer import GeneTokenizer
-
 	print(f"\nLoading tokenizer...")
 	tokenizer = GeneTokenizer(pathlib.Path(args.model_path))
 	print(f"  Vocab size: {len(tokenizer)}")
 
 	# load model
-	from lib.model import GeneT5
-
 	print(f"\nLoading model...")
 	model = GeneT5.from_pretrained(pathlib.Path(args.model_path), device='cpu', dtype=torch.float32)
 	model = model.to(device)
