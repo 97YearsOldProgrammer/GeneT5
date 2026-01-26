@@ -18,14 +18,14 @@ import triton.language as tl
 
 @dataclass
 class GQAttentionConfig:
-    embed_dim:        int   = 768
-    num_heads:        int   = 12
-    num_kv_heads:     int   = 4
-    head_dim:         int   = None
-    dropout:          float = 0.0
-    use_alibi:        bool  = False
-    max_seq_len:      int   = 8192
-    is_cross_attn:    bool  = True
+    embed_dim:     int   = 768
+    num_heads:     int   = 12
+    num_kv_heads:  int   = 4
+    head_dim:      int   = None
+    dropout:       float = 0.0
+    use_alibi:     bool  = False
+    max_seq_len:   int   = 8192
+    is_cross_attn: bool  = True
 
 
 ######################
@@ -47,68 +47,67 @@ def gqa_cross_attention_fwd_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """Forward pass for Grouped Query Attention cross-attention"""
-    
+    """Forward pass for GQA cross-attention with efficient KV head sharing"""
+
     pid_batch = tl.program_id(0)
     pid_head  = tl.program_id(1)
     pid_m     = tl.program_id(2)
-    
+
     kv_head = pid_head // heads_per_group
-    
+
     q_start = pid_m * BLOCK_M
     offs_m  = q_start + tl.arange(0, BLOCK_M)
     offs_d  = tl.arange(0, BLOCK_D)
-    
+
     mask_m = offs_m < q_len
-    
+
     q_ptrs = (Q_ptr +
               pid_batch * stride_qb +
               pid_head * stride_qh +
               offs_m[:, None] * stride_qs +
               offs_d[None, :] * stride_qd)
-    q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
-    
+    q      = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
+
     m_i = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
     l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
-    
+
     for n_start in range(0, kv_len, BLOCK_N):
         offs_n = n_start + tl.arange(0, BLOCK_N)
         mask_n = offs_n < kv_len
-        
+
         k_ptrs = (K_ptr +
                   pid_batch * stride_kb +
                   kv_head * stride_kh +
                   offs_n[:, None] * stride_ks +
                   offs_d[None, :] * stride_kd)
-        k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
-        
+        k      = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
+
         scores = tl.dot(q, tl.trans(k)) * softmax_scale
-        
         scores = tl.where(mask_m[:, None] & mask_n[None, :], scores, float('-inf'))
-        
+
         m_ij  = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, m_ij)
-        
+
         alpha = tl.exp(m_i - m_new)
         beta  = tl.exp(m_ij - m_new)
-        
+
         l_i = alpha * l_i + beta * tl.sum(tl.exp(scores - m_ij[:, None]), axis=1)
-        
+
         v_ptrs = (V_ptr +
                   pid_batch * stride_vb +
                   kv_head * stride_vh +
                   offs_n[:, None] * stride_vs +
                   offs_d[None, :] * stride_vd)
-        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
-        
+        v      = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+
         p   = tl.exp(scores - m_ij[:, None])
         acc = alpha[:, None] * acc + tl.dot(p.to(v.dtype), v)
-        
+
         m_i = m_new
-    
+
     acc = acc / l_i[:, None]
-    
+
     out_ptrs = (Out_ptr +
                 pid_batch * stride_ob +
                 pid_head * stride_oh +
@@ -134,87 +133,87 @@ def gqa_self_attention_fwd_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """Forward pass for Grouped Query Attention self-attention with optional causal mask"""
-    
+    """Forward pass for GQA self-attention with optional causal mask"""
+
     pid_batch = tl.program_id(0)
     pid_head  = tl.program_id(1)
     pid_m     = tl.program_id(2)
-    
+
     kv_head = pid_head // heads_per_group
-    
+
     q_start = pid_m * BLOCK_M
     offs_m  = q_start + tl.arange(0, BLOCK_M)
     offs_d  = tl.arange(0, BLOCK_D)
-    
+
     mask_m = offs_m < seq_len
-    
+
     q_ptrs = (Q_ptr +
               pid_batch * stride_qb +
               pid_head * stride_qh +
               offs_m[:, None] * stride_qs +
               offs_d[None, :] * stride_qd)
-    q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
-    
+    q      = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
+
     if use_alibi:
         alibi_slope = tl.load(alibi_slopes_ptr + pid_head)
-    
+
     m_i = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
     l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
-    
+
     kv_end = seq_len
     if is_causal:
         kv_end = min(seq_len, (pid_m + 1) * BLOCK_M)
-    
+
     for n_start in range(0, kv_end, BLOCK_N):
         offs_n = n_start + tl.arange(0, BLOCK_N)
         mask_n = offs_n < seq_len
-        
+
         k_ptrs = (K_ptr +
                   pid_batch * stride_kb +
                   kv_head * stride_kh +
                   offs_n[:, None] * stride_ks +
                   offs_d[None, :] * stride_kd)
-        k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
-        
+        k      = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
+
         scores = tl.dot(q, tl.trans(k)) * softmax_scale
-        
+
         if use_alibi:
             q_pos      = offs_m[:, None].to(tl.float32)
             k_pos      = offs_n[None, :].to(tl.float32)
             dist       = tl.abs(q_pos - k_pos)
             alibi_bias = -alibi_slope * dist
             scores     = scores + alibi_bias
-        
+
         if is_causal:
             causal_mask = offs_m[:, None] >= offs_n[None, :]
             scores      = tl.where(causal_mask & mask_m[:, None] & mask_n[None, :],
                                    scores, float('-inf'))
         else:
             scores = tl.where(mask_m[:, None] & mask_n[None, :], scores, float('-inf'))
-        
+
         m_ij  = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, m_ij)
-        
+
         alpha = tl.exp(m_i - m_new)
         beta  = tl.exp(m_ij - m_new)
-        
+
         l_i = alpha * l_i + beta * tl.sum(tl.exp(scores - m_ij[:, None]), axis=1)
-        
+
         v_ptrs = (V_ptr +
                   pid_batch * stride_vb +
                   kv_head * stride_vh +
                   offs_n[:, None] * stride_vs +
                   offs_d[None, :] * stride_vd)
-        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
-        
+        v      = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+
         p   = tl.exp(scores - m_ij[:, None])
         acc = alpha[:, None] * acc + tl.dot(p.to(v.dtype), v)
-        
+
         m_i = m_new
-    
+
     acc = acc / l_i[:, None]
-    
+
     out_ptrs = (Out_ptr +
                 pid_batch * stride_ob +
                 pid_head * stride_oh +
@@ -229,17 +228,11 @@ def gqa_self_attention_fwd_kernel(
 
 
 class GQAttention(nn.Module):
-    
-    """
-    Grouped Query Attention for efficient cross-attention
-    
-    Multiple query heads share the same key-value heads, reducing
-    memory bandwidth and KV cache size while maintaining quality
-    """
-    
+    """Grouped Query Attention with efficient KV head sharing"""
+
     def __init__(self, config, is_causal=False):
         super().__init__()
-        
+
         self.config          = config
         self.is_causal       = is_causal
         self.is_cross_attn   = config.is_cross_attn
@@ -249,148 +242,148 @@ class GQAttention(nn.Module):
         self.head_dim        = config.head_dim if config.head_dim else config.embed_dim // config.num_heads
         self.heads_per_group = config.num_heads // config.num_kv_heads
         self.softmax_scale   = 1.0 / math.sqrt(self.head_dim)
-        
+
         assert config.num_heads % config.num_kv_heads == 0, \
             "num_heads must be divisible by num_kv_heads"
-        
+
         self.q = nn.Linear(config.embed_dim, config.num_heads * self.head_dim, bias=False)
         self.k = nn.Linear(config.embed_dim, config.num_kv_heads * self.head_dim, bias=False)
         self.v = nn.Linear(config.embed_dim, config.num_kv_heads * self.head_dim, bias=False)
         self.o = nn.Linear(config.num_heads * self.head_dim, config.embed_dim, bias=False)
-        
+
         self.dropout = nn.Dropout(config.dropout)
-        
+
         if config.use_alibi and not config.is_cross_attn:
             slopes = self._compute_alibi_slopes(config.num_heads)
             self.register_buffer('alibi_slopes', slopes)
         else:
             self.alibi_slopes = None
-        
+
         self._use_triton = True
-    
+
     @staticmethod
     def _compute_alibi_slopes(num_heads):
         """Compute ALiBi slopes for position-aware attention"""
+
         def get_slopes(n):
             if n == 1:
                 return torch.tensor([1.0])
             base = 2 ** (-2 ** -(math.log2(n) - 3))
             return torch.tensor([base ** i for i in range(1, n + 1)])
-        
+
         if math.log2(num_heads).is_integer():
             return get_slopes(num_heads)
         else:
             closest_power = 2 ** math.floor(math.log2(num_heads))
-            slopes = torch.cat([
+            slopes        = torch.cat([
                 get_slopes(closest_power),
                 get_slopes(2 * closest_power)[0::2][:num_heads - closest_power]
             ])
             return slopes
-    
-    def _expand_kv_heads(self, x):
-        """Expand KV heads to match query heads via repetition"""
-        B, num_kv_heads, L, D = x.shape
-        x = x.unsqueeze(2)
-        x = x.expand(B, num_kv_heads, self.heads_per_group, L, D)
-        x = x.reshape(B, self.num_heads, L, D)
-        return x
-    
+
     def _forward_pytorch_cross(self, hidden_states, key_value_states, attention_mask=None):
-        """PyTorch fallback for cross-attention"""
-        
+        """PyTorch fallback for cross-attention without redundant KV expansion"""
+
         B, L_q, D = hidden_states.shape
         L_kv      = key_value_states.shape[1]
-        
+
         q = self.q(hidden_states)
         k = self.k(key_value_states)
         v = self.v(key_value_states)
-        
-        q = q.view(B, L_q, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, L_kv, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, L_kv, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        
-        k = self._expand_kv_heads(k)
-        v = self._expand_kv_heads(v)
-        
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.softmax_scale
-        
+
+        q = q.view(B, L_q, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = k.view(B, L_kv, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = v.view(B, L_kv, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        q_grouped = q.view(B, self.num_kv_heads, self.heads_per_group, L_q, self.head_dim)
+        scores    = torch.einsum('bghqd,bhkd->bghqk', q_grouped, k) * self.softmax_scale
+
         if attention_mask is not None:
-            scores = scores + attention_mask
-        
+            scores = scores + attention_mask.unsqueeze(2)
+
         attn_weights = F.softmax(scores.float(), dim=-1).type_as(scores)
         attn_weights = self.dropout(attn_weights)
-        
-        out = torch.matmul(attn_weights, v)
-        out = out.transpose(1, 2).reshape(B, L_q, self.num_heads * self.head_dim)
+
+        out = torch.einsum('bghqk,bhkd->bghqd', attn_weights, v)
+        out = out.reshape(B, self.num_heads, L_q, self.head_dim)
+        out = out.permute(0, 2, 1, 3).reshape(B, L_q, self.num_heads * self.head_dim)
         out = self.o(out)
-        
+
         return out, None
-    
+
     def _forward_pytorch_self(self, hidden_states, attention_mask=None, position_bias=None):
-        """PyTorch fallback for self-attention"""
-        
+        """PyTorch fallback for self-attention without redundant KV expansion"""
+
         B, L, D = hidden_states.shape
-        
+
         q = self.q(hidden_states)
         k = self.k(hidden_states)
         v = self.v(hidden_states)
-        
-        q = q.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        
-        k = self._expand_kv_heads(k)
-        v = self._expand_kv_heads(v)
-        
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.softmax_scale
-        
+
+        q = q.view(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = k.view(B, L, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = v.view(B, L, self.num_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        q_grouped = q.view(B, self.num_kv_heads, self.heads_per_group, L, self.head_dim)
+        scores    = torch.einsum('bghqd,bhkd->bghqk', q_grouped, k) * self.softmax_scale
+
         if self.alibi_slopes is not None and position_bias is None:
             positions     = torch.arange(L, device=hidden_states.device)
             dist_matrix   = torch.abs(positions[:, None] - positions[None, :]).float()
-            position_bias = -self.alibi_slopes.view(1, -1, 1, 1) * dist_matrix.view(1, 1, L, L)
-        
+            alibi_slopes  = self.alibi_slopes.view(self.num_kv_heads, self.heads_per_group)
+            position_bias = -alibi_slopes.view(1, self.num_kv_heads, self.heads_per_group, 1, 1) * \
+                            dist_matrix.view(1, 1, 1, L, L)
+
         if position_bias is not None:
             scores = scores + position_bias
-        
+
         if self.is_causal:
             causal_mask = torch.triu(torch.ones(L, L, device=scores.device), diagonal=1).bool()
             scores      = scores.masked_fill(causal_mask, float('-inf'))
-        
+
         if attention_mask is not None:
-            scores = scores + attention_mask
-        
+            scores = scores + attention_mask.unsqueeze(2)
+
         attn_weights = F.softmax(scores.float(), dim=-1).type_as(scores)
         attn_weights = self.dropout(attn_weights)
-        
-        out = torch.matmul(attn_weights, v)
-        out = out.transpose(1, 2).reshape(B, L, self.num_heads * self.head_dim)
+
+        out = torch.einsum('bghqk,bhkd->bghqd', attn_weights, v)
+        out = out.reshape(B, self.num_heads, L, self.head_dim)
+        out = out.permute(0, 2, 1, 3).reshape(B, L, self.num_heads * self.head_dim)
         out = self.o(out)
-        
+
         return out, position_bias
-    
+
     def _forward_triton_cross(self, hidden_states, key_value_states, attention_mask=None):
         """Triton-optimized cross-attention forward pass"""
-        
+
         B, L_q, D = hidden_states.shape
         L_kv      = key_value_states.shape[1]
-        
-        q = self.q(hidden_states)
-        k = self.k(key_value_states)
-        v = self.v(key_value_states)
-        
-        q = q.view(B, L_q, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-        k = k.view(B, L_kv, self.num_kv_heads, self.head_dim).transpose(1, 2).contiguous()
-        v = v.view(B, L_kv, self.num_kv_heads, self.head_dim).transpose(1, 2).contiguous()
-        
+
+        q = self.q(hidden_states).view(B, L_q, self.num_heads, self.head_dim)
+        k = self.k(key_value_states).view(B, L_kv, self.num_kv_heads, self.head_dim)
+        v = self.v(key_value_states).view(B, L_kv, self.num_kv_heads, self.head_dim)
+
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+
+        if not q.is_contiguous():
+            q = q.contiguous()
+        if not k.is_contiguous():
+            k = k.contiguous()
+        if not v.is_contiguous():
+            v = v.contiguous()
+
         out = torch.empty_like(q)
-        
+
         BLOCK_M = min(64, L_q)
         BLOCK_N = min(64, L_kv)
         BLOCK_D = self.head_dim
-        
+
         num_m_blocks = (L_q + BLOCK_M - 1) // BLOCK_M
         grid         = (B, self.num_heads, num_m_blocks)
-        
+
         gqa_cross_attention_fwd_kernel[grid](
             q, k, v, out,
             L_q, L_kv, self.num_heads, self.num_kv_heads, self.head_dim,
@@ -404,37 +397,44 @@ class GQAttention(nn.Module):
             BLOCK_N=BLOCK_N,
             BLOCK_D=BLOCK_D,
         )
-        
-        out = out.transpose(1, 2).reshape(B, L_q, self.num_heads * self.head_dim)
+
+        out = out.permute(0, 2, 1, 3).reshape(B, L_q, self.num_heads * self.head_dim)
         out = self.o(out)
         out = self.dropout(out)
-        
+
         return out, None
-    
+
     def _forward_triton_self(self, hidden_states, attention_mask=None):
         """Triton-optimized self-attention forward pass"""
-        
+
         B, L, D = hidden_states.shape
-        
-        q = self.q(hidden_states)
-        k = self.k(hidden_states)
-        v = self.v(hidden_states)
-        
-        q = q.view(B, L, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-        k = k.view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2).contiguous()
-        v = v.view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2).contiguous()
-        
+
+        q = self.q(hidden_states).view(B, L, self.num_heads, self.head_dim)
+        k = self.k(hidden_states).view(B, L, self.num_kv_heads, self.head_dim)
+        v = self.v(hidden_states).view(B, L, self.num_kv_heads, self.head_dim)
+
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+
+        if not q.is_contiguous():
+            q = q.contiguous()
+        if not k.is_contiguous():
+            k = k.contiguous()
+        if not v.is_contiguous():
+            v = v.contiguous()
+
         out = torch.empty_like(q)
-        
+
         BLOCK_M = min(64, L)
         BLOCK_N = min(64, L)
         BLOCK_D = self.head_dim
-        
+
         num_m_blocks = (L + BLOCK_M - 1) // BLOCK_M
         grid         = (B, self.num_heads, num_m_blocks)
-        
+
         alibi_ptr = self.alibi_slopes if self.alibi_slopes is not None else q
-        
+
         gqa_self_attention_fwd_kernel[grid](
             q, k, v, out,
             L, self.num_heads, self.num_kv_heads, self.head_dim,
@@ -451,13 +451,13 @@ class GQAttention(nn.Module):
             BLOCK_N=BLOCK_N,
             BLOCK_D=BLOCK_D,
         )
-        
-        out = out.transpose(1, 2).reshape(B, L, self.num_heads * self.head_dim)
+
+        out = out.permute(0, 2, 1, 3).reshape(B, L, self.num_heads * self.head_dim)
         out = self.o(out)
         out = self.dropout(out)
-        
+
         return out, None
-    
+
     def forward(self, hidden_states, key_value_states=None, attention_mask=None, position_bias=None):
 
         if self.is_cross_attn and key_value_states is not None:
@@ -474,7 +474,8 @@ class GQAttention(nn.Module):
                 except Exception:
                     pass
             return self._forward_pytorch_self(hidden_states, attention_mask, position_bias)
-    
+
     def get_kv_cache_size(self, batch_size, seq_len):
         """Return KV cache size in bytes (float16)"""
+
         return batch_size * seq_len * self.num_kv_heads * self.head_dim * 2 * 2

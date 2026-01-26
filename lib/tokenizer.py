@@ -58,18 +58,6 @@ def load_tokens_from_txt(txt_path):
     return tokens
 
 
-def save_tokens_to_txt(tokens, txt_path):
-    """Save tokens to a text file (one per line)"""
-    path = Path(txt_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    
-    with open(path, 'w') as f:
-        for token in tokens:
-            f.write(f"{token}\n")
-    
-    return path
-
-
 def append_tokens_to_txt(tokens, txt_path):
     """Append tokens to existing txt file, avoiding duplicates"""
     path = Path(txt_path)
@@ -148,20 +136,3 @@ def find_missing_tokens(config, tokens):
     
     existing = get_existing_tokens(config)
     return [t for t in tokens if t not in existing]
-
-
-def update_tokenizer_from_txt(tokenizer_path, txt_path, output_path=None):
-    """Update tokenizer with tokens from txt file"""
-    
-    config, config_path = load_tokenizer_config(tokenizer_path)
-    existing            = get_existing_tokens(config)
-    txt_tokens          = load_tokens_from_txt(txt_path)
-    missing             = [t for t in txt_tokens if t not in existing]
-    
-    if missing:
-        config, added = append_tokens_to_config(config, missing)
-        out_path      = output_path or config_path
-        saved         = save_tokenizer_config(config, out_path)
-        return config, added, saved
-    
-    return config, [], config_path

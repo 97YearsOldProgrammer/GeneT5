@@ -98,42 +98,6 @@ def build_length_index(binary_path, tokenizer=None, batch_size=256):
     return reader.lengths
 
 
-#######################
-#####  Utilities  #####
-#######################
-
-
-def get_binary_stats(binary_path):
-    """Get statistics about a binary dataset file"""
-
-    info       = binary.get_binary_info(binary_path)
-    num_chunks = info["num_chunks"]
-
-    raw_count      = 0
-    aug_count      = 0
-    total_features = 0
-    total_hints    = 0
-
-    for i in range(num_chunks):
-        chunk = binary.read_chunk_at_index(binary_path, i)
-        if chunk.is_augmented:
-            aug_count += 1
-        else:
-            raw_count += 1
-        total_features += len(chunk.features)
-        total_hints    += len(chunk.hints) if chunk.has_hints else 0
-
-    return {
-        "num_chunks":     num_chunks,
-        "raw_count":      raw_count,
-        "aug_count":      aug_count,
-        "total_features": total_features,
-        "total_hints":    total_hints,
-        "compressed":     info["compressed"],
-        "total_size":     info["total_size"],
-    }
-
-
 #####################
 #####  Dataset  #####
 #####################
@@ -228,9 +192,10 @@ class BinaryTrainDataset:
         return results
 
 
-######################
-#####  Collator  #####
-######################
+
+#####################
+#####  Utility  #####
+#####################
 
 
 class DynamicPaddingCollator:
@@ -434,11 +399,6 @@ class CompactingCollator:
             result["decoder_attention_mask"] = final_dec_masks
 
         return result
-
-
-#####################
-#####  Sampler  #####
-#####################
 
 
 class SmartBatchSampler:
