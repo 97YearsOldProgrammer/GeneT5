@@ -19,14 +19,14 @@ The idea is to utilize existed DNABert-v2 pre-trained model for giving the model
 | **Output Head**             | **Copy/Init**   | Usually initialized from the Input Embeddings (Shared).
 
 ```python3
-python3 bin/init_model.py \
+python3 -u bin/init_model.py \
     --save_dir "../model/init/" \
     --dnabert_path "zhihan1996/DNABERT-2-117M" \
     --use_moe \
     --num_experts 32 \
     --moe_top_k 2 \
     --tie_weights \
-    2>&1 | tee -a ../logs/init.txt
+    2>&1 | tee ../logs/init.txt
 ```
 
 

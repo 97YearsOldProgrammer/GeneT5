@@ -242,7 +242,7 @@ def write_binary(chunks, output_path, compress=True):
         f.write(struct.pack('<I', len(chunks)))
 
         offsets    = []
-        data_start = f.tell() + len(chunks) * 8
+        data_start = f.tell() + len(chunks) * 12
 
         all_data       = []
         current_offset = data_start
@@ -258,7 +258,7 @@ def write_binary(chunks, output_path, compress=True):
             current_offset += len(chunk_bytes)
 
         for offset, length in offsets:
-            f.write(struct.pack('<II', offset, length))
+            f.write(struct.pack('<QI', offset, length))
 
         for data in all_data:
             f.write(data)
@@ -280,7 +280,7 @@ def read_binary(input_path):
 
         offsets = []
         for _ in range(num_chunks):
-            offset, length = struct.unpack('<II', f.read(8))
+            offset, length = struct.unpack('<QI', f.read(12))
             offsets.append((offset, length))
 
         chunks = []
@@ -312,8 +312,8 @@ def read_chunk_at_index(input_path, index):
         if index >= num_chunks:
             raise IndexError(f"Index {index} out of range (total: {num_chunks})")
 
-        f.seek(10 + index * 8)
-        offset, length = struct.unpack('<II', f.read(8))
+        f.seek(10 + index * 12)
+        offset, length = struct.unpack('<QI', f.read(12))
 
         f.seek(offset)
         data = f.read(length)
@@ -338,7 +338,7 @@ def get_binary_info(input_path):
 
         offsets = []
         for _ in range(num_chunks):
-            offset, length = struct.unpack('<II', f.read(8))
+            offset, length = struct.unpack('<QI', f.read(12))
             offsets.append((offset, length))
 
         total_size = sum(length for _, length in offsets)
