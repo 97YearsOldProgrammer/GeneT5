@@ -1,19 +1,17 @@
 import subprocess
-
-from pathlib    import Path
-from typing     import Dict, List, Tuple, Optional, Any
+import pathlib
 
 import lib.dataset as ds
 
 
-##########################
-#####  Taxa Config  ######
-##########################
+####################
+#####  Config  #####
+####################
 
 
 TAXA_CONFIG = {
     "Prokaryotes": {
-        "limit": 9000,
+        "limit":   9000,
         "species": [
             "E.coli",
             "B.subtilis",
@@ -24,7 +22,7 @@ TAXA_CONFIG = {
         ],
     },
     "Unicellular": {
-        "limit": 22500,
+        "limit":   22500,
         "species": [
             "S.cerevisiae",
             "S.pombe",
@@ -35,7 +33,7 @@ TAXA_CONFIG = {
         ],
     },
     "Invertebrates": {
-        "limit": 45000,
+        "limit":   45000,
         "species": [
             "C.elegan",
             "Fly",
@@ -47,7 +45,7 @@ TAXA_CONFIG = {
         ],
     },
     "Vertebrates": {
-        "limit": 90000,
+        "limit":   90000,
         "species": [
             "Axolotl",
             "C.jacchus",
@@ -62,7 +60,7 @@ TAXA_CONFIG = {
         ],
     },
     "Plants": {
-        "limit": 45000,
+        "limit":   45000,
         "species": [
             "Earthmoss",
             "Maize",
@@ -74,8 +72,9 @@ TAXA_CONFIG = {
 }
 
 
-def build_species_lookup() -> Dict[str, Tuple[str, int]]:
+def build_species_lookup():
     """Build species -> (taxa, limit) lookup"""
+    
     lookup = {}
     for taxa, config in TAXA_CONFIG.items():
         limit = config["limit"]
@@ -84,18 +83,18 @@ def build_species_lookup() -> Dict[str, Tuple[str, int]]:
     return lookup
 
 
-# Pre-built lookup for convenience
 SPECIES_LOOKUP = build_species_lookup()
 
 
-#############################
-#####  Genome Utilities #####
-#############################
+######################
+#####  Utilities #####
+######################
 
 
-def find_genome_files(species_dir: Path) -> Tuple[Optional[Path], Optional[Path]]:
+def find_genome_files(species_dir):
     """Find GFF and FASTA files in species directory"""
-    species_dir = Path(species_dir)
+    
+    species_dir = pathlib.Path(species_dir)
     
     gff_file   = None
     fasta_file = None
@@ -107,7 +106,6 @@ def find_genome_files(species_dir: Path) -> Tuple[Optional[Path], Optional[Path]
         elif name_lower.endswith('.fna.gz') or name_lower.endswith('.fasta.gz') or name_lower.endswith('.fa.gz'):
             fasta_file = f
     
-    # Fallback: check for common names
     if gff_file is None:
         for name in ['gff.gz', 'annotation.gff.gz', 'genes.gff.gz']:
             candidate = species_dir / name
@@ -130,16 +128,7 @@ def find_genome_files(species_dir: Path) -> Tuple[Optional[Path], Optional[Path]
 #################################
 
 
-def run_parse_data(
-    species_name: str,
-    fasta_path: Path,
-    gff_path: Path,
-    output_dir: Path,
-    limit: int,
-    log_dir: Path,
-    token_file: Optional[str] = None,
-    n_workers: int = 1,
-) -> Dict[str, Any]:
+def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_dir, token_file=None, n_workers=1):
     """Run parse_data.py for a single species"""
     
     cmd = [
@@ -167,9 +156,9 @@ def run_parse_data(
             
             result = subprocess.run(
                 cmd,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                text=True,
+                stdout = log,
+                stderr = subprocess.STDOUT,
+                text   = True,
             )
         
         return {
@@ -188,14 +177,12 @@ def run_parse_data(
         }
 
 
-def process_species(args: Tuple) -> Dict[str, Any]:
-    """Worker function for parallel species processing
+def process_species(args):
+    """Worker function for parallel species processing"""
     
-    Args tuple: (species_name, raw_dir, baked_dir, log_dir, limit, token_file, n_workers)
-    """
     species_name, raw_dir, baked_dir, log_dir, limit, token_file, n_workers = args
     
-    species_raw_dir = Path(raw_dir) / species_name
+    species_raw_dir = pathlib.Path(raw_dir) / species_name
     
     if not species_raw_dir.exists():
         return {
@@ -213,7 +200,7 @@ def process_species(args: Tuple) -> Dict[str, Any]:
             "error":   f"Missing FASTA or GFF in: {species_raw_dir}",
         }
     
-    output_dir = Path(baked_dir) / species_name
+    output_dir = pathlib.Path(baked_dir) / species_name
     output_dir.mkdir(parents=True, exist_ok=True)
     
     return run_parse_data(
@@ -226,39 +213,24 @@ def process_species(args: Tuple) -> Dict[str, Any]:
 ####################################
 
 
-def run_tokenizer_expansion(
-    token_file: str,
-    tokenizer_path: str,
-    output_path: Optional[str] = None,
-    dry_run: bool = False,
-) -> Dict[str, Any]:
-    """Run append_tk.py to expand tokenizer with new tokens
+def run_tokenizer_expansion(token_file, tokenizer_path, output_path=None, dry_run=False):
+    """Run append_tk.py to expand tokenizer with new tokens"""
     
-    Args:
-        token_file: Path to txt file with extracted tokens
-        tokenizer_path: Path to tokenizer.json or directory
-        output_path: Output path (default: overwrite input)
-        dry_run: If True, only show what would be added
-    
-    Returns:
-        Dict with success status and details
-    """
-    token_path = Path(token_file)
+    token_path = pathlib.Path(token_file)
     
     if not token_path.exists():
         return {
             "success": False,
-            "error": f"Token file not found: {token_file}",
+            "error":   f"Token file not found: {token_file}",
         }
     
-    # Check if token file is empty
     with open(token_path, 'r') as f:
         tokens = [line.strip() for line in f if line.strip()]
     
     if not tokens:
         return {
             "success": True,
-            "added": 0,
+            "added":   0,
             "message": "No tokens to add (file empty)",
         }
     
@@ -277,21 +249,21 @@ def run_tokenizer_expansion(
     try:
         result = subprocess.run(
             cmd,
-            capture_output=True,
-            text=True,
+            capture_output = True,
+            text           = True,
         )
         
         return {
-            "success": result.returncode == 0,
-            "stdout":  result.stdout,
-            "stderr":  result.stderr,
+            "success":        result.returncode == 0,
+            "stdout":         result.stdout,
+            "stderr":         result.stderr,
             "tokens_in_file": len(tokens),
         }
     
     except Exception as e:
         return {
             "success": False,
-            "error": str(e),
+            "error":   str(e),
         }
 
 
@@ -332,23 +304,12 @@ def print_run_stats(stats, chunk_stats, validation, output_path):
         ds.print_validation_stats(validation)
 
 
-def build_species_list(
-    species: Optional[List[str]] = None,
-    taxa: Optional[List[str]] = None,
-) -> List[Tuple[str, int, str]]:
-    """Build list of species to process
+def build_species_list(species=None, taxa=None):
+    """Build list of species to process"""
     
-    Args:
-        species: Specific species names to process
-        taxa: Specific taxa to process (all species in those taxa)
-    
-    Returns:
-        List of (species_name, limit, taxa_name) tuples
-    """
     species_to_process = []
     
     if species:
-        # Specific species requested
         for sp in species:
             if sp in SPECIES_LOOKUP:
                 taxa_name, limit = SPECIES_LOOKUP[sp]
@@ -357,7 +318,6 @@ def build_species_list(
                 print(f"  WARNING: Unknown species '{sp}', skipping")
     
     elif taxa:
-        # Specific taxa requested
         for taxa_name in taxa:
             if taxa_name in TAXA_CONFIG:
                 config = TAXA_CONFIG[taxa_name]
@@ -367,9 +327,4 @@ def build_species_list(
                 print(f"  WARNING: Unknown taxa '{taxa_name}', skipping")
     
     else:
-        # All species
         for taxa_name, config in TAXA_CONFIG.items():
-            for sp in config["species"]:
-                species_to_process.append((sp, config["limit"], taxa_name))
-    
-    return species_to_process
