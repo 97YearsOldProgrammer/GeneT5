@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
 
-from __future__ import annotations
-
+import sys
 import argparse
 import subprocess
 import multiprocessing
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+# Add parent directory to path for lib imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from lib.util import (
+    TAXA_CONFIG,
+    SPECIES_LOOKUP,
+    build_species_list,
+    process_species,
+    run_tokenizer_expansion,
+)
+
 
 def main():
     
     parser = argparse.ArgumentParser(
-        description="Bake all species data with taxa-specific parameters", formatter_class=argparse.RawDescriptionHelpFormatter)
+        description="Bake all species data with taxa-specific parameters")
     parser.add_argument("--raw_dir", type=str, default="../raw",
         help="Directory containing species subdirectories [%(default)s]")
     parser.add_argument("--baked_dir", type=str, default="../baked",
@@ -27,10 +37,18 @@ def main():
         help="Parallel workers for species processing [auto]")
     parser.add_argument("--n_workers_per_species", type=int, default=1,
         help="Workers per species for chunking [%(default)s]")
+    
+    # Token extraction
+    parser.add_argument("--token_file", type=str, default="data/new_tokens.txt",
+        help="File to collect extracted tokens [%(default)s]")
+    parser.add_argument("--tokenizer", type=str, default=None,
+        help="Tokenizer path for expansion and compacting")
+    parser.add_argument("--skip_tokenizer_expansion", action="store_true",
+        help="Skip tokenizer expansion after processing")
+    
+    # Compacting
     parser.add_argument("--compact", action="store_true",
         help="Compact all training.bin files after baking")
-    parser.add_argument("--tokenizer", type=str, default=None,
-        help="Tokenizer path for compacting")
     parser.add_argument("--compact_target", type=int, default=8192,
         help="Target tokens for compacting [%(default)s]")
     
@@ -40,36 +58,11 @@ def main():
     n_workers = args.n_workers or max(1, multiprocessing.cpu_count() - 1)
     
     # Build species list
-    species_to_process = []
-    
-    if args.species:
-        # Specific species requested
-        for sp in args.species:
-            if sp in SPECIES_LOOKUP:
-                taxa, limit = SPECIES_LOOKUP[sp]
-                species_to_process.append((sp, limit, taxa))
-            else:
-                print(f"  WARNING: Unknown species '{sp}', skipping")
-    
-    elif args.taxa:
-        # Specific taxa requested
-        for taxa in args.taxa:
-            if taxa in TAXA_CONFIG:
-                config = TAXA_CONFIG[taxa]
-                for sp in config["species"]:
-                    species_to_process.append((sp, config["limit"], taxa))
-            else:
-                print(f"  WARNING: Unknown taxa '{taxa}', skipping")
-    
-    else:
-        # All species
-        for taxa, config in TAXA_CONFIG.items():
-            for sp in config["species"]:
-                species_to_process.append((sp, config["limit"], taxa))
+    species_to_process = build_species_list(args.species, args.taxa)
     
     if not species_to_process:
         print("No species to process!")
-        return
+        return 1
     
     # Setup directories
     raw_dir   = Path(args.raw_dir)
@@ -79,10 +72,15 @@ def main():
     baked_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
     
+    # Ensure token file directory exists
+    token_file = Path(args.token_file)
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    
     print(f"\n{' GeneT5 Data Baker ':=^60}")
     print(f"  Raw directory:   {raw_dir}")
     print(f"  Baked directory: {baked_dir}")
     print(f"  Log directory:   {log_dir}")
+    print(f"  Token file:      {token_file}")
     print(f"  Workers:         {n_workers}")
     print(f"  Species:         {len(species_to_process)}")
     
@@ -97,18 +95,18 @@ def main():
     for taxa, info in taxa_counts.items():
         print(f"  {taxa:15s}: {info['count']:2d} species @ {info['limit']:,} bp")
     
-    # Prepare work items
+    # Prepare work items (includes token_file for extraction)
     work_items = [
-        (sp, raw_dir, baked_dir, log_dir, limit, args.n_workers_per_species)
+        (sp, raw_dir, baked_dir, log_dir, limit, str(token_file), args.n_workers_per_species)
         for sp, limit, taxa in species_to_process
     ]
     
     # Process species in parallel
     print(f"\n{' Processing Species ':=^60}")
     
-    results  = []
-    success  = 0
-    failed   = 0
+    results = []
+    success = 0
+    failed  = 0
     
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
         futures = {executor.submit(process_species, item): item[0] for item in work_items}
@@ -131,9 +129,42 @@ def main():
                 failed += 1
                 print(f"  ✗ {species_name}: {e}")
     
-    print(f"\n{' Results ':=^60}")
+    print(f"\n{' Processing Results ':=^60}")
     print(f"  Success: {success}")
     print(f"  Failed:  {failed}")
+    
+    # Expand tokenizer if requested
+    if args.tokenizer and not args.skip_tokenizer_expansion and success > 0:
+        print(f"\n{' Tokenizer Expansion ':=^60}")
+        
+        if not token_file.exists():
+            print(f"  WARNING: Token file not found: {token_file}")
+        else:
+            # Count tokens in file
+            with open(token_file, 'r') as f:
+                tokens = [line.strip() for line in f if line.strip()]
+            print(f"  Tokens extracted: {len(tokens)}")
+            
+            if tokens:
+                expansion_result = run_tokenizer_expansion(
+                    str(token_file),
+                    args.tokenizer,
+                )
+                
+                if expansion_result["success"]:
+                    print(f"  ✓ Tokenizer expansion complete")
+                    if expansion_result.get("stdout"):
+                        # Print relevant lines from stdout
+                        for line in expansion_result["stdout"].split('\n'):
+                            if line.strip() and not line.startswith('='):
+                                print(f"    {line.strip()}")
+                else:
+                    error = expansion_result.get("error", "Unknown error")
+                    print(f"  ✗ Tokenizer expansion failed: {error}")
+                    if expansion_result.get("stderr"):
+                        print(f"    {expansion_result['stderr']}")
+            else:
+                print(f"  No new tokens to add")
     
     # Compact if requested
     if args.compact and success > 0:
@@ -159,209 +190,27 @@ def main():
                 ])
             
             print(f"  Running compact...")
-            subprocess.run(compact_cmd)
+            result = subprocess.run(compact_cmd, capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                print(f"  ✓ Compacting complete")
+            else:
+                print(f"  ✗ Compacting failed")
+                if result.stderr:
+                    print(f"    {result.stderr}")
     
     print(f"\n{'='*60}")
     print("Done!")
+    
+    if args.tokenizer and not args.skip_tokenizer_expansion:
+        print("\nNext steps:")
+        print("  1. Run resize_model.py to resize model embeddings")
+        print(f"     python bin/resize_model.py {args.tokenizer}")
+    
     print(f"{'='*60}")
+    
+    return 0 if failed == 0 else 1
 
 
 if __name__ == "__main__":
-    main()
-    
-
-####################
-#####  Config  #####
-####################
-
-
-TAXA_CONFIG = {
-    "Prokaryotes": {
-        "limit": 9000,
-        "species": [
-            "E.coli",
-            "B.subtilis", 
-            "C.crescentus",
-            "PCC6803",
-            "H.archaea",
-            "V.fischeri",
-        ],
-    },
-    "Unicellular": {
-        "limit": 22500,
-        "species": [
-            "S.cerevisiae",
-            "S.pombe",
-            "C.reinhardtii",
-            "N.crassa",
-            "D.discoideum",
-            "T.thermophila",
-        ],
-    },
-    "Invertebrates": {
-        "limit": 45000,
-        "species": [
-            "C.elegan",
-            "Fly",
-            "S.anemone",
-            "S.urchin",
-            "H.vulgaris",
-            "Bee",
-            "Silkworm",
-        ],
-    },
-    "Vertebrates": {
-        "limit": 90000,
-        "species": [
-            "Axolotl",
-            "C.jacchus",
-            "Chicken",
-            "C.porcellus",
-            "Frog",
-            "Human",
-            "Medaka",
-            "Mouse",
-            "Rat",
-            "Zebrafish",
-        ],
-    },
-    "Plants": {
-        "limit": 45000,
-        "species": [
-            "Earthmoss",
-            "Maize",
-            "M.truncatula",
-            "Rice",
-            "T.cress",
-        ],
-    },
-}
-
-SPECIES_LOOKUP = build_species_lookup()
-
-
-#######################
-#####  Utilities  #####
-#######################
-
-
-def build_species_lookup():
-    """Build species -> (taxa, limit) lookup"""
-    
-    lookup = {}
-    for taxa, config in TAXA_CONFIG.items():
-        limit = config["limit"]
-        for species in config["species"]:
-            lookup[species] = (taxa, limit)
-    return lookup
-
-
-def find_genome_files(species_dir):
-    """Find GFF and FASTA files in species directory"""
-    
-    species_dir = Path(species_dir)
-    
-    gff_file   = None
-    fasta_file = None
-    
-    for f in species_dir.iterdir():
-        name_lower = f.name.lower()
-        if name_lower.endswith('.gff.gz') or name_lower.endswith('.gff3.gz'):
-            gff_file = f
-        elif name_lower.endswith('.fna.gz') or name_lower.endswith('.fasta.gz') or name_lower.endswith('.fa.gz'):
-            fasta_file = f
-    
-    # Fallback: check for common names
-    if gff_file is None:
-        for name in ['gff.gz', 'annotation.gff.gz', 'genes.gff.gz']:
-            candidate = species_dir / name
-            if candidate.exists():
-                gff_file = candidate
-                break
-    
-    if fasta_file is None:
-        for name in ['fna.gz', 'fasta.gz', 'genome.fna.gz', 'genome.fasta.gz']:
-            candidate = species_dir / name
-            if candidate.exists():
-                fasta_file = candidate
-                break
-    
-    return fasta_file, gff_file
-
-
-def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_dir, n_workers=1):
-    """Run parse_data.py for a single species"""
-    
-    cmd = [
-        "python3", "bin/parse_data.py",
-        str(fasta_path),
-        str(gff_path),
-        str(output_dir),
-        "--limit", str(limit),
-        "--n_workers", str(n_workers),
-        "--extract_tokens", "data/new_tokens.txt",
-    ]
-    
-    log_file = log_dir / f"{species_name}.log"
-    
-    try:
-        with open(log_file, 'w') as log:
-            log.write(f"{'='*20} PARSING: {species_name} {'='*20}\n")
-            log.write(f"FASTA: {fasta_path}\n")
-            log.write(f"GFF:   {gff_path}\n")
-            log.write(f"Limit: {limit} bp\n")
-            log.write(f"{'='*60}\n\n")
-            log.flush()
-            
-            result = subprocess.run(
-                cmd,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-        
-        return {
-            "species":  species_name,
-            "success":  result.returncode == 0,
-            "log_file": str(log_file),
-            "output":   str(output_dir),
-        }
-    
-    except Exception as e:
-        return {
-            "species":  species_name,
-            "success":  False,
-            "error":    str(e),
-            "log_file": str(log_file),
-        }
-
-
-def process_species(args):
-    """Worker function for parallel species processing"""
-    
-    species_name, raw_dir, baked_dir, log_dir, limit, n_workers = args
-    
-    species_raw_dir = Path(raw_dir) / species_name
-    
-    if not species_raw_dir.exists():
-        return {
-            "species": species_name,
-            "success": False,
-            "error":   f"Directory not found: {species_raw_dir}",
-        }
-    
-    fasta_file, gff_file = find_genome_files(species_raw_dir)
-    
-    if fasta_file is None or gff_file is None:
-        return {
-            "species": species_name,
-            "success": False,
-            "error":   f"Missing FASTA or GFF in: {species_raw_dir}",
-        }
-    
-    output_dir = Path(baked_dir) / species_name
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    return run_parse_data(
-        species_name, fasta_file, gff_file, output_dir, limit, log_dir, n_workers
-    )
+    exit(main())
