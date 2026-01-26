@@ -18,11 +18,6 @@ build_gene_index      = parser.build_gene_index
 extract_feature_types = parser.extract_feature_types
 extract_biotypes      = parser.extract_biotypes
 
-# Streaming support for large genomes
-stream_fasta          = parser.stream_fasta
-estimate_fasta_size   = parser.estimate_fasta_size
-parse_gff_by_seqid    = parser.parse_gff_by_seqid
-
 
 #####################
 #####  Binary   #####

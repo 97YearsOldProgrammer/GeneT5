@@ -43,54 +43,6 @@ def parse_fasta(fasta_path):
     return sequences
 
 
-def stream_fasta(fasta_path):
-    """Stream FASTA file one sequence at a time (memory efficient)
-    
-    Yields (seqid, sequence) tuples one at a time, keeping only
-    one chromosome in memory. Essential for large genomes like Axolotl.
-    """
-
-    current_id  = None
-    current_seq = []
-
-    open_func = gzip.open if str(fasta_path).endswith('.gz') else open
-    mode      = 'rt' if str(fasta_path).endswith('.gz') else 'r'
-
-    with open_func(fasta_path, mode) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-
-            if line.startswith('>'):
-                # Yield previous sequence
-                if current_id is not None:
-                    yield current_id, ''.join(current_seq)
-
-                header      = line[1:].split()[0]
-                current_id  = header
-                current_seq = []
-            else:
-                current_seq.append(line.upper())
-
-    # Yield last sequence
-    if current_id is not None:
-        yield current_id, ''.join(current_seq)
-
-
-def estimate_fasta_size(fasta_path):
-    """Estimate uncompressed FASTA size in bytes"""
-
-    fasta_path = str(fasta_path)
-
-    if fasta_path.endswith('.gz'):
-        # Estimate: compressed gz is typically 3-4x smaller
-        compressed_size = os.path.getsize(fasta_path)
-        return compressed_size * 3.5
-    else:
-        return os.path.getsize(fasta_path)
-
-
 #################
 #####  GFF  #####
 #################
@@ -160,55 +112,6 @@ def parse_gff(gff_path):
             features.append(feature)
 
     return features
-
-
-def parse_gff_by_seqid(gff_path):
-    """Parse GFF3 and group features by seqid (memory efficient for large genomes)
-    
-    Returns dict: {seqid: [features]}
-    """
-
-    features_by_seqid = defaultdict(list)
-
-    open_func = gzip.open if str(gff_path).endswith('.gz') else open
-    mode      = 'rt' if str(gff_path).endswith('.gz') else 'r'
-
-    with open_func(gff_path, mode) as f:
-        for line in f:
-            line = line.strip()
-
-            if not line or line.startswith('#'):
-                continue
-
-            parts = line.split('\t')
-            if len(parts) < 9:
-                continue
-
-            seqid  = parts[0]
-            source = parts[1]
-            ftype  = parts[2]
-            start  = int(parts[3])
-            end    = int(parts[4])
-            score  = parts[5]
-            strand = parts[6]
-            phase  = parts[7]
-            attrs  = parse_gff_attributes(parts[8])
-
-            feature = {
-                "seqid":      seqid,
-                "source":     source,
-                "type":       ftype,
-                "start":      start,
-                "end":        end,
-                "score":      score,
-                "strand":     strand,
-                "phase":      phase,
-                "attributes": attrs,
-            }
-
-            features_by_seqid[seqid].append(feature)
-
-    return dict(features_by_seqid)
 
 
 ########################
