@@ -10,8 +10,6 @@ from lib.dataset.wrapper import (
     # Validation
     build_validation_set,
     save_validation_set,
-    compute_all_complexities,
-    identify_mean_complexity_genes,
     
     # Chunking
     dynamic_chunking,
@@ -20,7 +18,6 @@ from lib.dataset.wrapper import (
     # Compacting
     compact_chunks,
     flatten_groups,
-    COMPACT_SEP,
     
     # Binary I/O
     write_binary,
@@ -31,11 +28,8 @@ from lib.dataset.wrapper import (
     
     # Dataload
     build_length_index,
-    BinaryDatasetReader,
     BinaryTrainDataset,
     DynamicPaddingCollator,
-    BatchTokenizingCollator,
-    CompactingCollator,
     SmartBatchSampler,
     
     # Util

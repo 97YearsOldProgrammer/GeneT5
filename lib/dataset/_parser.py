@@ -91,22 +91,6 @@ def estimate_fasta_size(fasta_path):
         return os.path.getsize(fasta_path)
 
 
-def get_fasta_seqids(fasta_path):
-    """Get list of sequence IDs without loading sequences"""
-
-    seqids    = []
-    open_func = gzip.open if str(fasta_path).endswith('.gz') else open
-    mode      = 'rt' if str(fasta_path).endswith('.gz') else 'r'
-
-    with open_func(fasta_path, mode) as f:
-        for line in f:
-            if line.startswith('>'):
-                header = line[1:].split()[0]
-                seqids.append(header)
-
-    return seqids
-
-
 #################
 #####  GFF  #####
 #################
@@ -227,12 +211,6 @@ def parse_gff_by_seqid(gff_path):
     return dict(features_by_seqid)
 
 
-def filter_features_by_seqid(features, seqid):
-    """Filter feature list to single seqid"""
-
-    return [f for f in features if f["seqid"] == seqid]
-
-
 ########################
 #####  Gene Index  #####
 ########################
@@ -323,13 +301,6 @@ def build_gene_index(features):
             gene_index[parent]["features"].append(feat)
 
     return gene_index
-
-
-def build_gene_index_for_seqid(features_by_seqid, seqid):
-    """Build gene index for a single seqid"""
-
-    features = features_by_seqid.get(seqid, [])
-    return build_gene_index(features)
 
 
 ###########################

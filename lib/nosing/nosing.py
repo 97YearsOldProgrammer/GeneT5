@@ -256,20 +256,3 @@ class GFFNoiser:
             })
 
         return hints
-
-    def format_hints_for_input(self, hints, hint_token="[HIT]"):
-        """Format hints as input string"""
-
-        if not hints:
-            return ""
-
-        lines = [hint_token]
-
-        for hint in sorted(hints, key=lambda x: x["start"]):
-            ftype  = hint["type"].lower()
-            start  = hint["start"]
-            end    = hint["end"]
-            strand = hint.get("strand", "+")
-            lines.append(f"{ftype}\t{start}\t{end}\t{strand}")
-
-        return "\n".join(lines)

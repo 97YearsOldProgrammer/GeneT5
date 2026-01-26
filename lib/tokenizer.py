@@ -59,25 +59,6 @@ def load_tokens_from_txt(txt_path):
     return tokens
 
 
-def append_tokens_to_txt(tokens, txt_path):
-    """Append tokens to existing txt file, avoiding duplicates"""
-    path = Path(txt_path)
-    
-    existing = set()
-    if path.exists():
-        existing = set(load_tokens_from_txt(txt_path))
-    
-    new_tokens = [t for t in tokens if t not in existing]
-    
-    if new_tokens:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, 'a') as f:
-            for token in new_tokens:
-                f.write(f"{token}\n")
-    
-    return new_tokens
-
-
 def append_tokens_to_config(config, new_tokens):
     """Append new tokens to tokenizer config"""
     if not new_tokens:

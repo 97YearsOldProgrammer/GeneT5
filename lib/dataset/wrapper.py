@@ -21,10 +21,7 @@ extract_biotypes      = parser.extract_biotypes
 # Streaming support for large genomes
 stream_fasta          = parser.stream_fasta
 estimate_fasta_size   = parser.estimate_fasta_size
-get_fasta_seqids      = parser.get_fasta_seqids
 parse_gff_by_seqid    = parser.parse_gff_by_seqid
-filter_features_by_seqid    = parser.filter_features_by_seqid
-build_gene_index_for_seqid  = parser.build_gene_index_for_seqid
 
 
 #####################
@@ -65,8 +62,6 @@ COMPACT_SEP    = compacting.COMPACT_SEP
 
 build_validation_set       = validation.build_validation_set
 save_validation_set        = validation.save_validation_set
-compute_all_complexities   = validation.compute_all_complexities
-identify_mean_complexity_genes = validation.identify_mean_complexity_genes
 
 
 #####################
@@ -74,12 +69,8 @@ identify_mean_complexity_genes = validation.identify_mean_complexity_genes
 #####################
 
 
-BinaryDatasetReader     = dataload.BinaryDatasetReader
-build_length_index      = dataload.build_length_index
 BinaryTrainDataset      = dataload.BinaryTrainDataset
 DynamicPaddingCollator  = dataload.DynamicPaddingCollator
-BatchTokenizingCollator = dataload.BatchTokenizingCollator
-CompactingCollator      = dataload.CompactingCollator
 SmartBatchSampler       = dataload.SmartBatchSampler
 
 
