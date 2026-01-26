@@ -42,4 +42,9 @@ from lib.dataset.wrapper import (
     append_tokens_to_txt,
     format_size,
     print_run_stats,
+    
+    # Streaming (large genomes)
+    stream_fasta,
+    estimate_fasta_size,
+    parse_gff_by_seqid,
 )
