@@ -396,6 +396,14 @@ def write_bake_summary(log_path, run_config, species_results, species_stats, tok
         f.write(f"  Compact:         {run_config.get('compact', False)}\n")
         if run_config.get('compact'):
             f.write(f"  Compact target:  {run_config.get('compact_target', 8192)}\n")
+        
+        # Memory configuration
+        if run_config.get('memory_limit_pct') is not None:
+            f.write(f"\n  Memory Monitoring:\n")
+            f.write(f"    RAM limit:       {run_config.get('memory_limit_pct', 80):.1f}%\n")
+            f.write(f"    Throttle events: {run_config.get('throttle_events', 0)}\n")
+        else:
+            f.write(f"\n  Memory Monitoring: Disabled\n")
         f.write(f"\n")
         
         # Species results
