@@ -11,396 +11,453 @@ import triton
 import triton.language as tl
 
 
-####################
-#####  Config  #####
-####################
+##################
+##### CONFIG #####
+##################
 
 
 @dataclass
-class MoEConfig:
-    embed_dim:            int   = 768
-    ff_dim:               int   = 3072
-    num_experts:          int   = 8
-    top_k:                int   = 2
-    dropout:              float = 0.0
-    capacity_factor:      float = 1.25
-    eval_capacity_factor: float = 2.0
-    aux_loss_weight:      float = 0.01
-    load_balance_weight:  float = 0.01
-    router_z_loss_weight: float = 0.001
-    activation:           str   = 'silu'
+class SparseAttentionConfig:
+    embed_dim:         int   = 768
+    num_heads:         int   = 12
+    block_size:        int   = 64
+    window_size:       int   = 256
+    num_global_tokens: int   = 64
+    num_random_blocks: int   = 3
+    dropout:           float = 0.0
+    use_alibi:         bool  = True
 
 
-#######################
-#####  Algorithm  #####
-#######################
+######################
+##### TRITON OPS #####
+######################
 
 
 @triton.jit
-def expert_fused_ffn_kernel(
-    X_ptr, Gate_W_ptr, Up_W_ptr, Down_W_ptr, Out_ptr,
-    expert_offsets_ptr, token_indices_ptr, token_weights_ptr,
-    embed_dim, ff_dim,
-    stride_xd,
-    stride_gw_e, stride_gw_d, stride_gw_f,
-    stride_uw_e, stride_uw_d, stride_uw_f,
-    stride_dw_e, stride_dw_f, stride_dw_d,
-    stride_od,
-    num_experts,
+def sparse_attention_fwd_kernel(
+    Q_ptr, K_ptr, V_ptr, Out_ptr,
+    Global_K_ptr, Global_V_ptr,
+    block_indices_ptr,
+    seq_len, num_heads, head_dim,
+    num_global_tokens, blocks_per_query,
+    stride_qb, stride_qh, stride_qs, stride_qd,
+    stride_kb, stride_kh, stride_ks, stride_kd,
+    stride_vb, stride_vh, stride_vs, stride_vd,
+    stride_ob, stride_oh, stride_os, stride_od,
+    stride_gkb, stride_gkh, stride_gks, stride_gkd,
+    stride_gvb, stride_gvh, stride_gvs, stride_gvd,
+    alibi_slopes_ptr,
+    use_alibi: tl.constexpr,
+    softmax_scale,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    BLOCK_F: tl.constexpr,
+    BLOCK_G: tl.constexpr,
 ):
-    """Fused expert FFN: SiLU(x @ W_gate) * (x @ W_up) @ W_down"""
+    """Sparse attention with bidirectional global token visibility"""
 
-    pid_token  = tl.program_id(0)
-    pid_expert = tl.program_id(1)
+    pid_batch   = tl.program_id(0)
+    pid_head    = tl.program_id(1)
+    pid_q_block = tl.program_id(2)
 
-    start_off = tl.load(expert_offsets_ptr + pid_expert)
-    end_off   = tl.load(expert_offsets_ptr + pid_expert + 1)
+    q_block_start = pid_q_block * BLOCK_M
+    offs_m        = q_block_start + tl.arange(0, BLOCK_M)
+    offs_d        = tl.arange(0, BLOCK_D)
 
-    if pid_token >= (end_off - start_off):
-        return
+    mask_m = offs_m < seq_len
 
-    global_token_idx = pid_token + start_off
-    orig_token_idx   = tl.load(token_indices_ptr + global_token_idx)
-    token_weight     = tl.load(token_weights_ptr + global_token_idx)
+    q_ptrs = (Q_ptr +
+              pid_batch * stride_qb +
+              pid_head * stride_qh +
+              offs_m[:, None] * stride_qs +
+              offs_d[None, :] * stride_qd)
+    q      = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
 
-    offs_d = tl.arange(0, BLOCK_D)
-    offs_f = tl.arange(0, BLOCK_F)
+    if use_alibi:
+        alibi_slope = tl.load(alibi_slopes_ptr + pid_head)
 
-    x_ptrs = X_ptr + orig_token_idx * stride_xd + offs_d
-    x      = tl.load(x_ptrs, mask=offs_d < embed_dim, other=0.0)
+    m_i = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
 
-    gate_acc = tl.zeros((BLOCK_F,), dtype=tl.float32)
-    up_acc   = tl.zeros((BLOCK_F,), dtype=tl.float32)
+    for g_start in range(0, num_global_tokens, BLOCK_G):
+        g_offs = g_start + tl.arange(0, BLOCK_G)
+        g_mask = g_offs < num_global_tokens
 
-    for d in range(0, embed_dim, BLOCK_D):
-        d_offs  = d + tl.arange(0, BLOCK_D)
-        d_mask  = d_offs < embed_dim
-        x_chunk = tl.load(X_ptr + orig_token_idx * stride_xd + d_offs, mask=d_mask, other=0.0)
+        gk_ptrs = (Global_K_ptr +
+                   pid_batch * stride_gkb +
+                   pid_head * stride_gkh +
+                   g_offs[:, None] * stride_gks +
+                   offs_d[None, :] * stride_gkd)
+        gk      = tl.load(gk_ptrs, mask=g_mask[:, None], other=0.0)
 
-        for f in range(0, ff_dim, BLOCK_F):
-            f_offs = f + tl.arange(0, BLOCK_F)
-            f_mask = f_offs < ff_dim
+        scores = tl.dot(q, tl.trans(gk)) * softmax_scale
 
-            gate_ptrs = (Gate_W_ptr +
-                         pid_expert * stride_gw_e +
-                         d_offs[:, None] * stride_gw_d +
-                         f_offs[None, :] * stride_gw_f)
-            gate_w    = tl.load(gate_ptrs, mask=d_mask[:, None] & f_mask[None, :], other=0.0)
+        if use_alibi:
+            q_pos      = offs_m[:, None].to(tl.float32)
+            k_pos      = g_offs[None, :].to(tl.float32)
+            dist       = tl.abs(q_pos - k_pos)
+            alibi_bias = -alibi_slope * dist
+            scores     = scores + alibi_bias
 
-            up_ptrs = (Up_W_ptr +
-                       pid_expert * stride_uw_e +
-                       d_offs[:, None] * stride_uw_d +
-                       f_offs[None, :] * stride_uw_f)
-            up_w    = tl.load(up_ptrs, mask=d_mask[:, None] & f_mask[None, :], other=0.0)
+        scores = tl.where(mask_m[:, None] & g_mask[None, :], scores, float('-inf'))
 
-            gate_acc += tl.sum(x_chunk[:, None] * gate_w, axis=0)
-            up_acc   += tl.sum(x_chunk[:, None] * up_w, axis=0)
+        m_ij  = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
 
-    hidden = tl.sigmoid(gate_acc) * gate_acc * up_acc
+        alpha = tl.exp(m_i - m_new)
+        beta  = tl.exp(m_ij - m_new)
 
-    out_acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
-    for f in range(0, ff_dim, BLOCK_F):
-        f_offs   = f + tl.arange(0, BLOCK_F)
-        f_mask   = f_offs < ff_dim
-        h_chunk  = tl.where(f_mask, hidden, 0.0)
+        l_i = alpha * l_i + beta * tl.sum(tl.exp(scores - m_ij[:, None]), axis=1)
 
-        down_ptrs = (Down_W_ptr +
-                     pid_expert * stride_dw_e +
-                     f_offs[:, None] * stride_dw_f +
-                     offs_d[None, :] * stride_dw_d)
-        down_w    = tl.load(down_ptrs, mask=f_mask[:, None] & (offs_d[None, :] < embed_dim), other=0.0)
-        out_acc  += tl.sum(h_chunk[:, None] * down_w, axis=0)
+        gv_ptrs = (Global_V_ptr +
+                   pid_batch * stride_gvb +
+                   pid_head * stride_gvh +
+                   g_offs[:, None] * stride_gvs +
+                   offs_d[None, :] * stride_gvd)
+        gv      = tl.load(gv_ptrs, mask=g_mask[:, None], other=0.0)
 
-    out_ptrs  = Out_ptr + orig_token_idx * stride_od + offs_d
-    existing  = tl.load(out_ptrs, mask=offs_d < embed_dim, other=0.0)
-    tl.store(out_ptrs, existing + out_acc * token_weight, mask=offs_d < embed_dim)
+        p   = tl.exp(scores - m_ij[:, None])
+        acc = alpha[:, None] * acc + tl.dot(p.to(gv.dtype), gv)
+
+        m_i = m_new
+
+    for block_idx in range(blocks_per_query):
+        kv_block_id = tl.load(block_indices_ptr + pid_q_block * blocks_per_query + block_idx)
+
+        if kv_block_id >= 0:
+            kv_block_start = kv_block_id * BLOCK_N
+            offs_n         = kv_block_start + tl.arange(0, BLOCK_N)
+            mask_n         = (offs_n < seq_len) & (offs_n >= num_global_tokens)
+
+            k_ptrs = (K_ptr +
+                      pid_batch * stride_kb +
+                      pid_head * stride_kh +
+                      offs_n[:, None] * stride_ks +
+                      offs_d[None, :] * stride_kd)
+            k      = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
+
+            scores = tl.dot(q, tl.trans(k)) * softmax_scale
+
+            if use_alibi:
+                q_pos      = offs_m[:, None].to(tl.float32)
+                k_pos      = offs_n[None, :].to(tl.float32)
+                dist       = tl.abs(q_pos - k_pos)
+                alibi_bias = -alibi_slope * dist
+                scores     = scores + alibi_bias
+
+            scores = tl.where(mask_m[:, None] & mask_n[None, :], scores, float('-inf'))
+
+            m_ij  = tl.max(scores, axis=1)
+            m_new = tl.maximum(m_i, m_ij)
+
+            alpha = tl.exp(m_i - m_new)
+            beta  = tl.exp(m_ij - m_new)
+
+            l_i = alpha * l_i + beta * tl.sum(tl.exp(scores - m_ij[:, None]), axis=1)
+
+            v_ptrs = (V_ptr +
+                      pid_batch * stride_vb +
+                      pid_head * stride_vh +
+                      offs_n[:, None] * stride_vs +
+                      offs_d[None, :] * stride_vd)
+            v      = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+
+            p   = tl.exp(scores - m_ij[:, None])
+            acc = alpha[:, None] * acc + tl.dot(p.to(v.dtype), v)
+
+            m_i = m_new
+
+    acc = acc / l_i[:, None]
+
+    out_ptrs = (Out_ptr +
+                pid_batch * stride_ob +
+                pid_head * stride_oh +
+                offs_m[:, None] * stride_os +
+                offs_d[None, :] * stride_od)
+    tl.store(out_ptrs, acc, mask=mask_m[:, None])
 
 
 @triton.jit
-def batched_expert_gemm_kernel(
-    X_ptr, W_ptr, Out_ptr,
-    expert_ids_ptr, token_indices_ptr, token_weights_ptr,
-    num_tokens, embed_dim, out_dim,
-    stride_x, stride_w_e, stride_w_in, stride_w_out, stride_o,
-    BLOCK_IN:  tl.constexpr,
-    BLOCK_OUT: tl.constexpr,
+def global_token_attention_kernel(
+    Q_ptr, K_ptr, V_ptr, Out_ptr,
+    seq_len, num_heads, head_dim,
+    num_global_tokens,
+    stride_qb, stride_qh, stride_qs, stride_qd,
+    stride_kb, stride_kh, stride_ks, stride_kd,
+    stride_vb, stride_vh, stride_vs, stride_vd,
+    stride_ob, stride_oh, stride_os, stride_od,
+    alibi_slopes_ptr,
+    use_alibi: tl.constexpr,
+    softmax_scale,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
 ):
-    """Batched GEMM across all experts without Python loops"""
+    """Full attention for global tokens - they see ALL tokens"""
 
-    pid = tl.program_id(0)
+    pid_batch  = tl.program_id(0)
+    pid_head   = tl.program_id(1)
+    pid_g      = tl.program_id(2)
 
-    if pid >= num_tokens:
-        return
+    g_start = pid_g * BLOCK_M
+    offs_g  = g_start + tl.arange(0, BLOCK_M)
+    offs_d  = tl.arange(0, BLOCK_D)
 
-    token_idx  = tl.load(token_indices_ptr + pid)
-    expert_id  = tl.load(expert_ids_ptr + pid)
-    weight     = tl.load(token_weights_ptr + pid)
+    mask_g = offs_g < num_global_tokens
 
-    offs_in  = tl.arange(0, BLOCK_IN)
-    offs_out = tl.arange(0, BLOCK_OUT)
+    q_ptrs = (Q_ptr +
+              pid_batch * stride_qb +
+              pid_head * stride_qh +
+              offs_g[:, None] * stride_qs +
+              offs_d[None, :] * stride_qd)
+    q      = tl.load(q_ptrs, mask=mask_g[:, None], other=0.0)
 
-    acc = tl.zeros((BLOCK_OUT,), dtype=tl.float32)
+    if use_alibi:
+        alibi_slope = tl.load(alibi_slopes_ptr + pid_head)
 
-    for i in range(0, embed_dim, BLOCK_IN):
-        i_offs = i + offs_in
-        i_mask = i_offs < embed_dim
+    m_i = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
 
-        x = tl.load(X_ptr + token_idx * stride_x + i_offs, mask=i_mask, other=0.0)
+    for n_start in range(0, seq_len, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < seq_len
 
-        for o in range(0, out_dim, BLOCK_OUT):
-            o_offs = o + offs_out
-            o_mask = o_offs < out_dim
+        k_ptrs = (K_ptr +
+                  pid_batch * stride_kb +
+                  pid_head * stride_kh +
+                  offs_n[:, None] * stride_ks +
+                  offs_d[None, :] * stride_kd)
+        k      = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
 
-            w_ptrs = (W_ptr +
-                      expert_id * stride_w_e +
-                      i_offs[:, None] * stride_w_in +
-                      o_offs[None, :] * stride_w_out)
-            w      = tl.load(w_ptrs, mask=i_mask[:, None] & o_mask[None, :], other=0.0)
+        scores = tl.dot(q, tl.trans(k)) * softmax_scale
 
-            acc += tl.sum(x[:, None] * w, axis=0)
+        if use_alibi:
+            q_pos      = offs_g[:, None].to(tl.float32)
+            k_pos      = offs_n[None, :].to(tl.float32)
+            dist       = tl.abs(q_pos - k_pos)
+            alibi_bias = -alibi_slope * dist
+            scores     = scores + alibi_bias
 
-    out_ptrs = Out_ptr + token_idx * stride_o + offs_out
-    existing = tl.load(out_ptrs, mask=offs_out < out_dim, other=0.0)
-    tl.store(out_ptrs, existing + acc * weight, mask=offs_out < out_dim)
+        scores = tl.where(mask_g[:, None] & mask_n[None, :], scores, float('-inf'))
+
+        m_ij  = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+
+        alpha = tl.exp(m_i - m_new)
+        beta  = tl.exp(m_ij - m_new)
+
+        l_i = alpha * l_i + beta * tl.sum(tl.exp(scores - m_ij[:, None]), axis=1)
+
+        v_ptrs = (V_ptr +
+                  pid_batch * stride_vb +
+                  pid_head * stride_vh +
+                  offs_n[:, None] * stride_vs +
+                  offs_d[None, :] * stride_vd)
+        v      = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+
+        p   = tl.exp(scores - m_ij[:, None])
+        acc = alpha[:, None] * acc + tl.dot(p.to(v.dtype), v)
+
+        m_i = m_new
+
+    acc = acc / l_i[:, None]
+
+    out_ptrs = (Out_ptr +
+                pid_batch * stride_ob +
+                pid_head * stride_oh +
+                offs_g[:, None] * stride_os +
+                offs_d[None, :] * stride_od)
+    tl.store(out_ptrs, acc, mask=mask_g[:, None])
 
 
-class Router(nn.Module):
-    """Top-K router for expert selection"""
+##############################
+#####  SPARSE ATTENTION  #####
+##############################
 
-    def __init__(self, embed_dim, num_experts, top_k=2):
+
+class SparseAttention(nn.Module):
+    """BigBird-style sparse attention with bidirectional global tokens"""
+
+    def __init__(self, config, is_causal=False):
         super().__init__()
 
-        self.num_experts = num_experts
-        self.top_k       = top_k
-        self.gate        = nn.Linear(embed_dim, num_experts, bias=False)
+        self.config            = config
+        self.is_causal         = is_causal
+        self.embed_dim         = config.embed_dim
+        self.num_heads         = config.num_heads
+        self.head_dim          = config.embed_dim // config.num_heads
+        self.block_size        = config.block_size
+        self.window_size       = config.window_size
+        self.num_global_tokens = config.num_global_tokens
+        self.num_random_blocks = config.num_random_blocks
+        self.softmax_scale     = 1.0 / math.sqrt(self.head_dim)
 
-    def forward(self, x):
-        logits           = self.gate(x)
-        probs            = F.softmax(logits, dim=-1)
-        weights, indices = torch.topk(probs, self.top_k, dim=-1)
-        weights          = weights / weights.sum(dim=-1, keepdim=True)
+        self.q = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
+        self.k = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
+        self.v = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
+        self.o = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
 
-        return indices, weights, logits
+        self.dropout = nn.Dropout(config.dropout)
 
-
-class FusedExpertWeights(nn.Module):
-    """Fused expert weights for batched computation"""
-
-    def __init__(self, num_experts, embed_dim, ff_dim):
-        super().__init__()
-
-        self.num_experts = num_experts
-        self.embed_dim   = embed_dim
-        self.ff_dim      = ff_dim
-
-        self.gate_weights = nn.Parameter(torch.empty(num_experts, embed_dim, ff_dim))
-        self.up_weights   = nn.Parameter(torch.empty(num_experts, embed_dim, ff_dim))
-        self.down_weights = nn.Parameter(torch.empty(num_experts, ff_dim, embed_dim))
-
-        self._init_weights()
-
-    def _init_weights(self):
-        std = 0.02
-        nn.init.normal_(self.gate_weights, std=std)
-        nn.init.normal_(self.up_weights, std=std)
-        nn.init.normal_(self.down_weights, std=std)
-
-
-class MoE(nn.Module):
-    """Mixture of Experts with fused Triton kernels"""
-
-    def __init__(self, config):
-        super().__init__()
-
-        self.config               = config
-        self.embed_dim            = config.embed_dim
-        self.ff_dim               = config.ff_dim
-        self.num_experts          = config.num_experts
-        self.top_k                = config.top_k
-        self.capacity_factor      = config.capacity_factor
-        self.eval_capacity_factor = config.eval_capacity_factor
-        self.load_balance_weight  = config.load_balance_weight
-        self.router_z_weight      = config.router_z_loss_weight
-
-        self.gate           = nn.Linear(config.embed_dim, config.num_experts, bias=False)
-        self.expert_weights = FusedExpertWeights(config.num_experts, config.embed_dim, config.ff_dim)
-        self.dropout        = nn.Dropout(config.dropout)
-
-        self._use_triton = True
-
-    def _prepare_expert_batches(self, top_k_indices, top_k_probs, num_tokens, device):
-        """Prepare sorted token batches for fused expert computation"""
-
-        flat_indices = top_k_indices.reshape(-1)
-        flat_probs   = top_k_probs.reshape(-1)
-        flat_tokens  = torch.arange(num_tokens, device=device).unsqueeze(1).expand(-1, self.top_k).reshape(-1)
-
-        sorted_idx     = torch.argsort(flat_indices, stable=True)
-        sorted_experts = flat_indices[sorted_idx]
-        sorted_tokens  = flat_tokens[sorted_idx]
-        sorted_weights = flat_probs[sorted_idx]
-
-        expert_counts  = torch.bincount(sorted_experts, minlength=self.num_experts)
-        expert_offsets = torch.zeros(self.num_experts + 1, dtype=torch.long, device=device)
-        expert_offsets[1:] = expert_counts.cumsum(0)
-
-        return sorted_experts, sorted_tokens, sorted_weights, expert_offsets
-
-    def _forward_triton(self, x_flat, top_k_indices, top_k_probs):
-        """Triton-accelerated expert computation without Python loops"""
-
-        num_tokens, embed_dim = x_flat.shape
-        device                = x_flat.device
-
-        sorted_experts, sorted_tokens, sorted_weights, expert_offsets = \
-            self._prepare_expert_batches(top_k_indices, top_k_probs, num_tokens, device)
-
-        output      = torch.zeros_like(x_flat)
-        total_items = sorted_tokens.shape[0]
-
-        if total_items == 0:
-            return output
-
-        BLOCK_IN  = min(128, embed_dim)
-        BLOCK_OUT = min(128, self.ff_dim)
-
-        hidden = torch.zeros(num_tokens, self.ff_dim, device=device, dtype=x_flat.dtype)
-
-        gate_w = self.expert_weights.gate_weights
-        up_w   = self.expert_weights.up_weights
-        down_w = self.expert_weights.down_weights
-
-        grid = (total_items,)
-
-        batched_expert_gemm_kernel[grid](
-            x_flat, gate_w, hidden,
-            sorted_experts, sorted_tokens, torch.ones_like(sorted_weights),
-            total_items, embed_dim, self.ff_dim,
-            x_flat.stride(0),
-            gate_w.stride(0), gate_w.stride(1), gate_w.stride(2),
-            hidden.stride(0),
-            BLOCK_IN=BLOCK_IN, BLOCK_OUT=BLOCK_OUT,
-        )
-
-        hidden_up = torch.zeros_like(hidden)
-        batched_expert_gemm_kernel[grid](
-            x_flat, up_w, hidden_up,
-            sorted_experts, sorted_tokens, torch.ones_like(sorted_weights),
-            total_items, embed_dim, self.ff_dim,
-            x_flat.stride(0),
-            up_w.stride(0), up_w.stride(1), up_w.stride(2),
-            hidden_up.stride(0),
-            BLOCK_IN=BLOCK_IN, BLOCK_OUT=BLOCK_OUT,
-        )
-
-        hidden = F.silu(hidden) * hidden_up
-
-        batched_expert_gemm_kernel[grid](
-            hidden, down_w, output,
-            sorted_experts, sorted_tokens, sorted_weights,
-            total_items, self.ff_dim, embed_dim,
-            hidden.stride(0),
-            down_w.stride(0), down_w.stride(1), down_w.stride(2),
-            output.stride(0),
-            BLOCK_IN=BLOCK_OUT, BLOCK_OUT=BLOCK_IN,
-        )
-
-        return output
-
-    def _forward_pytorch(self, x_flat, top_k_indices, top_k_probs):
-        """Batched PyTorch fallback avoiding per-expert loops"""
-
-        num_tokens, embed_dim = x_flat.shape
-        device                = x_flat.device
-
-        sorted_experts, sorted_tokens, sorted_weights, expert_offsets = \
-            self._prepare_expert_batches(top_k_indices, top_k_probs, num_tokens, device)
-
-        output = torch.zeros_like(x_flat)
-
-        gate_w = self.expert_weights.gate_weights
-        up_w   = self.expert_weights.up_weights
-        down_w = self.expert_weights.down_weights
-
-        for expert_id in range(self.num_experts):
-            start = expert_offsets[expert_id].item()
-            end   = expert_offsets[expert_id + 1].item()
-
-            if start == end:
-                continue
-
-            token_ids = sorted_tokens[start:end]
-            weights   = sorted_weights[start:end].unsqueeze(-1)
-
-            expert_input = x_flat[token_ids]
-
-            gate_out = F.silu(expert_input @ gate_w[expert_id])
-            up_out   = expert_input @ up_w[expert_id]
-            hidden   = gate_out * up_out
-            out      = hidden @ down_w[expert_id]
-
-            output.index_add_(0, token_ids, out * weights)
-
-        return output
-
-    def forward(self, x):
-        batch_size, seq_len, embed_dim = x.shape
-        num_tokens                     = batch_size * seq_len
-        x_flat                         = x.view(num_tokens, embed_dim)
-
-        router_logits              = self.gate(x_flat)
-        router_probs               = F.softmax(router_logits, dim=-1)
-        top_k_probs, top_k_indices = torch.topk(router_probs, self.top_k, dim=-1)
-        top_k_probs                = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
-
-        if self._use_triton and x_flat.is_cuda:
-            try:
-                output = self._forward_triton(x_flat, top_k_indices, top_k_probs)
-            except Exception:
-                output = self._forward_pytorch(x_flat, top_k_indices, top_k_probs)
+        if config.use_alibi:
+            slopes = self._compute_alibi_slopes(config.num_heads)
+            self.register_buffer('alibi_slopes', slopes)
         else:
-            output = self._forward_pytorch(x_flat, top_k_indices, top_k_probs)
+            self.alibi_slopes = None
 
-        output   = self.dropout(output)
-        output   = output.view(batch_size, seq_len, embed_dim)
-        aux_loss = self._compute_aux_loss(router_logits, router_probs, top_k_indices)
+        self._block_indices_cache = {}
 
-        return output, aux_loss
+    @staticmethod
+    def _compute_alibi_slopes(num_heads):
+        """Compute ALiBi slopes for positional bias"""
 
-    def _compute_aux_loss(self, router_logits, router_probs, top_k_indices):
-        """Compute auxiliary losses for load balancing"""
+        def get_slopes(n):
+            if n == 1:
+                return torch.tensor([1.0])
+            base = 2 ** (-2 ** -(math.log2(n) - 3))
+            return torch.tensor([base ** i for i in range(1, n + 1)])
 
-        num_tokens  = router_logits.shape[0]
-        expert_mask = F.one_hot(top_k_indices, self.num_experts).float().sum(dim=1)
-        f           = expert_mask.sum(dim=0) / (num_tokens * self.top_k)
-        P           = router_probs.mean(dim=0)
+        if math.log2(num_heads).is_integer():
+            return get_slopes(num_heads)
+        else:
+            closest_power = 2 ** math.floor(math.log2(num_heads))
+            slopes        = torch.cat([
+                get_slopes(closest_power),
+                get_slopes(2 * closest_power)[0::2][:num_heads - closest_power]
+            ])
+            return slopes
 
-        load_balance_loss = self.num_experts * (f * P).sum()
-        z_loss            = torch.logsumexp(router_logits, dim=-1).square().mean()
+    def _compute_block_indices(self, seq_len, device):
+        """Compute sparse block indices excluding global tokens"""
 
-        return self.load_balance_weight * load_balance_loss + self.router_z_weight * z_loss
+        cache_key = (seq_len, device)
+        if cache_key in self._block_indices_cache:
+            return self._block_indices_cache[cache_key]
 
-    def get_expert_utilization(self, x):
-        """Debug helper: get expert utilization statistics"""
+        num_blocks        = seq_len // self.block_size
+        num_global_blocks = self.num_global_tokens // self.block_size
+        window_blocks     = self.window_size // self.block_size
 
-        with torch.no_grad():
-            batch_size, seq_len, embed_dim = x.shape
-            num_tokens                     = batch_size * seq_len
-            x_flat                         = x.view(num_tokens, embed_dim)
+        max_blocks = (2 * window_blocks + 1) + self.num_random_blocks
 
-            router_logits    = self.gate(x_flat)
-            router_probs     = F.softmax(router_logits, dim=-1)
-            _, top_k_indices = torch.topk(router_probs, self.top_k, dim=-1)
+        block_indices = torch.full(
+            (num_blocks, max_blocks), -1, dtype=torch.long, device=device
+        )
 
-            counts = torch.zeros(self.num_experts, device=x.device)
-            for k in range(self.top_k):
-                for expert_id in range(self.num_experts):
-                    counts[expert_id] += (top_k_indices[:, k] == expert_id).sum()
+        for q_block in range(num_blocks):
+            idx      = 0
+            attended = set()
 
-            return {
-                "counts":     counts.cpu().tolist(),
-                "probs_mean": router_probs.mean(dim=0).cpu().tolist(),
-                "probs_std":  router_probs.std(dim=0).cpu().tolist(),
-            }
+            for g in range(num_global_blocks):
+                attended.add(g)
+
+            window_start = max(num_global_blocks, q_block - window_blocks)
+            window_end   = min(num_blocks, q_block + window_blocks + 1)
+            for w in range(window_start, window_end):
+                if w not in attended:
+                    block_indices[q_block, idx] = w
+                    attended.add(w)
+                    idx += 1
+
+            available = [b for b in range(num_global_blocks, num_blocks) if b not in attended]
+            if available:
+                torch.manual_seed(q_block)
+                perm = torch.randperm(len(available))[:self.num_random_blocks]
+                for p in perm:
+                    block_indices[q_block, idx] = available[p]
+                    idx += 1
+
+        self._block_indices_cache[cache_key] = block_indices
+        return block_indices
+
+    def forward(self, hidden_states, attention_mask=None):
+        B, L, D = hidden_states.shape
+
+        pad_len = (self.block_size - L % self.block_size) % self.block_size
+        if pad_len > 0:
+            hidden_states = F.pad(hidden_states, (0, 0, 0, pad_len))
+            L_padded      = L + pad_len
+        else:
+            L_padded = L
+
+        q = self.q(hidden_states).view(B, L_padded, self.num_heads, self.head_dim)
+        k = self.k(hidden_states).view(B, L_padded, self.num_heads, self.head_dim)
+        v = self.v(hidden_states).view(B, L_padded, self.num_heads, self.head_dim)
+
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+
+        if not q.is_contiguous():
+            q = q.contiguous()
+        if not k.is_contiguous():
+            k = k.contiguous()
+        if not v.is_contiguous():
+            v = v.contiguous()
+
+        out = torch.empty_like(q)
+
+        global_k = k[:, :, :self.num_global_tokens, :].contiguous()
+        global_v = v[:, :, :self.num_global_tokens, :].contiguous()
+
+        BLOCK_G       = min(64, self.num_global_tokens)
+        num_g_blocks  = (self.num_global_tokens + BLOCK_G - 1) // BLOCK_G
+        grid_global   = (B, self.num_heads, num_g_blocks)
+
+        alibi_ptr = self.alibi_slopes if self.alibi_slopes is not None else q
+
+        global_token_attention_kernel[grid_global](
+            q, k, v, out,
+            L_padded, self.num_heads, self.head_dim,
+            self.num_global_tokens,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            alibi_ptr,
+            self.alibi_slopes is not None,
+            self.softmax_scale,
+            BLOCK_M=BLOCK_G,
+            BLOCK_N=64,
+            BLOCK_D=self.head_dim,
+        )
+
+        block_indices    = self._compute_block_indices(L_padded, hidden_states.device)
+        num_blocks       = L_padded // self.block_size
+        blocks_per_query = block_indices.shape[1]
+
+        num_nonglobal_blocks = num_blocks - (self.num_global_tokens // self.block_size)
+        grid_sparse          = (B, self.num_heads, num_nonglobal_blocks)
+
+        sparse_attention_fwd_kernel[grid_sparse](
+            q, k, v, out,
+            global_k, global_v,
+            block_indices,
+            L_padded, self.num_heads, self.head_dim,
+            self.num_global_tokens, blocks_per_query,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            global_k.stride(0), global_k.stride(1), global_k.stride(2), global_k.stride(3),
+            global_v.stride(0), global_v.stride(1), global_v.stride(2), global_v.stride(3),
+            alibi_ptr,
+            self.alibi_slopes is not None,
+            self.softmax_scale,
+            BLOCK_M=self.block_size,
+            BLOCK_N=self.block_size,
+            BLOCK_D=self.head_dim,
+            BLOCK_G=BLOCK_G,
+        )
+
+        out = out.permute(0, 2, 1, 3).reshape(B, L_padded, D)
+        out = self.o(out)
+
+        if pad_len > 0:
+            out = out[:, :L, :]
+
+        out = self.dropout(out)
+
+        return out, None
