@@ -165,9 +165,26 @@ def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_di
                 text   = True,
             )
         
+        # Extract error from log if failed
+        error_msg = None
+        if result.returncode != 0:
+            try:
+                with open(log_file, 'r') as f:
+                    lines = f.readlines()
+                # Find last meaningful lines
+                content_lines = [l.strip() for l in lines if l.strip() and not l.startswith('=')]
+                if len(content_lines) <= 4:  # Only header, no output
+                    error_msg = "Crashed immediately (likely OOM)"
+                else:
+                    # Get last error line
+                    error_msg = content_lines[-1][:80] if content_lines else f"Exit code {result.returncode}"
+            except Exception:
+                error_msg = f"Exit code {result.returncode}"
+        
         return {
             "species":  species_name,
             "success":  result.returncode == 0,
+            "error":    error_msg,
             "log_file": str(log_file),
             "output":   str(output_dir),
         }
@@ -179,7 +196,6 @@ def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_di
             "error":    str(e),
             "log_file": str(log_file),
         }
-
 
 def process_species(args):
     """Worker function for parallel species processing"""
