@@ -98,6 +98,7 @@ def dynamic_chunking(sequences, gene_index, limit_bp=25000, overlap_bp=5000, anc
 
             for gene_id, gene_data in genes_in_chunk:
                 gene_ids.append(gene_id)
+                transcripts = gene_data.get("transcripts", {})
 
                 for feat in gene_data.get("features", []):
                     adj_start = feat["start"] - window_start
@@ -106,15 +107,26 @@ def dynamic_chunking(sequences, gene_index, limit_bp=25000, overlap_bp=5000, anc
                     if adj_start < 0 or adj_end > (window_end - window_start):
                         continue
 
+                    # Get transcript_id from Parent attribute
+                    transcript_id = feat.get("attributes", {}).get("Parent", "")
+
+                    # Get biotype from transcript
+                    biotype = "."
+                    if transcript_id and transcript_id in transcripts:
+                        biotype = transcripts[transcript_id].get("biotype", ".")
+
                     chunk_features.append({
-                        "type":    feat["type"].lower(),
-                        "start":   adj_start,
-                        "end":     adj_end,
-                        "strand":  feat["strand"],
-                        "phase":   feat.get("phase", "."),
-                        "gene_id": gene_id,
+                        "type":          feat["type"].lower(),
+                        "start":         adj_start,
+                        "end":           adj_end,
+                        "strand":        feat["strand"],
+                        "phase":         feat.get("phase", "."),
+                        "gene_id":       gene_id,
+                        "transcript_id": transcript_id,
+                        "biotype":       biotype,
                     })
 
+            # Primary biotype for chunk metadata
             biotypes = []
             for gene_id, gene_data in genes_in_chunk:
                 for t_id, t_data in gene_data.get("transcripts", {}).items():

@@ -1,9 +1,6 @@
 import json
 import random
 
-import torch
-from torch.utils.data import Dataset
-
 import lib.dataset._binary as binary
 
 
@@ -41,33 +38,15 @@ class BinaryDatasetReader:
                     input_ids = self.tokenizer.encode(sample["input_text"], add_special_tokens=False)
                     self._lengths.append(len(input_ids))
                 else:
-                    # Fallback: rough estimate
                     self._lengths.append(len(sample["input_text"]) // 4)
 
         return self._lengths
 
     def _format_sample(self, chunk):
-        """Format chunk as input/target text"""
+        """Format chunk as input/target text using BinaryChunk methods"""
 
-        input_text = chunk.sequence
-        if chunk.has_hints and chunk.hints:
-            input_text += "\n[HIT]"
-            for h in sorted(chunk.hints, key=lambda x: x.get("start", 0)):
-                htype   = h.get("type", "exon").lower()
-                hstart  = h.get("start", 0)
-                hend    = h.get("end", 0)
-                hstrand = h.get("strand", "+")
-                input_text += f"\n{htype}\t{hstart}\t{hend}\t{hstrand}"
-
-        target_text = "<BOS>"
-        for f in sorted(chunk.features, key=lambda x: x.get("start", 0)):
-            ftype   = f.get("type", "exon").lower()
-            fstart  = f.get("start", 0)
-            fend    = f.get("end", 0)
-            fstrand = f.get("strand", "+")
-            fphase  = f.get("phase", ".")
-            target_text += f"\n{ftype}\t{fstart}\t{fend}\t{fstrand}\t{fphase}"
-        target_text += "\n<EOS>"
+        input_text  = chunk.get_input_text()
+        target_text = chunk.get_target_text()
 
         return {
             "input_text":  input_text,
@@ -133,8 +112,13 @@ def get_binary_stats(binary_path):
     }
 
 
-class BinaryTrainDataset(Dataset):
-    """PyTorch dataset wrapper for binary training files"""
+#####################
+#####  Dataset  #####
+#####################
+
+
+class BinaryTrainDataset:
+    """Dataset wrapper for binary training files"""
 
     def __init__(self, binary_path, tokenizer, max_input_len, max_target_len, seed=42):
 
@@ -148,10 +132,10 @@ class BinaryTrainDataset(Dataset):
         self._info   = binary.get_binary_info(binary_path)
         self._length = self._info["num_chunks"]
         self._reader = BinaryDatasetReader(binary_path, tokenizer)
-        self.lengths = None  # Lazy load
+        self.lengths = None
 
     def build_length_index(self):
-        """Build length index for smart batching (call explicitly if needed)"""
+        """Build length index for smart batching"""
 
         if self.lengths is None:
             self.lengths = self._reader.lengths
@@ -187,6 +171,11 @@ class BinaryTrainDataset(Dataset):
         }
 
 
+######################
+#####  Collator  #####
+######################
+
+
 class DynamicPaddingCollator:
     """Collator that pads batches dynamically"""
 
@@ -216,42 +205,20 @@ class DynamicPaddingCollator:
                 lbl_pad = max_target_len - lbl_len
                 labels.append(b["labels"] + [self.label_pad] * lbl_pad)
 
+        # Return as lists - caller converts to tensors
         result = {
-            "input_ids":      torch.tensor(input_ids),
-            "attention_mask": torch.tensor(attention_mask),
+            "input_ids":      input_ids,
+            "attention_mask": attention_mask,
         }
 
         if labels:
-            result["labels"] = torch.tensor(labels)
+            result["labels"] = labels
 
         return result
 
 
 class CompactingCollator:
-    """
-    Collator for compacted samples with block-diagonal decoder attention.
-    
-    When multiple samples are packed into one sequence (separated by [SEP]),
-    the decoder should NOT attend across sample boundaries. This collator
-    creates a block-diagonal attention mask for the decoder.
-    
-    Example:
-        Sample 1: [BOS] exon 100 200 + . [EOS]
-        Sample 2: [BOS] cds  50  150 + 0 [EOS]
-        
-        Combined: [BOS] exon... [EOS] [SEP] [BOS] cds... [EOS]
-        
-        Decoder attention mask (1 = attend, 0 = ignore):
-        
-                  tok1 tok2 tok3 [SEP] tok4 tok5 tok6
-        tok1       1    1    1    0     0    0    0
-        tok2       1    1    1    0     0    0    0
-        tok3       1    1    1    0     0    0    0
-        [SEP]      0    0    0    1     0    0    0
-        tok4       0    0    0    0     1    1    1
-        tok5       0    0    0    0     1    1    1
-        tok6       0    0    0    0     1    1    1
-    """
+    """Collator for compacted samples with block-diagonal decoder attention"""
 
     def __init__(self, tokenizer, pad_token_id=None, label_pad=-100, sep_token="[SEP]"):
 
@@ -262,24 +229,16 @@ class CompactingCollator:
         self.sep_token_id = tokenizer.convert_tokens_to_ids(sep_token)
 
     def __call__(self, batch):
-        """
-        Collate batch with proper attention masks.
-        
-        Each item in batch should have:
-            - input_ids: list of token ids
-            - labels: list of label ids
-            - compact_group: group index (samples in same group are packed)
-        """
+        """Collate batch with proper attention masks for compacted samples"""
 
         # Group by compact_group
         groups = {}
         for item in batch:
-            group_id = item.get("compact_group", id(item))  # fallback to unique id
+            group_id = item.get("compact_group", id(item))
             if group_id not in groups:
                 groups[group_id] = []
             groups[group_id].append(item)
 
-        # Process each group
         all_input_ids       = []
         all_attention_masks = []
         all_labels          = []
@@ -287,14 +246,12 @@ class CompactingCollator:
 
         for group_id, items in groups.items():
             if len(items) == 1:
-                # Single sample - standard processing
                 item = items[0]
                 all_input_ids.append(item["input_ids"])
                 all_attention_masks.append([1] * len(item["input_ids"]))
                 all_labels.append(item["labels"])
-                all_decoder_masks.append(None)  # Standard causal mask
+                all_decoder_masks.append(None)
             else:
-                # Multiple samples - pack with separator
                 packed_input   = []
                 packed_labels  = []
                 segment_starts = []
@@ -302,13 +259,13 @@ class CompactingCollator:
                 for i, item in enumerate(items):
                     if i > 0:
                         packed_input.append(self.sep_token_id)
-                        packed_labels.append(self.label_pad)  # Don't predict separator
+                        packed_labels.append(self.label_pad)
 
                     segment_starts.append(len(packed_input))
                     packed_input.extend(item["input_ids"])
                     packed_labels.extend(item["labels"])
 
-                segment_starts.append(len(packed_input))  # End marker
+                segment_starts.append(len(packed_input))
 
                 # Build block-diagonal decoder mask
                 seq_len      = len(packed_labels)
@@ -320,7 +277,7 @@ class CompactingCollator:
 
                     for i in range(start, end):
                         for j in range(start, end):
-                            if j <= i:  # Causal within segment
+                            if j <= i:
                                 decoder_mask[i][j] = 1
 
                 all_input_ids.append(packed_input)
@@ -329,12 +286,12 @@ class CompactingCollator:
                 all_decoder_masks.append(decoder_mask)
 
         # Pad to max length
-        max_input_len  = max(len(x) for x in all_input_ids)
-        max_label_len  = max(len(x) for x in all_labels)
+        max_input_len = max(len(x) for x in all_input_ids)
+        max_label_len = max(len(x) for x in all_labels)
 
-        padded_inputs  = []
-        padded_masks   = []
-        padded_labels  = []
+        padded_inputs    = []
+        padded_masks     = []
+        padded_labels    = []
         padded_dec_masks = []
 
         for i in range(len(all_input_ids)):
@@ -349,7 +306,6 @@ class CompactingCollator:
             padded_labels.append(all_labels[i] + [self.label_pad] * lbl_pad)
 
             if all_decoder_masks[i] is not None:
-                # Expand decoder mask with padding
                 dec_mask = all_decoder_masks[i]
                 for row in dec_mask:
                     row.extend([0] * lbl_pad)
@@ -360,27 +316,29 @@ class CompactingCollator:
                 padded_dec_masks.append(None)
 
         result = {
-            "input_ids":      torch.tensor(padded_inputs),
-            "attention_mask": torch.tensor(padded_masks),
-            "labels":         torch.tensor(padded_labels),
+            "input_ids":      padded_inputs,
+            "attention_mask": padded_masks,
+            "labels":         padded_labels,
         }
 
-        # Add decoder attention mask if any samples are compacted
         if any(m is not None for m in padded_dec_masks):
-            # Convert None masks to standard causal
             final_dec_masks = []
             for i, mask in enumerate(padded_dec_masks):
                 if mask is None:
-                    # Standard causal mask
                     seq_len = max_label_len
                     causal  = [[1 if j <= i else 0 for j in range(seq_len)] for i in range(seq_len)]
                     final_dec_masks.append(causal)
                 else:
                     final_dec_masks.append(mask)
 
-            result["decoder_attention_mask"] = torch.tensor(final_dec_masks)
+            result["decoder_attention_mask"] = final_dec_masks
 
         return result
+
+
+#####################
+#####  Sampler  #####
+#####################
 
 
 class SmartBatchSampler:

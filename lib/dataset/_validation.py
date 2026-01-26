@@ -69,22 +69,12 @@ def calculate_complexity(gene_data):
 
 
 #######################
-#####  Utilities  #####
+#####  Selection  #####
 #######################
 
 
 def identify_long_genes(gene_groups, threshold_bp=50000, top_k=None):
-    """
-    Identify genes longer than threshold.
-    
-    Args:
-        gene_groups: dict of gene_id -> gene_data
-        threshold_bp: minimum length threshold in bp
-        top_k: if provided, return only top K longest genes (default: all)
-    
-    Returns:
-        List of (gene_id, gene_data, length) tuples, sorted by length descending
-    """
+    """Identify genes longer than threshold"""
 
     long_genes = []
 
@@ -96,10 +86,8 @@ def identify_long_genes(gene_groups, threshold_bp=50000, top_k=None):
         if gene_len > threshold_bp:
             long_genes.append((gene_id, gene_data, gene_len))
 
-    # Sort by length descending
     long_genes = sorted(long_genes, key=lambda x: -x[2])
 
-    # Limit to top_k if specified
     if top_k is not None and top_k > 0:
         long_genes = long_genes[:top_k]
 
@@ -195,7 +183,7 @@ def select_rare_samples(gene_groups, exclude_ids, num_samples=10, seed=42):
 
 
 #####################
-#####  Scenario  #####
+#####  Scenario #####
 #####################
 
 
@@ -206,8 +194,28 @@ def build_scenarios(gene_id, gene_data, seed=42):
 
     noiser         = nosing.GFFNoiser()
     features       = gene_data.get("features", [])
+    transcripts    = gene_data.get("transcripts", {})
     scenarios      = []
     scenario_types = ["perfect", "good", "bad", "empty"]
+
+    # Enrich features with transcript_id and biotype
+    enriched_features = []
+    for feat in features:
+        transcript_id = feat.get("attributes", {}).get("Parent", "")
+        biotype       = "."
+        if transcript_id and transcript_id in transcripts:
+            biotype = transcripts[transcript_id].get("biotype", ".")
+
+        enriched_features.append({
+            "type":          feat.get("type", "exon").lower(),
+            "start":         feat.get("start", 0),
+            "end":           feat.get("end", 0),
+            "strand":        feat.get("strand", "+"),
+            "phase":         feat.get("phase", "."),
+            "gene_id":       gene_id,
+            "transcript_id": transcript_id,
+            "biotype":       biotype,
+        })
 
     for stype in scenario_types:
         random.seed(seed + hash(stype) % 10000)
@@ -215,14 +223,14 @@ def build_scenarios(gene_id, gene_data, seed=42):
         if stype == "empty":
             hints = []
         elif stype == "perfect":
-            hints = [f.copy() for f in features]
+            hints = [f.copy() for f in enriched_features]
         else:
-            hints, _, _ = noiser.noise_features(features, "", scenario=stype)
+            hints, _, _ = noiser.noise_features(enriched_features, "", scenario=stype)
 
         scenarios.append({
             "gene_id":       gene_id,
             "scenario_type": stype,
-            "features":      [f.copy() for f in features],
+            "features":      [f.copy() for f in enriched_features],
             "hints":         hints,
             "start":         gene_data.get("start", 0),
             "end":           gene_data.get("end", 0),
@@ -241,18 +249,7 @@ def build_validation_set(
     num_easy_samples = 10,
     seed             = 42,
 ):
-    """
-    Build validation set using feature-based selection.
-    
-    Args:
-        gene_groups: dict of gene_id -> gene_data
-        long_threshold: minimum length threshold for long genes
-        top_k_long: number of top longest genes to include
-        top_k_complex: number of top complex genes to include
-        num_rare_samples: number of rare biotype samples
-        num_easy_samples: number of easy gene samples
-        seed: random seed
-    """
+    """Build validation set using feature-based selection"""
 
     validation = {
         "long_genes":   [],
@@ -263,7 +260,7 @@ def build_validation_set(
         "scenarios":    [],
     }
 
-    # Get top K long genes (filtered by threshold, limited to top_k)
+    # Get top K long genes
     long_genes = identify_long_genes(gene_groups, long_threshold, top_k_long)
     for gene_id, gene_data, length in long_genes:
         validation["long_genes"].append({
@@ -336,12 +333,11 @@ def build_validation_set(
 
 
 def save_validation_set(validation, output_path):
-    """Save validation set to JSON file and print stats to stdout"""
+    """Save validation set to JSON file"""
 
     output_path = pathlib.Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Data only - no stats in JSON
     save_data = {
         "long_genes":   validation["long_genes"],
         "complex_loci": validation["complex_loci"],
@@ -354,7 +350,6 @@ def save_validation_set(validation, output_path):
     with open(output_path, 'w') as f:
         json.dump(save_data, f, indent=2)
 
-    # Print stats to stdout
     print(f"\n  Validation Set:")
     print(f"    Long genes:     {len(validation['long_genes'])}")
     print(f"    Complex loci:   {len(validation['complex_loci'])}")
@@ -364,84 +359,3 @@ def save_validation_set(validation, output_path):
     print(f"    Scenarios:      {len(validation['scenarios'])}")
 
     return output_path
-
-
-def load_validation_set(input_path):
-    """Load existing validation set from JSON file"""
-
-    with open(input_path, 'r') as f:
-        data = json.load(f)
-
-    data["all_ids"] = set(data.get("all_ids", []))
-
-    return data
-
-
-def get_existing_ids(jsonl_path):
-    """Get gene IDs already in validation JSONL file"""
-
-    path = pathlib.Path(jsonl_path)
-    if not path.exists():
-        return set()
-
-    ids = set()
-    with open(path, 'r') as f:
-        for line in f:
-            if line.strip():
-                record = json.loads(line)
-                gid    = record.get("gene_id", "")
-                if gid:
-                    ids.add(gid)
-
-    return ids
-
-
-def scenario_to_record(scenario, sequences=None):
-    """Convert a validation scenario to JSONL record format"""
-
-    gene_id  = scenario.get("gene_id", "unknown")
-    start    = scenario.get("start", 0)
-    end      = scenario.get("end", 0)
-    strand   = scenario.get("strand", "+")
-    features = scenario.get("features", [])
-    hints    = scenario.get("hints", [])
-    stype    = scenario.get("scenario_type", "unknown")
-
-    input_parts = []
-
-    if sequences and gene_id in sequences:
-        seq = sequences.get(gene_id, "")
-    else:
-        seq = scenario.get("sequence", "")
-
-    if seq:
-        input_parts.append(seq)
-
-    if hints:
-        input_parts.append("[HIT]")
-        for h in sorted(hints, key=lambda x: x.get("start", 0)):
-            htype   = h.get("type", "exon").lower()
-            hstart  = h.get("start", 0)
-            hend    = h.get("end", 0)
-            hstrand = h.get("strand", "+")
-            input_parts.append(f"{htype}\t{hstart}\t{hend}\t{hstrand}")
-
-    target_parts = ["<BOS>"]
-    for f in sorted(features, key=lambda x: x.get("start", 0)):
-        ftype   = f.get("type", "exon").lower()
-        fstart  = f.get("start", 0)
-        fend    = f.get("end", 0)
-        fstrand = f.get("strand", "+")
-        fphase  = f.get("phase", ".")
-        target_parts.append(f"{ftype}\t{fstart}\t{fend}\t{fstrand}\t{fphase}")
-    target_parts.append("<EOS>")
-
-    return {
-        "input":         "\n".join(input_parts),
-        "target":        "\n".join(target_parts),
-        "gene_id":       gene_id,
-        "scenario_type": stype,
-        "start":         start,
-        "end":           end,
-        "strand":        strand,
-    }

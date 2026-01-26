@@ -9,7 +9,7 @@ import pathlib
 #######################
 
 
-MAGIC_HEADER   = b'GT5B'  # GeneT5 Binary
+MAGIC_HEADER   = b'GT5B'
 FORMAT_VERSION = 1
 
 
@@ -122,6 +122,45 @@ class BinaryChunk:
             compact_group = meta.get("compact_group"),
         )
 
+    def _build_gene_transcript_indices(self):
+        """Build gene and transcript index mappings for features"""
+
+        gene_indices       = {}
+        transcript_indices = {}
+        gene_counter       = 1
+
+        sorted_features = sorted(self.features, key=lambda x: x.get("start", 0))
+
+        for f in sorted_features:
+            gene_id       = f.get("gene_id", "")
+            transcript_id = f.get("transcript_id", "")
+
+            if gene_id and gene_id not in gene_indices:
+                gene_indices[gene_id]       = gene_counter
+                transcript_indices[gene_id] = {}
+                gene_counter               += 1
+
+            if gene_id and transcript_id:
+                if transcript_id not in transcript_indices[gene_id]:
+                    t_idx = len(transcript_indices[gene_id]) + 1
+                    transcript_indices[gene_id][transcript_id] = t_idx
+
+        return gene_indices, transcript_indices
+
+    def _format_gene_idx(self, gene_id, transcript_id, gene_indices, transcript_indices):
+        """Format gene index with optional transcript index for alt splicing"""
+
+        gene_idx = gene_indices.get(gene_id, 1)
+
+        # Check if gene has multiple transcripts
+        if gene_id and transcript_id:
+            trans_map = transcript_indices.get(gene_id, {})
+            if len(trans_map) > 1:
+                t_idx = trans_map.get(transcript_id, 1)
+                return f"{gene_idx}.{t_idx}"
+
+        return str(gene_idx)
+
     def get_input_text(self):
         """Format chunk as input text for tokenization"""
 
@@ -134,34 +173,43 @@ class BinaryChunk:
                 hstart  = h.get("start", 0)
                 hend    = h.get("end", 0)
                 hstrand = h.get("strand", "+")
-                input_text += f"\n{htype}\t{hstart}\t{hend}\t{hstrand}"
+                input_text += f"\n{htype}{hstart}\t{hend}{hstrand}"
 
         return input_text
 
     def get_target_text(self):
         """Format chunk as target text for tokenization"""
 
-        target_text = "<BOS>"
+        gene_indices, transcript_indices = self._build_gene_transcript_indices()
 
-        for f in sorted(self.features, key=lambda x: x.get("start", 0)):
+        target_text     = "<BOS>"
+        sorted_features = sorted(self.features, key=lambda x: x.get("start", 0))
+
+        for f in sorted_features:
             ftype   = f.get("type", "exon").lower()
             fstart  = f.get("start", 0)
             fend    = f.get("end", 0)
             fstrand = f.get("strand", "+")
             fphase  = f.get("phase", ".")
-            target_text += f"\n{ftype}\t{fstart}\t{fend}\t{fstrand}\t{fphase}"
+            biotype = f.get("biotype", ".")
+
+            gene_id       = f.get("gene_id", "")
+            transcript_id = f.get("transcript_id", "")
+
+            gene_idx_str = self._format_gene_idx(
+                gene_id, transcript_id, gene_indices, transcript_indices
+            )
+
+            # Format: type start \t end strand phase biotype gene_idx
+            # biotype before gene_idx to avoid phase+gene_idx tokenizer confusion
+            target_text += f"\n{ftype}{fstart}\t{fend}{fstrand}{fphase}{biotype}{gene_idx_str}"
 
         target_text += "\n<EOS>"
 
         return target_text
 
     def estimate_input_tokens(self, tokenizer=None):
-        """
-        Estimate input token count for this chunk.
-        
-        If tokenizer provided: returns exact count
-        Otherwise: rough estimate (not recommended)
-        """
+        """Estimate input token count for this chunk"""
 
         input_text = self.get_input_text()
 
@@ -302,17 +350,3 @@ def get_binary_info(input_path):
         "total_size": total_size,
         "file_path":  str(input_path),
     }
-
-
-def merge_binary_files(input_paths, output_path, compress=True):
-    """Merge multiple binary files into one"""
-
-    all_chunks = []
-
-    for path in input_paths:
-        chunks = read_binary(path)
-        all_chunks.extend(chunks)
-
-    write_binary(all_chunks, output_path, compress)
-
-    return len(all_chunks)
