@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from transformers import AutoTokenizer
 
 
 #####################
@@ -136,3 +137,100 @@ def find_missing_tokens(config, tokens):
     
     existing = get_existing_tokens(config)
     return [t for t in tokens if t not in existing]
+
+
+#######################
+#####  Tokenizer  #####
+#######################
+
+
+class GeneTokenizer:
+    """Wrapper around HuggingFace tokenizer for GeneT5 models."""
+    
+    def __init__(self, tokenizer_path, trust_remote_code=True):
+        """
+        Load tokenizer from path.
+        
+        Args:
+            tokenizer_path: Path to tokenizer directory or tokenizer.json
+            trust_remote_code: Whether to trust remote code (default: True)
+        """
+        self.tokenizer_path = Path(tokenizer_path)
+        
+        # Try loading with AutoTokenizer first (handles most cases)
+        try:
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                str(tokenizer_path), 
+                trust_remote_code=trust_remote_code
+            )
+        except Exception as e:
+            # Fallback: try loading tokenizer.json directly
+            config, _ = load_tokenizer_config(tokenizer_path)
+            self._vocab = self._extract_vocab(config)
+            self._tokenizer = None
+    
+    def _extract_vocab(self, config):
+        """Extract vocabulary from tokenizer config."""
+        vocab = {}
+        
+        # Get vocab from model section
+        if "model" in config and "vocab" in config["model"]:
+            model_vocab = config["model"]["vocab"]
+            if isinstance(model_vocab, dict):
+                vocab.update(model_vocab)
+            elif isinstance(model_vocab, list):
+                vocab = {token: i for i, token in enumerate(model_vocab)}
+        
+        # Add tokens from added_tokens section
+        if "added_tokens" in config:
+            for token_info in config["added_tokens"]:
+                if isinstance(token_info, dict):
+                    if "content" in token_info and "id" in token_info:
+                        vocab[token_info["content"]] = token_info["id"]
+                elif isinstance(token_info, str):
+                    if token_info not in vocab:
+                        vocab[token_info] = len(vocab)
+        
+        return vocab
+    
+    def __len__(self):
+        """Return vocabulary size."""
+        if self._tokenizer is not None:
+            return len(self._tokenizer)
+        return len(self._vocab)
+    
+    def __call__(self, text, **kwargs):
+        """Tokenize text."""
+        if self._tokenizer is not None:
+            return self._tokenizer(text, **kwargs)
+        raise NotImplementedError("Direct tokenization requires HuggingFace tokenizer")
+    
+    def encode(self, text, **kwargs):
+        """Encode text to token ids."""
+        if self._tokenizer is not None:
+            return self._tokenizer.encode(text, **kwargs)
+        raise NotImplementedError("Encoding requires HuggingFace tokenizer")
+    
+    def decode(self, token_ids, **kwargs):
+        """Decode token ids to text."""
+        if self._tokenizer is not None:
+            return self._tokenizer.decode(token_ids, **kwargs)
+        raise NotImplementedError("Decoding requires HuggingFace tokenizer")
+    
+    @property
+    def vocab_size(self):
+        """Return vocabulary size."""
+        return len(self)
+    
+    def get_vocab(self):
+        """Return vocabulary dictionary."""
+        if self._tokenizer is not None:
+            return self._tokenizer.get_vocab()
+        return self._vocab.copy()
+    
+    def save_pretrained(self, save_path):
+        """Save tokenizer to directory."""
+        if self._tokenizer is not None:
+            self._tokenizer.save_pretrained(save_path)
+        else:
+            raise NotImplementedError("Saving requires HuggingFace tokenizer")
