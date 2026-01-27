@@ -36,18 +36,22 @@ class GQAttentionConfig:
 @triton.jit
 def gqa_cross_attention_fwd_kernel(
     Q_ptr, K_ptr, V_ptr, Out_ptr,
+    q_segment_ids_ptr, kv_segment_ids_ptr,
     q_len, kv_len, num_heads, num_kv_heads, head_dim,
     stride_qb, stride_qh, stride_qs, stride_qd,
     stride_kb, stride_kh, stride_ks, stride_kd,
     stride_vb, stride_vh, stride_vs, stride_vd,
     stride_ob, stride_oh, stride_os, stride_od,
+    stride_qsegb, stride_qsegs,
+    stride_kvsegb, stride_kvsegs,
     heads_per_group,
+    use_segment_mask: tl.constexpr,
     softmax_scale,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """Forward pass for GQA cross-attention with efficient KV head sharing"""
+    """Segment-aware GQA cross-attention"""
 
     pid_batch = tl.program_id(0)
     pid_head  = tl.program_id(1)
@@ -68,6 +72,10 @@ def gqa_cross_attention_fwd_kernel(
               offs_d[None, :] * stride_qd)
     q      = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
 
+    if use_segment_mask:
+        q_seg_ptrs = q_segment_ids_ptr + pid_batch * stride_qsegb + offs_m * stride_qsegs
+        q_seg_ids  = tl.load(q_seg_ptrs, mask=mask_m, other=-1)
+
     m_i = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
     l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
@@ -84,7 +92,14 @@ def gqa_cross_attention_fwd_kernel(
         k      = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
 
         scores = tl.dot(q, tl.trans(k)) * softmax_scale
-        scores = tl.where(mask_m[:, None] & mask_n[None, :], scores, float('-inf'))
+
+        if use_segment_mask:
+            kv_seg_ptrs = kv_segment_ids_ptr + pid_batch * stride_kvsegb + offs_n * stride_kvsegs
+            kv_seg_ids  = tl.load(kv_seg_ptrs, mask=mask_n, other=-1)
+            same_seg    = (q_seg_ids[:, None] == kv_seg_ids[None, :]) & (q_seg_ids[:, None] >= 0)
+            scores      = tl.where(same_seg & mask_m[:, None] & mask_n[None, :], scores, float('-inf'))
+        else:
+            scores = tl.where(mask_m[:, None] & mask_n[None, :], scores, float('-inf'))
 
         m_ij  = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, m_ij)
@@ -119,13 +134,16 @@ def gqa_cross_attention_fwd_kernel(
 @triton.jit
 def gqa_self_attention_fwd_kernel(
     Q_ptr, K_ptr, V_ptr, Out_ptr,
+    segment_ids_ptr,
     seq_len, num_heads, num_kv_heads, head_dim,
     stride_qb, stride_qh, stride_qs, stride_qd,
     stride_kb, stride_kh, stride_ks, stride_kd,
     stride_vb, stride_vh, stride_vs, stride_vd,
     stride_ob, stride_oh, stride_os, stride_od,
+    stride_segb, stride_segs,
     alibi_slopes_ptr,
     use_alibi: tl.constexpr,
+    use_segment_mask: tl.constexpr,
     heads_per_group,
     softmax_scale,
     is_causal: tl.constexpr,
@@ -133,7 +151,7 @@ def gqa_self_attention_fwd_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """Forward pass for GQA self-attention with optional causal mask"""
+    """Segment-aware GQA self-attention"""
 
     pid_batch = tl.program_id(0)
     pid_head  = tl.program_id(1)
@@ -156,6 +174,10 @@ def gqa_self_attention_fwd_kernel(
 
     if use_alibi:
         alibi_slope = tl.load(alibi_slopes_ptr + pid_head)
+
+    if use_segment_mask:
+        q_seg_ptrs = segment_ids_ptr + pid_batch * stride_segb + offs_m * stride_segs
+        q_seg_ids  = tl.load(q_seg_ptrs, mask=mask_m, other=-1)
 
     m_i = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
     l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
@@ -185,12 +207,19 @@ def gqa_self_attention_fwd_kernel(
             alibi_bias = -alibi_slope * dist
             scores     = scores + alibi_bias
 
+        valid_mask = mask_m[:, None] & mask_n[None, :]
+
         if is_causal:
             causal_mask = offs_m[:, None] >= offs_n[None, :]
-            scores      = tl.where(causal_mask & mask_m[:, None] & mask_n[None, :],
-                                   scores, float('-inf'))
-        else:
-            scores = tl.where(mask_m[:, None] & mask_n[None, :], scores, float('-inf'))
+            valid_mask  = valid_mask & causal_mask
+
+        if use_segment_mask:
+            k_seg_ptrs = segment_ids_ptr + pid_batch * stride_segb + offs_n * stride_segs
+            k_seg_ids  = tl.load(k_seg_ptrs, mask=mask_n, other=-1)
+            same_seg   = (q_seg_ids[:, None] == k_seg_ids[None, :]) & (q_seg_ids[:, None] >= 0)
+            valid_mask = valid_mask & same_seg
+
+        scores = tl.where(valid_mask, scores, float('-inf'))
 
         m_ij  = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, m_ij)
@@ -228,7 +257,7 @@ def gqa_self_attention_fwd_kernel(
 
 
 class GQAttention(nn.Module):
-    """Grouped Query Attention with efficient KV head sharing"""
+    """Grouped Query Attention with segment-aware masking"""
 
     def __init__(self, config, is_causal=False):
         super().__init__()
@@ -281,8 +310,8 @@ class GQAttention(nn.Module):
             ])
             return slopes
 
-    def _forward_pytorch_cross(self, hidden_states, key_value_states, attention_mask=None):
-        """PyTorch fallback for cross-attention without redundant KV expansion"""
+    def _forward_pytorch_cross(self, hidden_states, key_value_states, attention_mask=None, q_segment_ids=None, kv_segment_ids=None):
+        """PyTorch fallback for segment-aware cross-attention"""
 
         B, L_q, D = hidden_states.shape
         L_kv      = key_value_states.shape[1]
@@ -298,6 +327,12 @@ class GQAttention(nn.Module):
         q_grouped = q.view(B, self.num_kv_heads, self.heads_per_group, L_q, self.head_dim)
         scores    = torch.einsum('bghqd,bhkd->bghqk', q_grouped, k) * self.softmax_scale
 
+        if q_segment_ids is not None and kv_segment_ids is not None:
+            seg_mask = (q_segment_ids.unsqueeze(-1) == kv_segment_ids.unsqueeze(-2))
+            seg_mask = seg_mask & (q_segment_ids.unsqueeze(-1) >= 0)
+            seg_mask = seg_mask.unsqueeze(1).unsqueeze(2)
+            scores   = scores.masked_fill(~seg_mask, float('-inf'))
+
         if attention_mask is not None:
             scores = scores + attention_mask.unsqueeze(2)
 
@@ -311,8 +346,8 @@ class GQAttention(nn.Module):
 
         return out, None
 
-    def _forward_pytorch_self(self, hidden_states, attention_mask=None, position_bias=None):
-        """PyTorch fallback for self-attention without redundant KV expansion"""
+    def _forward_pytorch_self(self, hidden_states, attention_mask=None, position_bias=None, segment_ids=None):
+        """PyTorch fallback for segment-aware self-attention"""
 
         B, L, D = hidden_states.shape
 
@@ -341,6 +376,12 @@ class GQAttention(nn.Module):
             causal_mask = torch.triu(torch.ones(L, L, device=scores.device), diagonal=1).bool()
             scores      = scores.masked_fill(causal_mask, float('-inf'))
 
+        if segment_ids is not None:
+            seg_mask = (segment_ids.unsqueeze(-1) == segment_ids.unsqueeze(-2))
+            seg_mask = seg_mask & (segment_ids.unsqueeze(-1) >= 0)
+            seg_mask = seg_mask.unsqueeze(1).unsqueeze(2)
+            scores   = scores.masked_fill(~seg_mask, float('-inf'))
+
         if attention_mask is not None:
             scores = scores + attention_mask.unsqueeze(2)
 
@@ -354,8 +395,8 @@ class GQAttention(nn.Module):
 
         return out, position_bias
 
-    def _forward_triton_cross(self, hidden_states, key_value_states, attention_mask=None):
-        """Triton-optimized cross-attention forward pass"""
+    def _forward_triton_cross(self, hidden_states, key_value_states, attention_mask=None, q_segment_ids=None, kv_segment_ids=None):
+        """Triton-optimized segment-aware cross-attention"""
 
         B, L_q, D = hidden_states.shape
         L_kv      = key_value_states.shape[1]
@@ -377,6 +418,21 @@ class GQAttention(nn.Module):
 
         out = torch.empty_like(q)
 
+        use_segment_mask = q_segment_ids is not None and kv_segment_ids is not None
+
+        if use_segment_mask:
+            q_segment_ids  = q_segment_ids.contiguous()
+            kv_segment_ids = kv_segment_ids.contiguous()
+            stride_qsegb   = q_segment_ids.stride(0)
+            stride_qsegs   = q_segment_ids.stride(1) if q_segment_ids.dim() > 1 else 1
+            stride_kvsegb  = kv_segment_ids.stride(0)
+            stride_kvsegs  = kv_segment_ids.stride(1) if kv_segment_ids.dim() > 1 else 1
+        else:
+            stride_qsegb  = 0
+            stride_qsegs  = 0
+            stride_kvsegb = 0
+            stride_kvsegs = 0
+
         BLOCK_M = min(64, L_q)
         BLOCK_N = min(64, L_kv)
         BLOCK_D = self.head_dim
@@ -386,12 +442,17 @@ class GQAttention(nn.Module):
 
         gqa_cross_attention_fwd_kernel[grid](
             q, k, v, out,
+            q_segment_ids if use_segment_mask else q,
+            kv_segment_ids if use_segment_mask else k,
             L_q, L_kv, self.num_heads, self.num_kv_heads, self.head_dim,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            stride_qsegb, stride_qsegs,
+            stride_kvsegb, stride_kvsegs,
             self.heads_per_group,
+            use_segment_mask,
             self.softmax_scale,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
@@ -404,8 +465,8 @@ class GQAttention(nn.Module):
 
         return out, None
 
-    def _forward_triton_self(self, hidden_states, attention_mask=None):
-        """Triton-optimized self-attention forward pass"""
+    def _forward_triton_self(self, hidden_states, attention_mask=None, segment_ids=None):
+        """Triton-optimized segment-aware self-attention"""
 
         B, L, D = hidden_states.shape
 
@@ -426,6 +487,16 @@ class GQAttention(nn.Module):
 
         out = torch.empty_like(q)
 
+        use_segment_mask = segment_ids is not None
+
+        if use_segment_mask:
+            segment_ids = segment_ids.contiguous()
+            stride_segb = segment_ids.stride(0)
+            stride_segs = segment_ids.stride(1) if segment_ids.dim() > 1 else 1
+        else:
+            stride_segb = 0
+            stride_segs = 0
+
         BLOCK_M = min(64, L)
         BLOCK_N = min(64, L)
         BLOCK_D = self.head_dim
@@ -437,13 +508,16 @@ class GQAttention(nn.Module):
 
         gqa_self_attention_fwd_kernel[grid](
             q, k, v, out,
+            segment_ids if use_segment_mask else q,
             L, self.num_heads, self.num_kv_heads, self.head_dim,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            stride_segb, stride_segs,
             alibi_ptr,
             self.alibi_slopes is not None,
+            use_segment_mask,
             self.heads_per_group,
             self.softmax_scale,
             self.is_causal,
@@ -458,22 +532,23 @@ class GQAttention(nn.Module):
 
         return out, None
 
-    def forward(self, hidden_states, key_value_states=None, attention_mask=None, position_bias=None):
+    def forward(self, hidden_states, key_value_states=None, attention_mask=None, position_bias=None, segment_ids=None, q_segment_ids=None, kv_segment_ids=None):
+        """Forward with segment-aware masking for packed sequences"""
 
         if self.is_cross_attn and key_value_states is not None:
             if self._use_triton and hidden_states.is_cuda:
                 try:
-                    return self._forward_triton_cross(hidden_states, key_value_states, attention_mask)
+                    return self._forward_triton_cross(hidden_states, key_value_states, attention_mask, q_segment_ids, kv_segment_ids)
                 except Exception:
                     pass
-            return self._forward_pytorch_cross(hidden_states, key_value_states, attention_mask)
+            return self._forward_pytorch_cross(hidden_states, key_value_states, attention_mask, q_segment_ids, kv_segment_ids)
         else:
             if self._use_triton and hidden_states.is_cuda:
                 try:
-                    return self._forward_triton_self(hidden_states, attention_mask)
+                    return self._forward_triton_self(hidden_states, attention_mask, segment_ids)
                 except Exception:
                     pass
-            return self._forward_pytorch_self(hidden_states, attention_mask, position_bias)
+            return self._forward_pytorch_self(hidden_states, attention_mask, position_bias, segment_ids)
 
     def get_kv_cache_size(self, batch_size, seq_len):
         """Return KV cache size in bytes (float16)"""

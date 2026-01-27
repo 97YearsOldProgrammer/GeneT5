@@ -38,6 +38,7 @@ def sparse_attention_fwd_kernel(
     Q_ptr, K_ptr, V_ptr, Out_ptr,
     Global_K_ptr, Global_V_ptr,
     block_indices_ptr,
+    segment_ids_ptr,
     seq_len, num_heads, head_dim,
     num_global_tokens, blocks_per_query,
     start_block_idx,
@@ -47,15 +48,17 @@ def sparse_attention_fwd_kernel(
     stride_ob, stride_oh, stride_os, stride_od,
     stride_gkb, stride_gkh, stride_gks, stride_gkd,
     stride_gvb, stride_gvh, stride_gvs, stride_gvd,
+    stride_segb, stride_segs,
     alibi_slopes_ptr,
     use_alibi: tl.constexpr,
+    use_segment_mask: tl.constexpr,
     softmax_scale,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_G: tl.constexpr,
 ):
-    """Sparse attention with bidirectional global token visibility"""
+    """Sparse attention with segment-aware global tokens"""
 
     pid_batch   = tl.program_id(0)
     pid_head    = tl.program_id(1)
@@ -76,6 +79,10 @@ def sparse_attention_fwd_kernel(
 
     if use_alibi:
         alibi_slope = tl.load(alibi_slopes_ptr + pid_head)
+
+    if use_segment_mask:
+        q_seg_ptrs = segment_ids_ptr + pid_batch * stride_segb + offs_m * stride_segs
+        q_seg_ids  = tl.load(q_seg_ptrs, mask=mask_m, other=-1)
 
     m_i = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
     l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
@@ -101,7 +108,13 @@ def sparse_attention_fwd_kernel(
             alibi_bias = -alibi_slope * dist
             scores     = scores + alibi_bias
 
-        scores = tl.where(mask_m[:, None] & g_mask[None, :], scores, float('-inf'))
+        if use_segment_mask:
+            g_seg_ptrs  = segment_ids_ptr + pid_batch * stride_segb + g_offs * stride_segs
+            g_seg_ids   = tl.load(g_seg_ptrs, mask=g_mask, other=-1)
+            same_seg    = (q_seg_ids[:, None] == g_seg_ids[None, :]) & (q_seg_ids[:, None] >= 0)
+            scores      = tl.where(same_seg & mask_m[:, None] & g_mask[None, :], scores, float('-inf'))
+        else:
+            scores = tl.where(mask_m[:, None] & g_mask[None, :], scores, float('-inf'))
 
         m_ij  = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, m_ij)
@@ -182,24 +195,27 @@ def sparse_attention_fwd_kernel(
 @triton.jit
 def global_token_attention_kernel(
     Q_ptr, K_ptr, V_ptr, Out_ptr,
+    segment_ids_ptr,
     seq_len, num_heads, head_dim,
     num_global_tokens,
     stride_qb, stride_qh, stride_qs, stride_qd,
     stride_kb, stride_kh, stride_ks, stride_kd,
     stride_vb, stride_vh, stride_vs, stride_vd,
     stride_ob, stride_oh, stride_os, stride_od,
+    stride_segb, stride_segs,
     alibi_slopes_ptr,
     use_alibi: tl.constexpr,
+    use_segment_mask: tl.constexpr,
     softmax_scale,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """Full attention for global tokens - they see ALL tokens"""
+    """Segment-aware global token attention"""
 
-    pid_batch  = tl.program_id(0)
-    pid_head   = tl.program_id(1)
-    pid_g      = tl.program_id(2)
+    pid_batch = tl.program_id(0)
+    pid_head  = tl.program_id(1)
+    pid_g     = tl.program_id(2)
 
     g_start = pid_g * BLOCK_M
     offs_g  = g_start + tl.arange(0, BLOCK_M)
@@ -216,6 +232,10 @@ def global_token_attention_kernel(
 
     if use_alibi:
         alibi_slope = tl.load(alibi_slopes_ptr + pid_head)
+
+    if use_segment_mask:
+        g_seg_ptrs = segment_ids_ptr + pid_batch * stride_segb + offs_g * stride_segs
+        g_seg_ids  = tl.load(g_seg_ptrs, mask=mask_g, other=-1)
 
     m_i = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
     l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
@@ -241,7 +261,13 @@ def global_token_attention_kernel(
             alibi_bias = -alibi_slope * dist
             scores     = scores + alibi_bias
 
-        scores = tl.where(mask_g[:, None] & mask_n[None, :], scores, float('-inf'))
+        if use_segment_mask:
+            k_seg_ptrs = segment_ids_ptr + pid_batch * stride_segb + offs_n * stride_segs
+            k_seg_ids  = tl.load(k_seg_ptrs, mask=mask_n, other=-1)
+            same_seg   = (g_seg_ids[:, None] == k_seg_ids[None, :]) & (g_seg_ids[:, None] >= 0)
+            scores     = tl.where(same_seg & mask_g[:, None] & mask_n[None, :], scores, float('-inf'))
+        else:
+            scores = tl.where(mask_g[:, None] & mask_n[None, :], scores, float('-inf'))
 
         m_ij  = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, m_ij)
@@ -279,7 +305,7 @@ def global_token_attention_kernel(
 
 
 class SparseAttention(nn.Module):
-    """BigBird-style sparse attention with bidirectional global tokens"""
+    """BigBird-style sparse attention with segment-aware global tokens"""
 
     def __init__(self, config, is_causal=False):
         super().__init__()
@@ -373,13 +399,17 @@ class SparseAttention(nn.Module):
         self._block_indices_cache[cache_key] = block_indices
         return block_indices
 
-    def forward(self, hidden_states, attention_mask=None):
+    def forward(self, hidden_states, attention_mask=None, segment_ids=None):
+        """Forward with optional segment masking for packed sequences"""
+
         B, L, D = hidden_states.shape
 
         pad_len = (self.block_size - L % self.block_size) % self.block_size
         if pad_len > 0:
             hidden_states = F.pad(hidden_states, (0, 0, 0, pad_len))
             L_padded      = L + pad_len
+            if segment_ids is not None:
+                segment_ids = F.pad(segment_ids, (0, pad_len), value=-1)
         else:
             L_padded = L
 
@@ -403,22 +433,35 @@ class SparseAttention(nn.Module):
         global_k = k[:, :, :self.num_global_tokens, :].contiguous()
         global_v = v[:, :, :self.num_global_tokens, :].contiguous()
 
-        BLOCK_G       = min(64, self.num_global_tokens)
-        num_g_blocks  = (self.num_global_tokens + BLOCK_G - 1) // BLOCK_G
-        grid_global   = (B, self.num_heads, num_g_blocks)
+        use_segment_mask = segment_ids is not None
+
+        if use_segment_mask:
+            segment_ids = segment_ids.contiguous()
+            stride_segb = segment_ids.stride(0)
+            stride_segs = segment_ids.stride(1) if segment_ids.dim() > 1 else 1
+        else:
+            stride_segb = 0
+            stride_segs = 0
+
+        BLOCK_G      = min(64, self.num_global_tokens)
+        num_g_blocks = (self.num_global_tokens + BLOCK_G - 1) // BLOCK_G
+        grid_global  = (B, self.num_heads, num_g_blocks)
 
         alibi_ptr = self.alibi_slopes if self.alibi_slopes is not None else q
 
         global_token_attention_kernel[grid_global](
             q, k, v, out,
+            segment_ids if use_segment_mask else q,
             L_padded, self.num_heads, self.head_dim,
             self.num_global_tokens,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            stride_segb, stride_segs,
             alibi_ptr,
             self.alibi_slopes is not None,
+            use_segment_mask,
             self.softmax_scale,
             BLOCK_M=BLOCK_G,
             BLOCK_N=64,
@@ -437,6 +480,7 @@ class SparseAttention(nn.Module):
             q, k, v, out,
             global_k, global_v,
             block_indices,
+            segment_ids if use_segment_mask else q,
             L_padded, self.num_heads, self.head_dim,
             self.num_global_tokens, blocks_per_query,
             num_global_blocks,
@@ -446,8 +490,10 @@ class SparseAttention(nn.Module):
             out.stride(0), out.stride(1), out.stride(2), out.stride(3),
             global_k.stride(0), global_k.stride(1), global_k.stride(2), global_k.stride(3),
             global_v.stride(0), global_v.stride(1), global_v.stride(2), global_v.stride(3),
+            stride_segb, stride_segs,
             alibi_ptr,
             self.alibi_slopes is not None,
+            use_segment_mask,
             self.softmax_scale,
             BLOCK_M=self.block_size,
             BLOCK_N=self.block_size,
