@@ -1,42 +1,115 @@
+#!/usr/bin/env python3
 
-    
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="GeneT5 Inference")
-    parser.add_argument("--model", "-m", required=True, help="Model checkpoint path")
-    parser.add_argument("--input", "-i", required=True, help="Input FASTA file or sequence")
-    parser.add_argument("--output", "-o", default="output", help="Output directory")
-    parser.add_argument("--source", default="GeneT5", help="GFF source field")
-    parser.add_argument("--max-length", type=int, default=512, help="Max generation length")
-    parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
-    parser.add_argument("--top-k", type=int, default=50, help="Top-k sampling")
-    parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling")
-    parser.add_argument("--batch-size", type=int, default=1, help="Batch size")
-    parser.add_argument("--device", default=None, help="Device")
-    
-    args = parser.parse_args()
-    
-    device     = torch.device(args.device) if args.device else None
-    inferencer = GeneT5Inference.from_pretrained(args.model, device=device)
-    
-    sequences, seqids = read_input(args.input)
-    
-    gen_config = GenerationConfig(
-        max_length  = args.max_length,
-        temperature = args.temperature,
-        top_k       = args.top_k,
-        top_p       = args.top_p,
-    )
-    
-    results = inferencer.predict(
-        sequences  = sequences,
-        seqids     = seqids,
-        output_dir = args.output,
-        source     = args.source,
-        gen_config = gen_config,
-        batch_size = args.batch_size,
-    )
-    
-    print(f"\nProcessed {len(results)} sequences")
-    for r in results:
-        print(f"  {r.metadata['seqid']}: {len(r.gff_features)} features -> {r.gff_path}")
+import argparse
+import pathlib
+
+import torch
+
+import lib.util as util
+
+
+parser = argparse.ArgumentParser(
+    description='GeneT5 Inference')
+parser.add_argument('-m', '--model', required=True, type=str,
+    metavar='<path>', help='model checkpoint path')
+parser.add_argument('-i', '--input', required=True, type=str,
+    metavar='<file>', help='input FASTA file or sequence')
+parser.add_argument('-o', '--output', required=False, type=str, default='output',
+    metavar='<dir>', help='output directory [%(default)s]')
+parser.add_argument('--tokenizer', required=False, type=str, default=None,
+    metavar='<path>', help='tokenizer path (default: same as model)')
+parser.add_argument('--source', required=False, type=str, default='GeneT5',
+    metavar='<str>', help='GFF source field [%(default)s]')
+parser.add_argument('--max_length', required=False, type=int, default=512,
+    metavar='<int>', help='max generation length [%(default)i]')
+parser.add_argument('--temperature', required=False, type=float, default=1.0,
+    metavar='<float>', help='sampling temperature [%(default).1f]')
+parser.add_argument('--top_k', required=False, type=int, default=50,
+    metavar='<int>', help='top-k sampling [%(default)i]')
+parser.add_argument('--top_p', required=False, type=float, default=0.9,
+    metavar='<float>', help='top-p sampling [%(default).1f]')
+parser.add_argument('--batch_size', required=False, type=int, default=1,
+    metavar='<int>', help='batch size [%(default)i]')
+parser.add_argument('--device', required=False, type=str, default=None,
+    metavar='<str>', help='device (auto-detect if not specified)')
+parser.add_argument('--seed', required=False, type=int, default=42,
+    metavar='<int>', help='random seed [%(default)i]')
+
+args = parser.parse_args()
+
+print(f"\n{' GeneT5 Inference ':=^60}")
+
+# Set seed
+torch.manual_seed(args.seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(args.seed)
+
+# Load model
+print(f"\n{' Loading Model ':=^60}")
+print(f"  Checkpoint: {args.model}")
+
+device     = torch.device(args.device) if args.device else None
+tokenizer_path = args.tokenizer or args.model
+
+inferencer = util.GeneT5Inference.from_pretrained(
+    checkpoint_path = args.model,
+    tokenizer_path  = tokenizer_path,
+    device          = device,
+)
+
+# Load input
+print(f"\n{' Loading Input ':=^60}")
+print(f"  Input: {args.input}")
+
+sequences, seqids = util.read_input(args.input)
+print(f"  Sequences: {len(sequences)}")
+
+for i, (seqid, seq) in enumerate(zip(seqids[:5], sequences[:5])):
+    print(f"    {seqid}: {len(seq)} bp")
+if len(sequences) > 5:
+    print(f"    ... and {len(sequences) - 5} more")
+
+# Setup generation config
+gen_config = util.GenerationConfig(
+    max_length  = args.max_length,
+    temperature = args.temperature,
+    top_k       = args.top_k,
+    top_p       = args.top_p,
+)
+
+# Create output directory
+output_dir = pathlib.Path(args.output)
+output_dir.mkdir(parents=True, exist_ok=True)
+
+# Run inference
+print(f"\n{' Running Inference ':=^60}")
+print(f"  Output:      {output_dir}")
+print(f"  Batch size:  {args.batch_size}")
+print(f"  Max length:  {args.max_length}")
+print(f"  Temperature: {args.temperature}")
+print(f"  Top-k:       {args.top_k}")
+print(f"  Top-p:       {args.top_p}")
+
+results = inferencer.predict(
+    sequences  = sequences,
+    seqids     = seqids,
+    output_dir = output_dir,
+    source     = args.source,
+    gen_config = gen_config,
+    batch_size = args.batch_size,
+)
+
+# Print results
+print(f"\n{' Results ':=^60}")
+print(f"  Processed: {len(results)} sequences")
+
+total_features = 0
+for r in results:
+    num_features    = len(r.gff_features)
+    total_features += num_features
+    print(f"    {r.metadata['seqid']}: {num_features} features -> {r.gff_path}")
+
+print(f"\n{'='*60}")
+print(f"  Total features: {total_features}")
+print(f"  Output dir:     {output_dir}")
+print(f"{'='*60}")
