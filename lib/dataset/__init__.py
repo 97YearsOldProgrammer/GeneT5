@@ -17,6 +17,12 @@ from lib.dataset.wrapper import (
     # Compacting
     compact_chunks,
     flatten_groups,
+    pack_with_isolation,
+    verify_isolation,
+    build_segment_mask,
+    estimate_chunk_tokens,
+    align_to_block,
+    compute_effective_length,
     
     # Binary I/O
     write_binary,

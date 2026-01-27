@@ -45,8 +45,14 @@ augment_with_hints = chunking.augment_with_hints
 ######################
 
 
-compact_chunks = compacting.compact_chunks
-flatten_groups = compacting.flatten_groups
+compact_chunks           = compacting.compact_chunks
+flatten_groups           = compacting.flatten_groups
+pack_with_isolation      = compacting.pack_with_isolation
+verify_isolation         = compacting.verify_isolation
+build_segment_mask       = compacting.build_segment_mask
+estimate_chunk_tokens    = compacting.estimate_chunk_tokens
+align_to_block           = compacting.align_to_block
+compute_effective_length = compacting.compute_effective_length
 
 
 ######################

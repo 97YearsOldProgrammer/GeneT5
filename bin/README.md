@@ -91,6 +91,15 @@ python3 bin/resize_model.py model_path tokenizer_path
 ---
 
 
+### Compacting All Binary File
+
+After parse all datas, remember to run the compacting function.
+
+```python3
+```
+---
+
+
 ### Tuning
 
 To Tune on distributed device: Run the following Sh script
