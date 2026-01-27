@@ -26,7 +26,6 @@ from lib.dataset.wrapper import (
     BinaryChunk,
     
     # Dataload
-    build_length_index,
     BinaryTrainDataset,
     DynamicPaddingCollator,
     SmartBatchSampler,
