@@ -2,7 +2,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from lib.build_model import build_gt5
+from lib.util.build_model import build_gt5
 
 
 parser = argparse.ArgumentParser(
