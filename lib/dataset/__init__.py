@@ -14,13 +14,16 @@ from lib.dataset.wrapper import (
     dynamic_chunking,
     augment_with_hints,
     
-    # Compacting
-    compact_chunks,
-    flatten_groups,
+    # Streaming Compacting
+    ChunkMeta,
+    stream_extract_metadata,
+    pack_from_metadata,
+    stream_write_compacted,
+
+    # Segment utilities
     pack_with_isolation,
     verify_isolation,
     build_segment_mask,
-    estimate_chunk_tokens,
     align_to_block,
     compute_effective_length,
     

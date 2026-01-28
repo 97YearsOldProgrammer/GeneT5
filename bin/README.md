@@ -8,25 +8,33 @@ For reproducibility, all the Linux Cmd to build this from scratch is being recor
 
 ### Init the Model
 
-The idea is to utilize existed DNABert-v2 pre-trained model for giving the model understanding of embedding Genetic Sequences.  
-
-| Component                   | Action          | Reason
-| :-------------------------: | :-----------:   | :---- 
-| **Encoder Self-Attention**  | **Copy**        | It already knows how to find context in the input.
-| **Decoder Self-Attention**  | **Copy**        | It can reuse the Encoder's logic for finding context.
-| **Cross-Attention**         | **Random Init** | This is the "new" connection that links input to output.
-| **Layer Norms**             | **Copy**        | Keeps the math stable from the start.
-| **Output Head**             | **Copy/Init**   | Usually initialized from the Input Embeddings (Shared).
-
 ```python3
 python3 -u bin/init_model.py \
-    --save_dir "../model/init/" \
+    --save_dir ../model/init \
     --dnabert_path "zhihan1996/DNABERT-2-117M" \
+    --tie_weights \
+    --decoder_layers 12 \
+    --decoder_heads 12 \
+    --decoder_kv_heads 3 \
+    --decoder_ff_dim 3072 \
+    --decoder_dropout 0.1 \
     --use_moe \
     --num_experts 32 \
     --moe_top_k 2 \
-    --tie_weights \
-    2>&1 | tee ../logs/init.txt
+    --init_std 0.02 \
+    --init_embed_std 0.02 \
+    --init_ffn_std 0.02 \
+    --init_attn_std 0.02 \
+    --init_moe_router_std 0.006 \
+    --encoder_block_size 256 \
+    --encoder_window_size 34560 \
+    --encoder_num_global_tokens 0 \
+    --encoder_num_rand_blocks 0 \
+    --decoder_block_size 16 \
+    --decoder_window_size 1600 \
+    --decoder_num_global_tokens 0 \
+    --decoder_num_rand_blocks 0 \
+    2>&1 | tee ../logs/init.log
 ```
 
 
@@ -96,18 +104,39 @@ python3 bin/resize_model.py model_path tokenizer_path
 After parse all datas, remember to run the compacting function.
 
 ```python3
+ python -u bin/compact.py \
+  ../baked/*/training.bin \ 
+  -o ../baked/33/train.bin \
+  --tokenizer ../model/init/ \
+  --compact_target 30000 \
+  --hard_limit 32768 \
+  --workers 15 \     
+  --batch_size 5000 \  
+  2>&1 | tee ../logs/compact.log
+
 ```
+
+
 ---
 
 
 ### Tuning
 
-To Tune on distributed device: Run the following Sh script
 
-```sh
-# Node 0
-MASTER_ADDR=192.168.100.10 NNODES=2 NODE_RANK=0 ./bin/launch_distributed.sh
-
-# Node 1  
-MASTER_ADDR=192.168.100.10 NNODES=2 NODE_RANK=1 ./bin/launch_distributed.sh
+```python3
+python -u bin/finet \
+  ../baked/33/train.bin \
+  ../baked/33/validation.bin \
+  ../model/trial1 \
+  ../model/init \
+  --lr 1e-4 \
+  --batch_size 4 \
+  --grad_accum 64 \
+  --weight_decay 0.01 \
+  --warmup_ratio 0.03 \
+  --max_grad_norm 1.0 \
+  --gradient_checkpointing \
+  --max_input_len 4096 \
+  --max_target_len 2048 \
+  2>&1 | tee ../logs/tune/1.log
 ```

@@ -10,7 +10,11 @@ import pathlib
 
 
 MAGIC_HEADER   = b'GT5B'
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2  # v2: 64-bit offsets (QI) for files >4GB
+
+# Offset table entry sizes by version
+OFFSET_ENTRY_SIZE_V1 = 8   # II: 32-bit offset, 32-bit length
+OFFSET_ENTRY_SIZE_V2 = 12  # QI: 64-bit offset, 32-bit length
 
 
 #########################
@@ -229,45 +233,62 @@ class BinaryChunk:
 #################
 
 
-def write_binary(chunks, output_path, compress=True):
-    """Write chunks to binary file with optional compression"""
+def write_binary(chunks, output_path, compress=True, show_progress=True):
+    """
+    Write chunks to binary file with optional compression.
 
+    Uses streaming write with seek-based offset table to minimize memory:
+    - Memory: O(n) for offset array (~12MB per 1M chunks) + O(1) chunk buffer
+    - Single pass through chunks, single serialization per chunk
+    - v2 format: 64-bit offsets support files >4GB
+    """
     output_path = pathlib.Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    num_chunks = len(chunks)
+
     with open(output_path, 'wb') as f:
-        f.write(MAGIC_HEADER)
-        f.write(struct.pack('<B', FORMAT_VERSION))
-        f.write(struct.pack('<B', 1 if compress else 0))
-        f.write(struct.pack('<I', len(chunks)))
+        # Write header (10 bytes total)
+        f.write(MAGIC_HEADER)                              # 4 bytes
+        f.write(struct.pack('<B', FORMAT_VERSION))         # 1 byte (v2)
+        f.write(struct.pack('<B', 1 if compress else 0))   # 1 byte
+        f.write(struct.pack('<I', num_chunks))             # 4 bytes
 
-        offsets    = []
-        data_start = f.tell() + len(chunks) * 8
+        # Write placeholder offset table (will seek back to fill)
+        # v2: 12 bytes per entry (QI: 64-bit offset + 32-bit length)
+        offset_table_pos = f.tell()  # Position 10
+        f.write(b'\x00' * (num_chunks * OFFSET_ENTRY_SIZE_V2))
 
-        all_data       = []
-        current_offset = data_start
+        # Stream chunks directly to file, record offsets
+        offsets = []
 
-        for chunk in chunks:
+        for i, chunk in enumerate(chunks):
+            current_offset = f.tell()
+
             chunk_bytes = chunk.to_bytes()
-
             if compress:
                 chunk_bytes = zlib.compress(chunk_bytes, level=6)
 
+            f.write(chunk_bytes)
             offsets.append((current_offset, len(chunk_bytes)))
-            all_data.append(chunk_bytes)
-            current_offset += len(chunk_bytes)
 
+            if show_progress and (i + 1) % 50000 == 0:
+                pct = 100 * (i + 1) / num_chunks
+                print(f"    Writing: {i + 1:,}/{num_chunks:,} ({pct:.1f}%)", end='\r')
+
+        if show_progress and num_chunks > 50000:
+            print(f"    Writing: {num_chunks:,}/{num_chunks:,} (100.0%)")
+
+        # Seek back and write real offset table (v2: QI format)
+        f.seek(offset_table_pos)
         for offset, length in offsets:
-            f.write(struct.pack('<II', offset, length))
-
-        for data in all_data:
-            f.write(data)
+            f.write(struct.pack('<QI', offset, length))
 
     return output_path
 
 
 def read_binary(input_path):
-    """Read all chunks from binary file"""
+    """Read all chunks from binary file (supports v1 and v2 formats)"""
 
     with open(input_path, 'rb') as f:
         magic = f.read(4)
@@ -278,10 +299,18 @@ def read_binary(input_path):
         compressed = struct.unpack('<B', f.read(1))[0]
         num_chunks = struct.unpack('<I', f.read(4))[0]
 
+        # Read offset table based on version
         offsets = []
-        for _ in range(num_chunks):
-            offset, length = struct.unpack('<II', f.read(8))
-            offsets.append((offset, length))
+        if version >= 2:
+            # v2: QI format (64-bit offset, 32-bit length)
+            for _ in range(num_chunks):
+                offset, length = struct.unpack('<QI', f.read(12))
+                offsets.append((offset, length))
+        else:
+            # v1: II format (32-bit offset, 32-bit length)
+            for _ in range(num_chunks):
+                offset, length = struct.unpack('<II', f.read(8))
+                offsets.append((offset, length))
 
         chunks = []
         for offset, length in offsets:
@@ -298,7 +327,7 @@ def read_binary(input_path):
 
 
 def read_chunk_at_index(input_path, index):
-    """Read single chunk by index without loading entire file"""
+    """Read single chunk by index without loading entire file (supports v1 and v2)"""
 
     with open(input_path, 'rb') as f:
         magic = f.read(4)
@@ -312,8 +341,13 @@ def read_chunk_at_index(input_path, index):
         if index >= num_chunks:
             raise IndexError(f"Index {index} out of range (total: {num_chunks})")
 
-        f.seek(10 + index * 8)
-        offset, length = struct.unpack('<II', f.read(8))
+        # Seek to correct offset entry based on version
+        if version >= 2:
+            f.seek(10 + index * 12)  # v2: 12 bytes per entry
+            offset, length = struct.unpack('<QI', f.read(12))
+        else:
+            f.seek(10 + index * 8)   # v1: 8 bytes per entry
+            offset, length = struct.unpack('<II', f.read(8))
 
         f.seek(offset)
         data = f.read(length)
@@ -325,7 +359,7 @@ def read_chunk_at_index(input_path, index):
 
 
 def get_binary_info(input_path):
-    """Get metadata about binary dataset without loading all chunks"""
+    """Get metadata about binary dataset without loading all chunks (supports v1 and v2)"""
 
     with open(input_path, 'rb') as f:
         magic = f.read(4)
@@ -336,10 +370,16 @@ def get_binary_info(input_path):
         compressed = struct.unpack('<B', f.read(1))[0]
         num_chunks = struct.unpack('<I', f.read(4))[0]
 
+        # Read offset table based on version
         offsets = []
-        for _ in range(num_chunks):
-            offset, length = struct.unpack('<II', f.read(8))
-            offsets.append((offset, length))
+        if version >= 2:
+            for _ in range(num_chunks):
+                offset, length = struct.unpack('<QI', f.read(12))
+                offsets.append((offset, length))
+        else:
+            for _ in range(num_chunks):
+                offset, length = struct.unpack('<II', f.read(8))
+                offsets.append((offset, length))
 
         total_size = sum(length for _, length in offsets)
 

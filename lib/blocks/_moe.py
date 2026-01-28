@@ -34,6 +34,9 @@ class MoEConfig:
 def _check_triton_support():
     """Check if Triton is supported on current hardware"""
 
+    import os
+    if os.environ.get("GENET5_DISABLE_TRITON", "0") == "1":
+        return False
     if not torch.cuda.is_available():
         return False
     cap = torch.cuda.get_device_capability()
@@ -185,13 +188,15 @@ def expert_gemm_tiled_kernel(
     stride_o_t, stride_o_d,
     apply_weights: tl.constexpr,
     use_atomic: tl.constexpr,
+    use_sequential_output: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     """Tiled GEMM kernel for expert computation
-    
-    Computes: Out[token_indices] += (X[token_indices] @ W) * weights
+
+    Computes: Out[output_idx] += (X[token_indices] @ W) * weights
+    where output_idx is either token_indices or sequential (0, 1, 2, ...)
     Uses proper tiled matrix multiplication for efficiency.
     """
 
@@ -208,7 +213,7 @@ def expert_gemm_tiled_kernel(
     mask_m = offs_m < num_tokens
     mask_n = offs_n < out_dim
 
-    # Load token indices for this tile
+    # Load token indices for input reads
     token_indices = tl.load(token_indices_ptr + offs_m, mask=mask_m, other=0)
 
     # Initialize accumulator
@@ -235,8 +240,14 @@ def expert_gemm_tiled_kernel(
         weights = tl.load(token_weights_ptr + offs_m, mask=mask_m, other=0.0)
         acc     = acc * weights[:, None]
 
+    # Determine output indices: either token_indices or sequential
+    if use_sequential_output:
+        out_indices = offs_m
+    else:
+        out_indices = token_indices
+
     # Store results
-    out_ptrs = Out_ptr + token_indices[:, None] * stride_o_t + offs_n[None, :] * stride_o_d
+    out_ptrs = Out_ptr + out_indices[:, None] * stride_o_t + offs_n[None, :] * stride_o_d
 
     if use_atomic:
         tl.atomic_add(out_ptrs, acc, mask=mask_m[:, None] & mask_n[None, :])
@@ -365,6 +376,7 @@ class MoE(nn.Module):
             grid_n = (self.ff_dim + BLOCK_N - 1) // BLOCK_N
 
             # Gate projection: x @ gate_w[expert_id]
+            # Use sequential output for intermediate buffer
             expert_gemm_tiled_kernel[(grid_m, grid_n)](
                 x_flat, gate_w[expert_id], hidden,
                 expert_token_indices, expert_weights,
@@ -374,6 +386,7 @@ class MoE(nn.Module):
                 hidden.stride(0), hidden.stride(1),
                 False,  # Don't apply weights yet
                 False,  # No atomic needed for intermediate
+                True,   # Use sequential output indices (0, 1, 2, ...)
                 BLOCK_M = BLOCK_M,
                 BLOCK_N = BLOCK_N,
                 BLOCK_K = BLOCK_K,
@@ -390,6 +403,7 @@ class MoE(nn.Module):
                 hidden_up.stride(0), hidden_up.stride(1),
                 False,
                 False,
+                True,   # Use sequential output indices
                 BLOCK_M = BLOCK_M,
                 BLOCK_N = BLOCK_N,
                 BLOCK_K = BLOCK_K,
@@ -458,7 +472,12 @@ class MoE(nn.Module):
         if self._triton_supported and x_flat.is_cuda:
             try:
                 output = self._forward_triton(x_flat, top_k_indices, top_k_probs)
+                # Sync to catch async CUDA errors from Triton kernels
+                torch.cuda.synchronize()
             except Exception:
+                # Reset CUDA state after error and fall back to PyTorch
+                torch.cuda.synchronize()
+                self._triton_supported = False
                 output = self._forward_pytorch(x_flat, top_k_indices, top_k_probs)
         else:
             output = self._forward_pytorch(x_flat, top_k_indices, top_k_probs)

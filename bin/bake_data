@@ -32,9 +32,11 @@ parser.add_argument("--tokenizer",  type=str, default=None,
 parser.add_argument("--skip_tokenizer_expansion", action="store_true",
     help="Skip tokenizer expansion after processing")
 parser.add_argument("--compact",        action="store_true",
-    help="Compact all training.bin files after baking")
+    help="Compact all training.bin files after baking (requires --tokenizer)")
 parser.add_argument("--compact_target", type=int, default=8192,
     help="Target tokens for compacting [%(default)s]")
+parser.add_argument("--compact_file_parallel", type=int, default=2,
+    help="Files to process in parallel during compacting [%(default)s]")
 
 args = parser.parse_args()
 
@@ -148,44 +150,56 @@ if args.tokenizer and not args.skip_tokenizer_expansion and success > 0:
 
 if args.compact and success > 0:
     print(f"\n{' Compacting ':=^60}")
-    
-    training_files = list(baked_dir.glob("*/training.bin"))
-    
-    if not training_files:
-        print("  No training.bin files found!")
-        compact_result = {"success": False, "error": "No training.bin files found"}
+
+    # Tokenizer is required for compacting
+    if not args.tokenizer:
+        print("  ERROR: --tokenizer required for compacting")
+        print("  Skipping compaction step.")
+        compact_result = {"success": False, "error": "Tokenizer not specified"}
     else:
-        print(f"  Found {len(training_files)} training files")
-        
-        output_path = baked_dir / "all_training.bin"
-        compact_cmd = [
-            "python3", "bin/compact.py",
-        ] + [str(f) for f in training_files] + [
-            "-o", str(output_path),
-        ]
-        
-        if args.tokenizer:
-            compact_cmd.extend([
+        training_files = list(baked_dir.glob("*/training.bin"))
+
+        if not training_files:
+            print("  No training.bin files found!")
+            compact_result = {"success": False, "error": "No training.bin files found"}
+        else:
+            print(f"  Found {len(training_files)} training files")
+
+            output_path = baked_dir / "all_training.bin"
+            script_dir = pathlib.Path(__file__).parent.resolve()
+            compact_script = script_dir / "compact.py"
+
+            compact_cmd = [
+                "python3", str(compact_script),
+            ] + [str(f) for f in training_files] + [
+                "-o", str(output_path),
                 "--tokenizer", args.tokenizer,
                 "--compact_target", str(args.compact_target),
-            ])
-        
-        print(f"  Running compact...")
-        result = subprocess.run(compact_cmd, capture_output=True, text=True)
-        
-        if result.returncode == 0:
-            print(f"  ✓ Compacting complete")
-            output_size = output_path.stat().st_size if output_path.exists() else 0
-            compact_result = {
-                "success": True,
-                "output":  str(output_path),
-                "size":    f"{output_size / 1024 / 1024:.2f} MB",
-            }
-        else:
-            print(f"  ✗ Compacting failed")
-            if result.stderr:
-                print(f"    {result.stderr}")
-            compact_result = {"success": False, "error": result.stderr or "Unknown error"}
+                "--workers", str(n_workers_per_species),
+                "--file_parallel", str(args.compact_file_parallel),
+            ]
+
+            print(f"  Running streaming compact (file_parallel={args.compact_file_parallel})...")
+            result = subprocess.run(compact_cmd, capture_output=True, text=True)
+
+            if result.returncode == 0:
+                print(f"  ✓ Compacting complete")
+                if result.stdout:
+                    # Print last few lines of output
+                    lines = result.stdout.strip().split('\n')
+                    for line in lines[-10:]:
+                        print(f"    {line}")
+                output_size = output_path.stat().st_size if output_path.exists() else 0
+                compact_result = {
+                    "success": True,
+                    "output":  str(output_path),
+                    "size":    f"{output_size / 1024 / 1024:.2f} MB",
+                }
+            else:
+                print(f"  ✗ Compacting failed")
+                if result.stderr:
+                    print(f"    {result.stderr}")
+                compact_result = {"success": False, "error": result.stderr or "Unknown error"}
 
 # Collect stats and write summary
 print(f"\n{' Collecting Statistics ':=^60}")

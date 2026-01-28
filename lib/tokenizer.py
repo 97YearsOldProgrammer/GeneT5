@@ -202,6 +202,37 @@ class GeneTokenizer:
     def vocab_size(self):
         """Return vocabulary size."""
         return len(self)
+
+    @property
+    def pad_token_id(self):
+        """Return pad token ID."""
+        if self._tokenizer is not None:
+            return self._tokenizer.pad_token_id
+        # Check common pad token formats
+        for token in ("[PAD]", "<PAD>", "<pad>"):
+            if token in self._vocab:
+                return self._vocab[token]
+        return 0
+
+    @property
+    def eos_token_id(self):
+        """Return end-of-sequence token ID."""
+        if self._tokenizer is not None:
+            return self._tokenizer.eos_token_id
+        for token in ("<eos>", "<EOS>", "[EOS]", "</s>"):
+            if token in self._vocab:
+                return self._vocab[token]
+        return None
+
+    @property
+    def bos_token_id(self):
+        """Return beginning-of-sequence token ID."""
+        if self._tokenizer is not None:
+            return self._tokenizer.bos_token_id
+        for token in ("<bos>", "<BOS>", "[BOS]", "<s>"):
+            if token in self._vocab:
+                return self._vocab[token]
+        return None
     
     def get_vocab(self):
         """Return vocabulary dictionary."""

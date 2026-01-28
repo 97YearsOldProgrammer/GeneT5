@@ -1,6 +1,8 @@
 import random
 import math
 
+import torch
+
 import lib.dataset._binary     as binary
 import lib.dataset._compacting as compacting
 
@@ -103,16 +105,20 @@ class BinaryTrainDataset:
         self.seed           = seed
         self.epoch          = 0
 
-        self._info   = binary.get_binary_info(binary_path)
-        self._length = self._info["num_chunks"]
-        self._reader = BinaryDatasetReader(binary_path, tokenizer)
-        self.lengths = None
+        self._info    = binary.get_binary_info(binary_path)
+        self._length  = self._info["num_chunks"]
+        self._reader  = BinaryDatasetReader(binary_path, tokenizer)
+        self._lengths = None
+
+    @property
+    def lengths(self):
+        """Get lengths with lazy loading"""
+        if self._lengths is None:
+            self._lengths = self._reader.lengths
+        return self._lengths
 
     def build_length_index(self):
-        """Build length index for smart batching"""
-
-        if self.lengths is None:
-            self.lengths = self._reader.lengths
+        """Build length index for smart batching (deprecated, use lengths property)"""
         return self.lengths
 
     def set_epoch(self, epoch):
@@ -209,12 +215,12 @@ class DynamicPaddingCollator:
                 labels.append(b["labels"] + [self.label_pad] * lbl_pad)
 
         result = {
-            "input_ids":      input_ids,
-            "attention_mask": attention_mask,
+            "input_ids":      torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
         }
 
         if labels:
-            result["labels"] = labels
+            result["labels"] = torch.tensor(labels, dtype=torch.long)
 
         return result
 

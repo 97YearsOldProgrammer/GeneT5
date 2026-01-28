@@ -45,14 +45,18 @@ augment_with_hints = chunking.augment_with_hints
 ######################
 
 
-compact_chunks           = compacting.compact_chunks
-flatten_groups           = compacting.flatten_groups
+# Streaming compaction (memory-efficient)
+ChunkMeta              = compacting.ChunkMeta
+stream_extract_metadata = compacting.stream_extract_metadata
+pack_from_metadata     = compacting.pack_from_metadata
+stream_write_compacted = compacting.stream_write_compacted
+
+# Segment packing utilities
 pack_with_isolation      = compacting.pack_with_isolation
 verify_isolation         = compacting.verify_isolation
 build_segment_mask       = compacting.build_segment_mask
 align_to_block           = compacting.align_to_block
 compute_effective_length = compacting.compute_effective_length
-estimate_chunk_tokens    = compacting.estimate_chunk_tokens_fallback
 
 
 ######################

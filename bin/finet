@@ -125,7 +125,12 @@ def main():
     
     print(f"  Train: {len(train_dataset)}")
     print(f"  Val:   {len(val_dataset)}")
-    
+
+    if len(train_dataset) == 0:
+        print(f"\nERROR: Training dataset is empty!")
+        print(f"       Please check: {args.train_bin}")
+        return
+
     # setup dataloaders
     print(f"\nSetting up dataloaders...")
     
@@ -284,8 +289,8 @@ def main():
                 optimizer.zero_grad()
             
             total_train_loss += loss.item() * args.grad_accum
-        
-        train_loss = total_train_loss / len(train_loader)
+
+        train_loss = total_train_loss / max(len(train_loader), 1)
         
         # evaluate
         model.eval()
