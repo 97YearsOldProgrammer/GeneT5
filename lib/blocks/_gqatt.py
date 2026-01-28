@@ -25,7 +25,7 @@ class GQAttentionConfig:
     dropout:       float = 0.0
     use_alibi:     bool  = False
     max_seq_len:   int   = 8192
-    is_cross_attn: bool  = True
+    is_cross_attn: bool  = False
 
     def __post_init__(self):
 
@@ -64,8 +64,12 @@ def gqa_cross_attention_fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    HEADS_PER_GROUP: tl.constexpr,
 ):
-    """GQA cross-attention optimized to load KV once per group"""
+    """GQA cross-attention optimized to load KV once per group
+    
+    Fixed: KV loaded once per block, reused across all heads in group
+    """
 
     pid_batch    = tl.program_id(0)
     pid_kv_head  = tl.program_id(1)
@@ -74,70 +78,144 @@ def gqa_cross_attention_fwd_kernel(
     q_start = pid_m * BLOCK_M
     offs_m  = q_start + tl.arange(0, BLOCK_M)
     offs_d  = tl.arange(0, BLOCK_D)
+    offs_n  = tl.arange(0, BLOCK_N)
     mask_m  = offs_m < q_len
 
+    # Load segment IDs for queries (shared across heads in group)
     if use_segment_mask:
         q_seg_ptrs = q_segment_ids_ptr + pid_batch * stride_qsegb + offs_m * stride_qsegs
         q_seg_ids  = tl.load(q_seg_ptrs, mask=mask_m, other=-1)
 
-    for local_head in range(heads_per_group):
-        pid_head = pid_kv_head * heads_per_group + local_head
+    # Initialize per-head accumulators
+    m_i_0 = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
+    m_i_1 = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
+    m_i_2 = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
+    m_i_3 = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
+    
+    l_i_0 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    l_i_1 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    l_i_2 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    l_i_3 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    
+    acc_0 = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+    acc_1 = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+    acc_2 = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+    acc_3 = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
 
-        q_ptrs = (Q_ptr +
-                  pid_batch * stride_qb +
-                  pid_head * stride_qh +
-                  offs_m[:, None] * stride_qs +
-                  offs_d[None, :] * stride_qd)
-        q      = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
+    # Load all Q heads for this group upfront
+    q_base = Q_ptr + pid_batch * stride_qb + offs_m[:, None] * stride_qs + offs_d[None, :] * stride_qd
+    
+    q_0 = tl.load(q_base + (pid_kv_head * HEADS_PER_GROUP + 0) * stride_qh, mask=mask_m[:, None], other=0.0)
+    q_1 = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+    q_2 = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+    q_3 = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+    
+    if HEADS_PER_GROUP > 1:
+        q_1 = tl.load(q_base + (pid_kv_head * HEADS_PER_GROUP + 1) * stride_qh, mask=mask_m[:, None], other=0.0)
+    if HEADS_PER_GROUP > 2:
+        q_2 = tl.load(q_base + (pid_kv_head * HEADS_PER_GROUP + 2) * stride_qh, mask=mask_m[:, None], other=0.0)
+    if HEADS_PER_GROUP > 3:
+        q_3 = tl.load(q_base + (pid_kv_head * HEADS_PER_GROUP + 3) * stride_qh, mask=mask_m[:, None], other=0.0)
 
-        m_i = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
-        l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
-        acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+    # Iterate over KV blocks - load K,V ONCE per block
+    for n_start in range(0, kv_len, BLOCK_N):
+        offs_n_curr = n_start + offs_n
+        mask_n      = offs_n_curr < kv_len
 
-        for n_start in range(0, kv_len, BLOCK_N):
-            offs_n = n_start + tl.arange(0, BLOCK_N)
-            mask_n = offs_n < kv_len
+        # Load K and V ONCE for all heads in group
+        k_ptrs = (K_ptr +
+                  pid_batch * stride_kb +
+                  pid_kv_head * stride_kh +
+                  offs_n_curr[:, None] * stride_ks +
+                  offs_d[None, :] * stride_kd)
+        k      = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
+        
+        v_ptrs = (V_ptr +
+                  pid_batch * stride_vb +
+                  pid_kv_head * stride_vh +
+                  offs_n_curr[:, None] * stride_vs +
+                  offs_d[None, :] * stride_vd)
+        v      = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
 
-            k_ptrs = (K_ptr +
-                      pid_batch * stride_kb +
-                      pid_kv_head * stride_kh +
-                      offs_n[:, None] * stride_ks +
-                      offs_d[None, :] * stride_kd)
-            k      = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
-            scores = tl.dot(q, tl.trans(k)) * softmax_scale
+        k_t = tl.trans(k)
 
-            if use_segment_mask:
-                kv_seg_ptrs = kv_segment_ids_ptr + pid_batch * stride_kvsegb + offs_n * stride_kvsegs
-                kv_seg_ids  = tl.load(kv_seg_ptrs, mask=mask_n, other=-1)
-                same_seg    = (q_seg_ids[:, None] == kv_seg_ids[None, :]) & (q_seg_ids[:, None] >= 0)
-                scores      = tl.where(same_seg & mask_m[:, None] & mask_n[None, :], scores, float('-inf'))
-            else:
-                scores = tl.where(mask_m[:, None] & mask_n[None, :], scores, float('-inf'))
+        # Compute base mask (shared across heads)
+        if use_segment_mask:
+            kv_seg_ptrs = kv_segment_ids_ptr + pid_batch * stride_kvsegb + offs_n_curr * stride_kvsegs
+            kv_seg_ids  = tl.load(kv_seg_ptrs, mask=mask_n, other=-1)
+            same_seg    = (q_seg_ids[:, None] == kv_seg_ids[None, :]) & (q_seg_ids[:, None] >= 0)
+            base_mask   = same_seg & mask_m[:, None] & mask_n[None, :]
+        else:
+            base_mask = mask_m[:, None] & mask_n[None, :]
 
-            m_ij  = tl.max(scores, axis=1)
-            m_new = tl.maximum(m_i, m_ij)
-            alpha = tl.exp(m_i - m_new)
-            p     = tl.exp(scores - m_new[:, None])
-            l_i   = alpha * l_i + tl.sum(p, axis=1)
+        # Process head 0
+        scores_0 = tl.dot(q_0, k_t) * softmax_scale
+        scores_0 = tl.where(base_mask, scores_0, float('-inf'))
+        m_ij_0   = tl.max(scores_0, axis=1)
+        m_new_0  = tl.maximum(m_i_0, m_ij_0)
+        alpha_0  = tl.exp(m_i_0 - m_new_0)
+        p_0      = tl.exp(scores_0 - m_new_0[:, None])
+        l_i_0    = alpha_0 * l_i_0 + tl.sum(p_0, axis=1)
+        acc_0    = alpha_0[:, None] * acc_0 + tl.dot(p_0.to(v.dtype), v)
+        m_i_0    = m_new_0
 
-            v_ptrs = (V_ptr +
-                      pid_batch * stride_vb +
-                      pid_kv_head * stride_vh +
-                      offs_n[:, None] * stride_vs +
-                      offs_d[None, :] * stride_vd)
-            v   = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
-            acc = alpha[:, None] * acc + tl.dot(p.to(v.dtype), v)
-            m_i = m_new
+        # Process head 1
+        if HEADS_PER_GROUP > 1:
+            scores_1 = tl.dot(q_1, k_t) * softmax_scale
+            scores_1 = tl.where(base_mask, scores_1, float('-inf'))
+            m_ij_1   = tl.max(scores_1, axis=1)
+            m_new_1  = tl.maximum(m_i_1, m_ij_1)
+            alpha_1  = tl.exp(m_i_1 - m_new_1)
+            p_1      = tl.exp(scores_1 - m_new_1[:, None])
+            l_i_1    = alpha_1 * l_i_1 + tl.sum(p_1, axis=1)
+            acc_1    = alpha_1[:, None] * acc_1 + tl.dot(p_1.to(v.dtype), v)
+            m_i_1    = m_new_1
 
-        l_i = tl.where(l_i == 0.0, 1.0, l_i)
-        acc = acc / l_i[:, None]
+        # Process head 2
+        if HEADS_PER_GROUP > 2:
+            scores_2 = tl.dot(q_2, k_t) * softmax_scale
+            scores_2 = tl.where(base_mask, scores_2, float('-inf'))
+            m_ij_2   = tl.max(scores_2, axis=1)
+            m_new_2  = tl.maximum(m_i_2, m_ij_2)
+            alpha_2  = tl.exp(m_i_2 - m_new_2)
+            p_2      = tl.exp(scores_2 - m_new_2[:, None])
+            l_i_2    = alpha_2 * l_i_2 + tl.sum(p_2, axis=1)
+            acc_2    = alpha_2[:, None] * acc_2 + tl.dot(p_2.to(v.dtype), v)
+            m_i_2    = m_new_2
 
-        out_ptrs = (Out_ptr +
-                    pid_batch * stride_ob +
-                    pid_head * stride_oh +
-                    offs_m[:, None] * stride_os +
-                    offs_d[None, :] * stride_od)
-        tl.store(out_ptrs, acc, mask=mask_m[:, None])
+        # Process head 3
+        if HEADS_PER_GROUP > 3:
+            scores_3 = tl.dot(q_3, k_t) * softmax_scale
+            scores_3 = tl.where(base_mask, scores_3, float('-inf'))
+            m_ij_3   = tl.max(scores_3, axis=1)
+            m_new_3  = tl.maximum(m_i_3, m_ij_3)
+            alpha_3  = tl.exp(m_i_3 - m_new_3)
+            p_3      = tl.exp(scores_3 - m_new_3[:, None])
+            l_i_3    = alpha_3 * l_i_3 + tl.sum(p_3, axis=1)
+            acc_3    = alpha_3[:, None] * acc_3 + tl.dot(p_3.to(v.dtype), v)
+            m_i_3    = m_new_3
+
+    # Finalize and store outputs
+    out_base = Out_ptr + pid_batch * stride_ob + offs_m[:, None] * stride_os + offs_d[None, :] * stride_od
+
+    l_i_0 = tl.where(l_i_0 == 0.0, 1.0, l_i_0)
+    acc_0 = acc_0 / l_i_0[:, None]
+    tl.store(out_base + (pid_kv_head * HEADS_PER_GROUP + 0) * stride_oh, acc_0, mask=mask_m[:, None])
+
+    if HEADS_PER_GROUP > 1:
+        l_i_1 = tl.where(l_i_1 == 0.0, 1.0, l_i_1)
+        acc_1 = acc_1 / l_i_1[:, None]
+        tl.store(out_base + (pid_kv_head * HEADS_PER_GROUP + 1) * stride_oh, acc_1, mask=mask_m[:, None])
+
+    if HEADS_PER_GROUP > 2:
+        l_i_2 = tl.where(l_i_2 == 0.0, 1.0, l_i_2)
+        acc_2 = acc_2 / l_i_2[:, None]
+        tl.store(out_base + (pid_kv_head * HEADS_PER_GROUP + 2) * stride_oh, acc_2, mask=mask_m[:, None])
+
+    if HEADS_PER_GROUP > 3:
+        l_i_3 = tl.where(l_i_3 == 0.0, 1.0, l_i_3)
+        acc_3 = acc_3 / l_i_3[:, None]
+        tl.store(out_base + (pid_kv_head * HEADS_PER_GROUP + 3) * stride_oh, acc_3, mask=mask_m[:, None])
 
 
 @triton.jit
@@ -159,8 +237,12 @@ def gqa_self_attention_fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    HEADS_PER_GROUP: tl.constexpr,
 ):
-    """GQA self-attention optimized to load KV once per group"""
+    """GQA self-attention optimized to load KV once per group
+    
+    Fixed: KV loaded once per block, reused across all heads in group
+    """
 
     pid_batch   = tl.program_id(0)
     pid_kv_head = tl.program_id(1)
@@ -169,6 +251,7 @@ def gqa_self_attention_fwd_kernel(
     q_start = pid_m * BLOCK_M
     offs_m  = q_start + tl.arange(0, BLOCK_M)
     offs_d  = tl.arange(0, BLOCK_D)
+    offs_n  = tl.arange(0, BLOCK_N)
     mask_m  = offs_m < seq_len
 
     if use_segment_mask:
@@ -177,81 +260,171 @@ def gqa_self_attention_fwd_kernel(
 
     kv_end = seq_len
     if is_causal:
-        kv_end = min(seq_len, (pid_m + 1) * BLOCK_M)
+        kv_end = tl.minimum(seq_len, (pid_m + 1) * BLOCK_M)
 
-    for local_head in range(heads_per_group):
-        pid_head = pid_kv_head * heads_per_group + local_head
+    # Initialize per-head accumulators
+    m_i_0 = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
+    m_i_1 = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
+    m_i_2 = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
+    m_i_3 = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
+    
+    l_i_0 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    l_i_1 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    l_i_2 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    l_i_3 = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    
+    acc_0 = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+    acc_1 = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+    acc_2 = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+    acc_3 = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
 
-        q_ptrs = (Q_ptr +
-                  pid_batch * stride_qb +
-                  pid_head * stride_qh +
-                  offs_m[:, None] * stride_qs +
-                  offs_d[None, :] * stride_qd)
-        q      = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
+    # Load all Q heads for this group upfront
+    q_base = Q_ptr + pid_batch * stride_qb + offs_m[:, None] * stride_qs + offs_d[None, :] * stride_qd
+    
+    q_0 = tl.load(q_base + (pid_kv_head * HEADS_PER_GROUP + 0) * stride_qh, mask=mask_m[:, None], other=0.0)
+    q_1 = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+    q_2 = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+    q_3 = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+    
+    if HEADS_PER_GROUP > 1:
+        q_1 = tl.load(q_base + (pid_kv_head * HEADS_PER_GROUP + 1) * stride_qh, mask=mask_m[:, None], other=0.0)
+    if HEADS_PER_GROUP > 2:
+        q_2 = tl.load(q_base + (pid_kv_head * HEADS_PER_GROUP + 2) * stride_qh, mask=mask_m[:, None], other=0.0)
+    if HEADS_PER_GROUP > 3:
+        q_3 = tl.load(q_base + (pid_kv_head * HEADS_PER_GROUP + 3) * stride_qh, mask=mask_m[:, None], other=0.0)
 
+    # Load ALiBi slopes if needed
+    alibi_slope_0 = 0.0
+    alibi_slope_1 = 0.0
+    alibi_slope_2 = 0.0
+    alibi_slope_3 = 0.0
+    
+    if use_alibi:
+        alibi_slope_0 = tl.load(alibi_slopes_ptr + pid_kv_head * HEADS_PER_GROUP + 0)
+        if HEADS_PER_GROUP > 1:
+            alibi_slope_1 = tl.load(alibi_slopes_ptr + pid_kv_head * HEADS_PER_GROUP + 1)
+        if HEADS_PER_GROUP > 2:
+            alibi_slope_2 = tl.load(alibi_slopes_ptr + pid_kv_head * HEADS_PER_GROUP + 2)
+        if HEADS_PER_GROUP > 3:
+            alibi_slope_3 = tl.load(alibi_slopes_ptr + pid_kv_head * HEADS_PER_GROUP + 3)
+
+    # Iterate over KV blocks - load K,V ONCE per block
+    for n_start in range(0, kv_end, BLOCK_N):
+        offs_n_curr = n_start + offs_n
+        mask_n      = offs_n_curr < seq_len
+
+        # Load K and V ONCE for all heads in group
+        k_ptrs = (K_ptr +
+                  pid_batch * stride_kb +
+                  pid_kv_head * stride_kh +
+                  offs_n_curr[:, None] * stride_ks +
+                  offs_d[None, :] * stride_kd)
+        k      = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
+        
+        v_ptrs = (V_ptr +
+                  pid_batch * stride_vb +
+                  pid_kv_head * stride_vh +
+                  offs_n_curr[:, None] * stride_vs +
+                  offs_d[None, :] * stride_vd)
+        v      = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+
+        k_t = tl.trans(k)
+
+        # Compute base mask (shared across heads)
+        valid_mask = mask_m[:, None] & mask_n[None, :]
+
+        if is_causal:
+            causal_mask = offs_m[:, None] >= offs_n_curr[None, :]
+            valid_mask  = valid_mask & causal_mask
+
+        if use_segment_mask:
+            k_seg_ptrs = segment_ids_ptr + pid_batch * stride_segb + offs_n_curr * stride_segs
+            k_seg_ids  = tl.load(k_seg_ptrs, mask=mask_n, other=-1)
+            same_seg   = (q_seg_ids[:, None] == k_seg_ids[None, :]) & (q_seg_ids[:, None] >= 0)
+            valid_mask = valid_mask & same_seg
+
+        # Precompute position differences for ALiBi
         if use_alibi:
-            alibi_slope = tl.load(alibi_slopes_ptr + pid_head)
+            q_pos = offs_m[:, None].to(tl.float32)
+            k_pos = offs_n_curr[None, :].to(tl.float32)
+            pos_diff = tl.abs(q_pos - k_pos)
 
-        m_i = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
-        l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
-        acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+        # Process head 0
+        scores_0 = tl.dot(q_0, k_t) * softmax_scale
+        if use_alibi:
+            scores_0 = scores_0 - alibi_slope_0 * pos_diff
+        scores_0 = tl.where(valid_mask, scores_0, float('-inf'))
+        m_ij_0   = tl.max(scores_0, axis=1)
+        m_new_0  = tl.maximum(m_i_0, m_ij_0)
+        alpha_0  = tl.exp(m_i_0 - m_new_0)
+        p_0      = tl.exp(scores_0 - m_new_0[:, None])
+        l_i_0    = alpha_0 * l_i_0 + tl.sum(p_0, axis=1)
+        acc_0    = alpha_0[:, None] * acc_0 + tl.dot(p_0.to(v.dtype), v)
+        m_i_0    = m_new_0
 
-        for n_start in range(0, kv_end, BLOCK_N):
-            offs_n = n_start + tl.arange(0, BLOCK_N)
-            mask_n = offs_n < seq_len
-
-            k_ptrs = (K_ptr +
-                      pid_batch * stride_kb +
-                      pid_kv_head * stride_kh +
-                      offs_n[:, None] * stride_ks +
-                      offs_d[None, :] * stride_kd)
-            k      = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
-            scores = tl.dot(q, tl.trans(k)) * softmax_scale
-
+        # Process head 1
+        if HEADS_PER_GROUP > 1:
+            scores_1 = tl.dot(q_1, k_t) * softmax_scale
             if use_alibi:
-                q_pos      = offs_m[:, None].to(tl.float32)
-                k_pos      = offs_n[None, :].to(tl.float32)
-                alibi_bias = -alibi_slope * tl.abs(q_pos - k_pos)
-                scores     = scores + alibi_bias
+                scores_1 = scores_1 - alibi_slope_1 * pos_diff
+            scores_1 = tl.where(valid_mask, scores_1, float('-inf'))
+            m_ij_1   = tl.max(scores_1, axis=1)
+            m_new_1  = tl.maximum(m_i_1, m_ij_1)
+            alpha_1  = tl.exp(m_i_1 - m_new_1)
+            p_1      = tl.exp(scores_1 - m_new_1[:, None])
+            l_i_1    = alpha_1 * l_i_1 + tl.sum(p_1, axis=1)
+            acc_1    = alpha_1[:, None] * acc_1 + tl.dot(p_1.to(v.dtype), v)
+            m_i_1    = m_new_1
 
-            valid_mask = mask_m[:, None] & mask_n[None, :]
+        # Process head 2
+        if HEADS_PER_GROUP > 2:
+            scores_2 = tl.dot(q_2, k_t) * softmax_scale
+            if use_alibi:
+                scores_2 = scores_2 - alibi_slope_2 * pos_diff
+            scores_2 = tl.where(valid_mask, scores_2, float('-inf'))
+            m_ij_2   = tl.max(scores_2, axis=1)
+            m_new_2  = tl.maximum(m_i_2, m_ij_2)
+            alpha_2  = tl.exp(m_i_2 - m_new_2)
+            p_2      = tl.exp(scores_2 - m_new_2[:, None])
+            l_i_2    = alpha_2 * l_i_2 + tl.sum(p_2, axis=1)
+            acc_2    = alpha_2[:, None] * acc_2 + tl.dot(p_2.to(v.dtype), v)
+            m_i_2    = m_new_2
 
-            if is_causal:
-                causal_mask = offs_m[:, None] >= offs_n[None, :]
-                valid_mask  = valid_mask & causal_mask
+        # Process head 3
+        if HEADS_PER_GROUP > 3:
+            scores_3 = tl.dot(q_3, k_t) * softmax_scale
+            if use_alibi:
+                scores_3 = scores_3 - alibi_slope_3 * pos_diff
+            scores_3 = tl.where(valid_mask, scores_3, float('-inf'))
+            m_ij_3   = tl.max(scores_3, axis=1)
+            m_new_3  = tl.maximum(m_i_3, m_ij_3)
+            alpha_3  = tl.exp(m_i_3 - m_new_3)
+            p_3      = tl.exp(scores_3 - m_new_3[:, None])
+            l_i_3    = alpha_3 * l_i_3 + tl.sum(p_3, axis=1)
+            acc_3    = alpha_3[:, None] * acc_3 + tl.dot(p_3.to(v.dtype), v)
+            m_i_3    = m_new_3
 
-            if use_segment_mask:
-                k_seg_ptrs = segment_ids_ptr + pid_batch * stride_segb + offs_n * stride_segs
-                k_seg_ids  = tl.load(k_seg_ptrs, mask=mask_n, other=-1)
-                same_seg   = (q_seg_ids[:, None] == k_seg_ids[None, :]) & (q_seg_ids[:, None] >= 0)
-                valid_mask = valid_mask & same_seg
+    # Finalize and store outputs
+    out_base = Out_ptr + pid_batch * stride_ob + offs_m[:, None] * stride_os + offs_d[None, :] * stride_od
 
-            scores = tl.where(valid_mask, scores, float('-inf'))
+    l_i_0 = tl.where(l_i_0 == 0.0, 1.0, l_i_0)
+    acc_0 = acc_0 / l_i_0[:, None]
+    tl.store(out_base + (pid_kv_head * HEADS_PER_GROUP + 0) * stride_oh, acc_0, mask=mask_m[:, None])
 
-            m_ij  = tl.max(scores, axis=1)
-            m_new = tl.maximum(m_i, m_ij)
-            alpha = tl.exp(m_i - m_new)
-            p     = tl.exp(scores - m_new[:, None])
-            l_i   = alpha * l_i + tl.sum(p, axis=1)
+    if HEADS_PER_GROUP > 1:
+        l_i_1 = tl.where(l_i_1 == 0.0, 1.0, l_i_1)
+        acc_1 = acc_1 / l_i_1[:, None]
+        tl.store(out_base + (pid_kv_head * HEADS_PER_GROUP + 1) * stride_oh, acc_1, mask=mask_m[:, None])
 
-            v_ptrs = (V_ptr +
-                      pid_batch * stride_vb +
-                      pid_kv_head * stride_vh +
-                      offs_n[:, None] * stride_vs +
-                      offs_d[None, :] * stride_vd)
-            v   = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
-            acc = alpha[:, None] * acc + tl.dot(p.to(v.dtype), v)
-            m_i = m_new
+    if HEADS_PER_GROUP > 2:
+        l_i_2 = tl.where(l_i_2 == 0.0, 1.0, l_i_2)
+        acc_2 = acc_2 / l_i_2[:, None]
+        tl.store(out_base + (pid_kv_head * HEADS_PER_GROUP + 2) * stride_oh, acc_2, mask=mask_m[:, None])
 
-        l_i = tl.where(l_i == 0.0, 1.0, l_i)
-        acc = acc / l_i[:, None]
-
-        out_ptrs = (Out_ptr +
-                    pid_batch * stride_ob +
-                    pid_head * stride_oh +
-                    offs_m[:, None] * stride_os +
-                    offs_d[None, :] * stride_od)
-        tl.store(out_ptrs, acc, mask=mask_m[:, None])
+    if HEADS_PER_GROUP > 3:
+        l_i_3 = tl.where(l_i_3 == 0.0, 1.0, l_i_3)
+        acc_3 = acc_3 / l_i_3[:, None]
+        tl.store(out_base + (pid_kv_head * HEADS_PER_GROUP + 3) * stride_oh, acc_3, mask=mask_m[:, None])
 
 
 class GQAttention(nn.Module):
@@ -272,6 +445,7 @@ class GQAttention(nn.Module):
         self.softmax_scale   = 1.0 / math.sqrt(self.head_dim)
 
         assert config.num_heads % config.num_kv_heads == 0
+        assert self.heads_per_group <= 4, "Current kernel supports up to 4 heads per group"
 
         self.q       = nn.Linear(config.embed_dim, config.num_heads * self.head_dim, bias=False)
         self.k       = nn.Linear(config.embed_dim, config.num_kv_heads * self.head_dim, bias=False)
@@ -305,6 +479,25 @@ class GQAttention(nn.Module):
                 get_slopes(closest_power),
                 get_slopes(2 * closest_power)[0::2][:num_heads - closest_power]
             ])
+
+    def _validate_inputs(self, hidden_states, key_value_states=None, segment_ids=None, q_segment_ids=None, kv_segment_ids=None):
+        """Validate input tensors"""
+
+        B, L, D = hidden_states.shape
+        assert D == self.embed_dim, f"Expected embed_dim {self.embed_dim}, got {D}"
+
+        if self.is_cross_attn:
+            assert key_value_states is not None, "Cross-attention requires key_value_states"
+            assert key_value_states.shape[0] == B, "Batch size mismatch"
+            assert key_value_states.shape[2] == D, "Embed dim mismatch"
+
+        if segment_ids is not None:
+            assert segment_ids.shape[0] == B, "Segment IDs batch size mismatch"
+            assert segment_ids.shape[1] == L, "Segment IDs length mismatch"
+
+        if q_segment_ids is not None and kv_segment_ids is not None:
+            assert q_segment_ids.shape[0] == B, "Q segment IDs batch size mismatch"
+            assert kv_segment_ids.shape[0] == B, "KV segment IDs batch size mismatch"
 
     def _forward_pytorch_cross(self, hidden_states, key_value_states, attention_mask=None, q_segment_ids=None, kv_segment_ids=None):
         """PyTorch fallback for segment-aware cross-attention"""
@@ -413,8 +606,8 @@ class GQAttention(nn.Module):
             stride_kvsegb = 0
             stride_kvsegs = 0
 
-        BLOCK_M      = min(64, L_q)
-        BLOCK_N      = min(64, L_kv)
+        BLOCK_M      = 64
+        BLOCK_N      = 64
         BLOCK_D      = self.head_dim
         num_m_blocks = (L_q + BLOCK_M - 1) // BLOCK_M
         grid         = (B, self.num_kv_heads, num_m_blocks)
@@ -433,9 +626,10 @@ class GQAttention(nn.Module):
             self.heads_per_group,
             use_segment_mask,
             self.softmax_scale,
-            BLOCK_M = BLOCK_M,
-            BLOCK_N = BLOCK_N,
-            BLOCK_D = BLOCK_D,
+            BLOCK_M         = BLOCK_M,
+            BLOCK_N         = BLOCK_N,
+            BLOCK_D         = BLOCK_D,
+            HEADS_PER_GROUP = self.heads_per_group,
         )
 
         out = out.permute(0, 2, 1, 3).reshape(B, L_q, self.num_heads * self.head_dim)
@@ -464,8 +658,8 @@ class GQAttention(nn.Module):
             stride_segb = 0
             stride_segs = 0
 
-        BLOCK_M      = min(64, L)
-        BLOCK_N      = min(64, L)
+        BLOCK_M      = 64
+        BLOCK_N      = 64
         BLOCK_D      = self.head_dim
         num_m_blocks = (L + BLOCK_M - 1) // BLOCK_M
         grid         = (B, self.num_kv_heads, num_m_blocks)
@@ -487,9 +681,10 @@ class GQAttention(nn.Module):
             self.heads_per_group,
             self.softmax_scale,
             self.is_causal,
-            BLOCK_M = BLOCK_M,
-            BLOCK_N = BLOCK_N,
-            BLOCK_D = BLOCK_D,
+            BLOCK_M         = BLOCK_M,
+            BLOCK_N         = BLOCK_N,
+            BLOCK_D         = BLOCK_D,
+            HEADS_PER_GROUP = self.heads_per_group,
         )
 
         out = out.permute(0, 2, 1, 3).reshape(B, L, self.num_heads * self.head_dim)
@@ -501,6 +696,7 @@ class GQAttention(nn.Module):
     def forward(self, hidden_states, key_value_states=None, attention_mask=None, position_bias=None, segment_ids=None, q_segment_ids=None, kv_segment_ids=None):
         """Forward with segment-aware masking for packed sequences"""
 
+        self._validate_inputs(hidden_states, key_value_states, segment_ids, q_segment_ids, kv_segment_ids)
         use_triton = self._triton_supported and hidden_states.is_cuda
 
         if self.is_cross_attn and key_value_states is not None:
