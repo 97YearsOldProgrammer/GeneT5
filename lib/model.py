@@ -131,12 +131,19 @@ class GeneT5(nn.Module):
         # Encode (or use cached)
         if encoder_hidden_states is None:
             encoder_hidden_states = self.encode(encoder_input_ids, encoder_attention_mask)
-        
-        # Replace invalid indices with pad token
+
+        # Create decoder attention mask from padding if not provided
+        # This handles -100 padding values properly
+        if decoder_attention_mask is None and decoder_input_ids is not None:
+            decoder_attention_mask = (decoder_input_ids >= 0) & (decoder_input_ids < self.vocab_size)
+            decoder_attention_mask = decoder_attention_mask.long()
+
+        # Replace invalid indices with pad token (0) for embedding lookup
+        # The attention mask will prevent these from affecting computation
         decoder_input_ids_safe = decoder_input_ids.clone()
         decoder_input_ids_safe[decoder_input_ids_safe < 0] = 0
         decoder_input_ids_safe[decoder_input_ids_safe >= self.vocab_size] = 0
-        
+
         # Embed decoder inputs
         decoder_embeds = self.decoder_embed(decoder_input_ids_safe)
         decoder_embeds = self.decoder_embed_dropout(decoder_embeds)

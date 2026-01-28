@@ -93,6 +93,22 @@ def build_gt5(
         Output Head             -> TIED or RANDOM INIT
     """
     
+    # Handle None values - fall back to defaults
+    if decoder_block_size is None:
+        decoder_block_size = DECODER_DEFAULTS["block_size"]
+    if decoder_window_size is None:
+        decoder_window_size = DECODER_DEFAULTS["window_size"]
+    if decoder_num_global_tokens is None:
+        decoder_num_global_tokens = DECODER_DEFAULTS["num_global_tokens"]
+    if decoder_num_rand_blocks is None:
+        decoder_num_rand_blocks = DECODER_DEFAULTS["num_rand_blocks"]
+    if init_embed_std is None:
+        init_embed_std = init_std
+    if init_ffn_std is None:
+        init_ffn_std = init_std
+    if init_attn_std is None:
+        init_attn_std = init_std
+
     print("=" * 60)
     print("Building GeneT5 from DNABERT-2")
     print("=" * 60)

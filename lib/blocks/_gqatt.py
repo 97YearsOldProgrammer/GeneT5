@@ -149,72 +149,81 @@ def gqa_cross_attention_fwd_kernel(
             base_mask = mask_m[:, None] & mask_n[None, :]
 
         # Process head 0
-        scores_0 = tl.dot(q_0, k_t) * softmax_scale
-        scores_0 = tl.where(base_mask, scores_0, float('-inf'))
-        m_ij_0   = tl.max(scores_0, axis=1)
-        m_new_0  = tl.maximum(m_i_0, m_ij_0)
-        alpha_0  = tl.exp(m_i_0 - m_new_0)
-        p_0      = tl.exp(scores_0 - m_new_0[:, None])
-        l_i_0    = alpha_0 * l_i_0 + tl.sum(p_0, axis=1)
-        acc_0    = alpha_0[:, None] * acc_0 + tl.dot(p_0.to(v.dtype), v)
-        m_i_0    = m_new_0
+        scores_0    = tl.dot(q_0, k_t) * softmax_scale
+        scores_0    = tl.where(base_mask, scores_0, float('-inf'))
+        m_ij_0      = tl.max(scores_0, axis=1)
+        m_new_0     = tl.maximum(m_i_0, m_ij_0)
+        both_inf_0  = (m_i_0 == float('-inf')) & (m_new_0 == float('-inf'))
+        alpha_0     = tl.where(both_inf_0, 1.0, tl.exp(m_i_0 - m_new_0))
+        p_0         = tl.where(both_inf_0[:, None], 0.0, tl.exp(scores_0 - m_new_0[:, None]))
+        l_i_0       = alpha_0 * l_i_0 + tl.sum(p_0, axis=1)
+        acc_0       = alpha_0[:, None] * acc_0 + tl.dot(p_0.to(v.dtype), v)
+        m_i_0       = m_new_0
 
         # Process head 1
         if HEADS_PER_GROUP > 1:
-            scores_1 = tl.dot(q_1, k_t) * softmax_scale
-            scores_1 = tl.where(base_mask, scores_1, float('-inf'))
-            m_ij_1   = tl.max(scores_1, axis=1)
-            m_new_1  = tl.maximum(m_i_1, m_ij_1)
-            alpha_1  = tl.exp(m_i_1 - m_new_1)
-            p_1      = tl.exp(scores_1 - m_new_1[:, None])
-            l_i_1    = alpha_1 * l_i_1 + tl.sum(p_1, axis=1)
-            acc_1    = alpha_1[:, None] * acc_1 + tl.dot(p_1.to(v.dtype), v)
-            m_i_1    = m_new_1
+            scores_1    = tl.dot(q_1, k_t) * softmax_scale
+            scores_1    = tl.where(base_mask, scores_1, float('-inf'))
+            m_ij_1      = tl.max(scores_1, axis=1)
+            m_new_1     = tl.maximum(m_i_1, m_ij_1)
+            both_inf_1  = (m_i_1 == float('-inf')) & (m_new_1 == float('-inf'))
+            alpha_1     = tl.where(both_inf_1, 1.0, tl.exp(m_i_1 - m_new_1))
+            p_1         = tl.where(both_inf_1[:, None], 0.0, tl.exp(scores_1 - m_new_1[:, None]))
+            l_i_1       = alpha_1 * l_i_1 + tl.sum(p_1, axis=1)
+            acc_1       = alpha_1[:, None] * acc_1 + tl.dot(p_1.to(v.dtype), v)
+            m_i_1       = m_new_1
 
         # Process head 2
         if HEADS_PER_GROUP > 2:
-            scores_2 = tl.dot(q_2, k_t) * softmax_scale
-            scores_2 = tl.where(base_mask, scores_2, float('-inf'))
-            m_ij_2   = tl.max(scores_2, axis=1)
-            m_new_2  = tl.maximum(m_i_2, m_ij_2)
-            alpha_2  = tl.exp(m_i_2 - m_new_2)
-            p_2      = tl.exp(scores_2 - m_new_2[:, None])
-            l_i_2    = alpha_2 * l_i_2 + tl.sum(p_2, axis=1)
-            acc_2    = alpha_2[:, None] * acc_2 + tl.dot(p_2.to(v.dtype), v)
-            m_i_2    = m_new_2
+            scores_2    = tl.dot(q_2, k_t) * softmax_scale
+            scores_2    = tl.where(base_mask, scores_2, float('-inf'))
+            m_ij_2      = tl.max(scores_2, axis=1)
+            m_new_2     = tl.maximum(m_i_2, m_ij_2)
+            both_inf_2  = (m_i_2 == float('-inf')) & (m_new_2 == float('-inf'))
+            alpha_2     = tl.where(both_inf_2, 1.0, tl.exp(m_i_2 - m_new_2))
+            p_2         = tl.where(both_inf_2[:, None], 0.0, tl.exp(scores_2 - m_new_2[:, None]))
+            l_i_2       = alpha_2 * l_i_2 + tl.sum(p_2, axis=1)
+            acc_2       = alpha_2[:, None] * acc_2 + tl.dot(p_2.to(v.dtype), v)
+            m_i_2       = m_new_2
 
         # Process head 3
         if HEADS_PER_GROUP > 3:
-            scores_3 = tl.dot(q_3, k_t) * softmax_scale
-            scores_3 = tl.where(base_mask, scores_3, float('-inf'))
-            m_ij_3   = tl.max(scores_3, axis=1)
-            m_new_3  = tl.maximum(m_i_3, m_ij_3)
-            alpha_3  = tl.exp(m_i_3 - m_new_3)
-            p_3      = tl.exp(scores_3 - m_new_3[:, None])
-            l_i_3    = alpha_3 * l_i_3 + tl.sum(p_3, axis=1)
-            acc_3    = alpha_3[:, None] * acc_3 + tl.dot(p_3.to(v.dtype), v)
-            m_i_3    = m_new_3
+            scores_3    = tl.dot(q_3, k_t) * softmax_scale
+            scores_3    = tl.where(base_mask, scores_3, float('-inf'))
+            m_ij_3      = tl.max(scores_3, axis=1)
+            m_new_3     = tl.maximum(m_i_3, m_ij_3)
+            both_inf_3  = (m_i_3 == float('-inf')) & (m_new_3 == float('-inf'))
+            alpha_3     = tl.where(both_inf_3, 1.0, tl.exp(m_i_3 - m_new_3))
+            p_3         = tl.where(both_inf_3[:, None], 0.0, tl.exp(scores_3 - m_new_3[:, None]))
+            l_i_3       = alpha_3 * l_i_3 + tl.sum(p_3, axis=1)
+            acc_3       = alpha_3[:, None] * acc_3 + tl.dot(p_3.to(v.dtype), v)
+            m_i_3       = m_new_3
 
     # Finalize and store outputs
     out_base = Out_ptr + pid_batch * stride_ob + offs_m[:, None] * stride_os + offs_d[None, :] * stride_od
 
+    # Guard against NaN: when l_i==0 (no valid attention targets), output zeros
+    zero_mask_0 = (l_i_0 == 0.0)[:, None]
     l_i_0 = tl.where(l_i_0 == 0.0, 1.0, l_i_0)
-    acc_0 = acc_0 / l_i_0[:, None]
+    acc_0 = tl.where(zero_mask_0, 0.0, acc_0 / l_i_0[:, None])
     tl.store(out_base + (pid_kv_head * HEADS_PER_GROUP + 0) * stride_oh, acc_0, mask=mask_m[:, None])
 
     if HEADS_PER_GROUP > 1:
+        zero_mask_1 = (l_i_1 == 0.0)[:, None]
         l_i_1 = tl.where(l_i_1 == 0.0, 1.0, l_i_1)
-        acc_1 = acc_1 / l_i_1[:, None]
+        acc_1 = tl.where(zero_mask_1, 0.0, acc_1 / l_i_1[:, None])
         tl.store(out_base + (pid_kv_head * HEADS_PER_GROUP + 1) * stride_oh, acc_1, mask=mask_m[:, None])
 
     if HEADS_PER_GROUP > 2:
+        zero_mask_2 = (l_i_2 == 0.0)[:, None]
         l_i_2 = tl.where(l_i_2 == 0.0, 1.0, l_i_2)
-        acc_2 = acc_2 / l_i_2[:, None]
+        acc_2 = tl.where(zero_mask_2, 0.0, acc_2 / l_i_2[:, None])
         tl.store(out_base + (pid_kv_head * HEADS_PER_GROUP + 2) * stride_oh, acc_2, mask=mask_m[:, None])
 
     if HEADS_PER_GROUP > 3:
+        zero_mask_3 = (l_i_3 == 0.0)[:, None]
         l_i_3 = tl.where(l_i_3 == 0.0, 1.0, l_i_3)
-        acc_3 = acc_3 / l_i_3[:, None]
+        acc_3 = tl.where(zero_mask_3, 0.0, acc_3 / l_i_3[:, None])
         tl.store(out_base + (pid_kv_head * HEADS_PER_GROUP + 3) * stride_oh, acc_3, mask=mask_m[:, None])
 
 
@@ -350,80 +359,89 @@ def gqa_self_attention_fwd_kernel(
             pos_diff = tl.abs(q_pos - k_pos)
 
         # Process head 0
-        scores_0 = tl.dot(q_0, k_t) * softmax_scale
+        scores_0    = tl.dot(q_0, k_t) * softmax_scale
         if use_alibi:
             scores_0 = scores_0 - alibi_slope_0 * pos_diff
-        scores_0 = tl.where(valid_mask, scores_0, float('-inf'))
-        m_ij_0   = tl.max(scores_0, axis=1)
-        m_new_0  = tl.maximum(m_i_0, m_ij_0)
-        alpha_0  = tl.exp(m_i_0 - m_new_0)
-        p_0      = tl.exp(scores_0 - m_new_0[:, None])
-        l_i_0    = alpha_0 * l_i_0 + tl.sum(p_0, axis=1)
-        acc_0    = alpha_0[:, None] * acc_0 + tl.dot(p_0.to(v.dtype), v)
-        m_i_0    = m_new_0
+        scores_0    = tl.where(valid_mask, scores_0, float('-inf'))
+        m_ij_0      = tl.max(scores_0, axis=1)
+        m_new_0     = tl.maximum(m_i_0, m_ij_0)
+        both_inf_0  = (m_i_0 == float('-inf')) & (m_new_0 == float('-inf'))
+        alpha_0     = tl.where(both_inf_0, 1.0, tl.exp(m_i_0 - m_new_0))
+        p_0         = tl.where(both_inf_0[:, None], 0.0, tl.exp(scores_0 - m_new_0[:, None]))
+        l_i_0       = alpha_0 * l_i_0 + tl.sum(p_0, axis=1)
+        acc_0       = alpha_0[:, None] * acc_0 + tl.dot(p_0.to(v.dtype), v)
+        m_i_0       = m_new_0
 
         # Process head 1
         if HEADS_PER_GROUP > 1:
-            scores_1 = tl.dot(q_1, k_t) * softmax_scale
+            scores_1    = tl.dot(q_1, k_t) * softmax_scale
             if use_alibi:
                 scores_1 = scores_1 - alibi_slope_1 * pos_diff
-            scores_1 = tl.where(valid_mask, scores_1, float('-inf'))
-            m_ij_1   = tl.max(scores_1, axis=1)
-            m_new_1  = tl.maximum(m_i_1, m_ij_1)
-            alpha_1  = tl.exp(m_i_1 - m_new_1)
-            p_1      = tl.exp(scores_1 - m_new_1[:, None])
-            l_i_1    = alpha_1 * l_i_1 + tl.sum(p_1, axis=1)
-            acc_1    = alpha_1[:, None] * acc_1 + tl.dot(p_1.to(v.dtype), v)
-            m_i_1    = m_new_1
+            scores_1    = tl.where(valid_mask, scores_1, float('-inf'))
+            m_ij_1      = tl.max(scores_1, axis=1)
+            m_new_1     = tl.maximum(m_i_1, m_ij_1)
+            both_inf_1  = (m_i_1 == float('-inf')) & (m_new_1 == float('-inf'))
+            alpha_1     = tl.where(both_inf_1, 1.0, tl.exp(m_i_1 - m_new_1))
+            p_1         = tl.where(both_inf_1[:, None], 0.0, tl.exp(scores_1 - m_new_1[:, None]))
+            l_i_1       = alpha_1 * l_i_1 + tl.sum(p_1, axis=1)
+            acc_1       = alpha_1[:, None] * acc_1 + tl.dot(p_1.to(v.dtype), v)
+            m_i_1       = m_new_1
 
         # Process head 2
         if HEADS_PER_GROUP > 2:
-            scores_2 = tl.dot(q_2, k_t) * softmax_scale
+            scores_2    = tl.dot(q_2, k_t) * softmax_scale
             if use_alibi:
                 scores_2 = scores_2 - alibi_slope_2 * pos_diff
-            scores_2 = tl.where(valid_mask, scores_2, float('-inf'))
-            m_ij_2   = tl.max(scores_2, axis=1)
-            m_new_2  = tl.maximum(m_i_2, m_ij_2)
-            alpha_2  = tl.exp(m_i_2 - m_new_2)
-            p_2      = tl.exp(scores_2 - m_new_2[:, None])
-            l_i_2    = alpha_2 * l_i_2 + tl.sum(p_2, axis=1)
-            acc_2    = alpha_2[:, None] * acc_2 + tl.dot(p_2.to(v.dtype), v)
-            m_i_2    = m_new_2
+            scores_2    = tl.where(valid_mask, scores_2, float('-inf'))
+            m_ij_2      = tl.max(scores_2, axis=1)
+            m_new_2     = tl.maximum(m_i_2, m_ij_2)
+            both_inf_2  = (m_i_2 == float('-inf')) & (m_new_2 == float('-inf'))
+            alpha_2     = tl.where(both_inf_2, 1.0, tl.exp(m_i_2 - m_new_2))
+            p_2         = tl.where(both_inf_2[:, None], 0.0, tl.exp(scores_2 - m_new_2[:, None]))
+            l_i_2       = alpha_2 * l_i_2 + tl.sum(p_2, axis=1)
+            acc_2       = alpha_2[:, None] * acc_2 + tl.dot(p_2.to(v.dtype), v)
+            m_i_2       = m_new_2
 
         # Process head 3
         if HEADS_PER_GROUP > 3:
-            scores_3 = tl.dot(q_3, k_t) * softmax_scale
+            scores_3    = tl.dot(q_3, k_t) * softmax_scale
             if use_alibi:
                 scores_3 = scores_3 - alibi_slope_3 * pos_diff
-            scores_3 = tl.where(valid_mask, scores_3, float('-inf'))
-            m_ij_3   = tl.max(scores_3, axis=1)
-            m_new_3  = tl.maximum(m_i_3, m_ij_3)
-            alpha_3  = tl.exp(m_i_3 - m_new_3)
-            p_3      = tl.exp(scores_3 - m_new_3[:, None])
-            l_i_3    = alpha_3 * l_i_3 + tl.sum(p_3, axis=1)
-            acc_3    = alpha_3[:, None] * acc_3 + tl.dot(p_3.to(v.dtype), v)
-            m_i_3    = m_new_3
+            scores_3    = tl.where(valid_mask, scores_3, float('-inf'))
+            m_ij_3      = tl.max(scores_3, axis=1)
+            m_new_3     = tl.maximum(m_i_3, m_ij_3)
+            both_inf_3  = (m_i_3 == float('-inf')) & (m_new_3 == float('-inf'))
+            alpha_3     = tl.where(both_inf_3, 1.0, tl.exp(m_i_3 - m_new_3))
+            p_3         = tl.where(both_inf_3[:, None], 0.0, tl.exp(scores_3 - m_new_3[:, None]))
+            l_i_3       = alpha_3 * l_i_3 + tl.sum(p_3, axis=1)
+            acc_3       = alpha_3[:, None] * acc_3 + tl.dot(p_3.to(v.dtype), v)
+            m_i_3       = m_new_3
 
     # Finalize and store outputs
     out_base = Out_ptr + pid_batch * stride_ob + offs_m[:, None] * stride_os + offs_d[None, :] * stride_od
 
+    # Guard against NaN: when l_i==0 (no valid attention targets), output zeros
+    zero_mask_0 = (l_i_0 == 0.0)[:, None]
     l_i_0 = tl.where(l_i_0 == 0.0, 1.0, l_i_0)
-    acc_0 = acc_0 / l_i_0[:, None]
+    acc_0 = tl.where(zero_mask_0, 0.0, acc_0 / l_i_0[:, None])
     tl.store(out_base + (pid_kv_head * HEADS_PER_GROUP + 0) * stride_oh, acc_0, mask=mask_m[:, None])
 
     if HEADS_PER_GROUP > 1:
+        zero_mask_1 = (l_i_1 == 0.0)[:, None]
         l_i_1 = tl.where(l_i_1 == 0.0, 1.0, l_i_1)
-        acc_1 = acc_1 / l_i_1[:, None]
+        acc_1 = tl.where(zero_mask_1, 0.0, acc_1 / l_i_1[:, None])
         tl.store(out_base + (pid_kv_head * HEADS_PER_GROUP + 1) * stride_oh, acc_1, mask=mask_m[:, None])
 
     if HEADS_PER_GROUP > 2:
+        zero_mask_2 = (l_i_2 == 0.0)[:, None]
         l_i_2 = tl.where(l_i_2 == 0.0, 1.0, l_i_2)
-        acc_2 = acc_2 / l_i_2[:, None]
+        acc_2 = tl.where(zero_mask_2, 0.0, acc_2 / l_i_2[:, None])
         tl.store(out_base + (pid_kv_head * HEADS_PER_GROUP + 2) * stride_oh, acc_2, mask=mask_m[:, None])
 
     if HEADS_PER_GROUP > 3:
+        zero_mask_3 = (l_i_3 == 0.0)[:, None]
         l_i_3 = tl.where(l_i_3 == 0.0, 1.0, l_i_3)
-        acc_3 = acc_3 / l_i_3[:, None]
+        acc_3 = tl.where(zero_mask_3, 0.0, acc_3 / l_i_3[:, None])
         tl.store(out_base + (pid_kv_head * HEADS_PER_GROUP + 3) * stride_oh, acc_3, mask=mask_m[:, None])
 
 

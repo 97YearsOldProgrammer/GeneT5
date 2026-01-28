@@ -351,10 +351,15 @@ class MoE(nn.Module):
             # Intermediate buffer for this expert's computation
             hidden = torch.zeros(count, self.ff_dim, device=device, dtype=x_flat.dtype)
 
-            # Block sizes for tiled GEMM
-            BLOCK_M = min(64, count)
-            BLOCK_K = min(64, embed_dim)
-            BLOCK_N = min(64, self.ff_dim)
+            # Block sizes for tiled GEMM - must be powers of 2 for Triton arange
+            def next_power_of_2(n):
+                if n <= 0:
+                    return 1
+                return 1 << (n - 1).bit_length()
+
+            BLOCK_M = next_power_of_2(min(64, count))
+            BLOCK_K = next_power_of_2(min(64, embed_dim))
+            BLOCK_N = next_power_of_2(min(64, self.ff_dim))
 
             grid_m = (count + BLOCK_M - 1) // BLOCK_M
             grid_n = (self.ff_dim + BLOCK_N - 1) // BLOCK_N
@@ -397,23 +402,7 @@ class MoE(nn.Module):
             grid_n_down = (embed_dim + BLOCK_N - 1) // BLOCK_N
             BLOCK_K_down = min(64, self.ff_dim)
 
-            expert_gemm_tiled_kernel[(grid_m, grid_n_down)](
-                hidden, down_w[expert_id], output,
-                torch.arange(count, device=device),  # Direct indices into hidden
-                expert_weights,
-                count, self.ff_dim, embed_dim,
-                hidden.stride(0), hidden.stride(1),
-                down_w.stride(1), down_w.stride(2),
-                output.stride(0), output.stride(1),
-                True,   # Apply weights
-                True,   # Use atomic add for correctness with top_k > 1
-                BLOCK_M = BLOCK_M,
-                BLOCK_N = min(64, embed_dim),
-                BLOCK_K = BLOCK_K_down,
-            )
-
-            # Manual scatter add for down projection output
-            # This replaces the atomic in kernel for simpler correctness
+            # Use PyTorch for down projection - simpler and correct
             down_out = hidden @ down_w[expert_id]
             output.index_add_(0, expert_token_indices, down_out * expert_weights.unsqueeze(-1))
 
@@ -465,10 +454,10 @@ class MoE(nn.Module):
         top_k_probs, top_k_indices = torch.topk(router_probs, self.top_k, dim=-1)
         top_k_probs                = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
 
-        # Use PyTorch path for correctness - Triton path available but needs more testing
+        # Use Triton path when available, fall back to PyTorch
         if self._triton_supported and x_flat.is_cuda:
             try:
-                output = self._forward_pytorch(x_flat, top_k_indices, top_k_probs)
+                output = self._forward_triton(x_flat, top_k_indices, top_k_probs)
             except Exception:
                 output = self._forward_pytorch(x_flat, top_k_indices, top_k_probs)
         else:

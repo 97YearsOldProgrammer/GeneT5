@@ -71,7 +71,11 @@ def main():
         metavar='<int>', help='dataloader workers [%(default)i]')
     parser.add_argument('--early_stopping', required=False, type=int, default=None,
         metavar='<int>', help='early stopping patience')
-    
+    parser.add_argument('--label_smoothing', required=False, type=float, default=0.0,
+        metavar='<float>', help='label smoothing factor [%(default).2f]')
+    parser.add_argument('--gradient_checkpointing', action='store_true',
+        help='enable gradient checkpointing to save memory')
+
     args = parser.parse_args()
     
     print(f"\n{' GeneT5 Fine-Tuning ':=^60}")
@@ -209,8 +213,23 @@ def main():
     print(f"\n{'=' * 60}")
     print('Training...')
     print(f"{'=' * 60}")
-    
+
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+    # Setup label smoothing loss if enabled
+    if args.label_smoothing > 0:
+        loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=args.label_smoothing)
+        print(f"  Label smoothing: {args.label_smoothing}")
+    else:
+        loss_fct = None
+
+    # Enable gradient checkpointing if requested
+    if args.gradient_checkpointing:
+        if hasattr(model.encoder, 'gradient_checkpointing_enable'):
+            model.encoder.gradient_checkpointing_enable()
+        if hasattr(model.decoder, 'gradient_checkpointing_enable'):
+            model.decoder.gradient_checkpointing_enable()
+        print("  Gradient checkpointing: enabled")
     
     patience_counter = 0
     
@@ -228,15 +247,33 @@ def main():
         
         for step, batch in enumerate(train_loader):
             batch = {k: v.to(device) for k, v in batch.items()}
-            
+
+            # Prepare decoder inputs with proper attention mask
+            decoder_input_ids = batch['labels'][:, :-1]
+            labels = batch['labels'][:, 1:]
+
+            # Create decoder attention mask (1 for valid tokens, 0 for padding)
+            decoder_attention_mask = (decoder_input_ids != -100).long()
+
             with torch.amp.autocast('cuda', dtype=dtype):
                 outputs = model(
-                    encoder_input_ids = batch['input_ids'],
-                    decoder_input_ids = batch['labels'][:, :-1],
-                    labels            = batch['labels'][:, 1:],
+                    encoder_input_ids      = batch['input_ids'],
+                    decoder_input_ids      = decoder_input_ids,
+                    labels                 = labels if loss_fct is None else None,
+                    encoder_attention_mask = batch.get('attention_mask'),
+                    decoder_attention_mask = decoder_attention_mask,
                 )
-                
-                loss = outputs['loss'] / args.grad_accum
+
+                # Use label smoothing loss if enabled
+                if loss_fct is not None:
+                    logits = outputs['logits']
+                    loss = loss_fct(logits.reshape(-1, model.vocab_size), labels.reshape(-1))
+                    if outputs.get('moe_loss') is not None:
+                        loss = loss + outputs['moe_loss']
+                else:
+                    loss = outputs['loss']
+
+                loss = loss / args.grad_accum
             
             loss.backward()
             
@@ -258,14 +295,21 @@ def main():
         with torch.no_grad():
             for batch in val_loader:
                 batch = {k: v.to(device) for k, v in batch.items()}
-                
+
+                # Prepare decoder inputs with proper attention mask
+                decoder_input_ids = batch['labels'][:, :-1]
+                labels = batch['labels'][:, 1:]
+                decoder_attention_mask = (decoder_input_ids != -100).long()
+
                 with torch.amp.autocast('cuda', dtype=dtype):
                     outputs = model(
-                        encoder_input_ids = batch['input_ids'],
-                        decoder_input_ids = batch['labels'][:, :-1],
-                        labels            = batch['labels'][:, 1:],
+                        encoder_input_ids      = batch['input_ids'],
+                        decoder_input_ids      = decoder_input_ids,
+                        labels                 = labels,
+                        encoder_attention_mask = batch.get('attention_mask'),
+                        decoder_attention_mask = decoder_attention_mask,
                     )
-                
+
                 total_val_loss += outputs['loss'].item()
                 num_batches    += 1
         

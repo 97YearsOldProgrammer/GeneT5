@@ -85,23 +85,21 @@ if args.new_tokens_file:
     new_tokens_list.extend(file_tokens)
 
 # Handle legacy args with deprecation warning
+_deprecated = [
+    ("block_size",        "encoder_block_size"),
+    ("window_size",       "encoder_window_size"),
+    ("num_global_tokens", "encoder_num_global_tokens"),
+    ("num_rand_blocks",   "encoder_num_rand_blocks"),
+]
+for old, new in _deprecated:
+    if getattr(args, old) is not None:
+        print(f"WARNING: --{old} is deprecated. Use --{new} instead.")
+        setattr(args, new, getattr(args, old))
+
 encoder_block_size        = args.encoder_block_size
 encoder_window_size       = args.encoder_window_size
 encoder_num_global_tokens = args.encoder_num_global_tokens
 encoder_num_rand_blocks   = args.encoder_num_rand_blocks
-
-if args.block_size is not None:
-    print("WARNING: --block_size is deprecated. Use --encoder_block_size instead.")
-    encoder_block_size = args.block_size
-if args.window_size is not None:
-    print("WARNING: --window_size is deprecated. Use --encoder_window_size instead.")
-    encoder_window_size = args.window_size
-if args.num_global_tokens is not None:
-    print("WARNING: --num_global_tokens is deprecated. Use --encoder_num_global_tokens instead.")
-    encoder_num_global_tokens = args.num_global_tokens
-if args.num_rand_blocks is not None:
-    print("WARNING: --num_rand_blocks is deprecated. Use --encoder_num_rand_blocks instead.")
-    encoder_num_rand_blocks = args.num_rand_blocks
 
 print(f"\n{' GeneT5 Initialization ':=^60}")
     
