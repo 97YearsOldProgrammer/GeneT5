@@ -50,9 +50,9 @@ flatten_groups           = compacting.flatten_groups
 pack_with_isolation      = compacting.pack_with_isolation
 verify_isolation         = compacting.verify_isolation
 build_segment_mask       = compacting.build_segment_mask
-estimate_chunk_tokens    = compacting.estimate_chunk_tokens
 align_to_block           = compacting.align_to_block
 compute_effective_length = compacting.compute_effective_length
+estimate_chunk_tokens    = compacting.estimate_chunk_tokens_fallback
 
 
 ######################
@@ -79,7 +79,7 @@ SmartBatchSampler       = dataload.SmartBatchSampler
 ###################
 
 
-append_tokens_to_txt = util.append_tokens_to_txt
-format_size          = util.format_size
-print_run_stats      = util.print_run_stats
+append_tokens_to_txt   = util.append_tokens_to_txt
+format_size            = util.format_size
+print_run_stats        = util.print_run_stats
 print_validation_stats = validation.print_validation_stats

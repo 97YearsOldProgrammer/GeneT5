@@ -20,12 +20,17 @@ import triton.language as tl
 class SparseAttentionConfig:
     embed_dim:         int   = 768
     num_heads:         int   = 12
+    num_kv_heads:      int   = None  # For GQA, defaults to num_heads
     block_size:        int   = 64
     window_size:       int   = 256
     num_global_tokens: int   = 64
     num_random_blocks: int   = 3
     dropout:           float = 0.0
     use_alibi:         bool  = True
+    
+    def __post_init__(self):
+        if self.num_kv_heads is None:
+            self.num_kv_heads = self.num_heads
 
 
 ######################
@@ -39,7 +44,7 @@ def sparse_attention_fwd_kernel(
     Global_K_ptr, Global_V_ptr,
     block_indices_ptr,
     segment_ids_ptr,
-    seq_len, num_heads, head_dim,
+    seq_len, num_heads, num_kv_heads, head_dim,
     num_global_tokens, blocks_per_query,
     start_block_idx,
     stride_qb, stride_qh, stride_qs, stride_qd,
@@ -58,11 +63,14 @@ def sparse_attention_fwd_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_G: tl.constexpr,
 ):
-    """Sparse attention with segment-aware global tokens"""
+    """Sparse attention with segment-aware global tokens and GQA support"""
 
     pid_batch   = tl.program_id(0)
     pid_head    = tl.program_id(1)
     pid_q_block = tl.program_id(2) + start_block_idx
+    
+    # GQA: map query head to KV head
+    kv_head = pid_head * num_kv_heads // num_heads
 
     q_block_start = pid_q_block * BLOCK_M
     offs_m        = q_block_start + tl.arange(0, BLOCK_M)
@@ -94,7 +102,7 @@ def sparse_attention_fwd_kernel(
 
         gk_ptrs = (Global_K_ptr +
                    pid_batch * stride_gkb +
-                   pid_head * stride_gkh +
+                   kv_head * stride_gkh +
                    g_offs[:, None] * stride_gks +
                    offs_d[None, :] * stride_gkd)
         gk      = tl.load(gk_ptrs, mask=g_mask[:, None], other=0.0)
@@ -126,7 +134,7 @@ def sparse_attention_fwd_kernel(
 
         gv_ptrs = (Global_V_ptr +
                    pid_batch * stride_gvb +
-                   pid_head * stride_gvh +
+                   kv_head * stride_gvh +
                    g_offs[:, None] * stride_gvs +
                    offs_d[None, :] * stride_gvd)
         gv      = tl.load(gv_ptrs, mask=g_mask[:, None], other=0.0)
@@ -146,7 +154,7 @@ def sparse_attention_fwd_kernel(
 
             k_ptrs = (K_ptr +
                       pid_batch * stride_kb +
-                      pid_head * stride_kh +
+                      kv_head * stride_kh +
                       offs_n[:, None] * stride_ks +
                       offs_d[None, :] * stride_kd)
             k      = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
@@ -172,7 +180,7 @@ def sparse_attention_fwd_kernel(
 
             v_ptrs = (V_ptr +
                       pid_batch * stride_vb +
-                      pid_head * stride_vh +
+                      kv_head * stride_vh +
                       offs_n[:, None] * stride_vs +
                       offs_d[None, :] * stride_vd)
             v      = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
@@ -196,7 +204,7 @@ def sparse_attention_fwd_kernel(
 def global_token_attention_kernel(
     Q_ptr, K_ptr, V_ptr, Out_ptr,
     segment_ids_ptr,
-    seq_len, num_heads, head_dim,
+    seq_len, num_heads, num_kv_heads, head_dim,
     num_global_tokens,
     stride_qb, stride_qh, stride_qs, stride_qd,
     stride_kb, stride_kh, stride_ks, stride_kd,
@@ -211,11 +219,14 @@ def global_token_attention_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """Segment-aware global token attention"""
+    """Segment-aware global token attention with GQA support"""
 
     pid_batch = tl.program_id(0)
     pid_head  = tl.program_id(1)
     pid_g     = tl.program_id(2)
+    
+    # GQA: map query head to KV head
+    kv_head = pid_head * num_kv_heads // num_heads
 
     g_start = pid_g * BLOCK_M
     offs_g  = g_start + tl.arange(0, BLOCK_M)
@@ -247,7 +258,7 @@ def global_token_attention_kernel(
 
         k_ptrs = (K_ptr +
                   pid_batch * stride_kb +
-                  pid_head * stride_kh +
+                  kv_head * stride_kh +
                   offs_n[:, None] * stride_ks +
                   offs_d[None, :] * stride_kd)
         k      = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
@@ -279,7 +290,7 @@ def global_token_attention_kernel(
 
         v_ptrs = (V_ptr +
                   pid_batch * stride_vb +
-                  pid_head * stride_vh +
+                  kv_head * stride_vh +
                   offs_n[:, None] * stride_vs +
                   offs_d[None, :] * stride_vd)
         v      = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
@@ -305,25 +316,44 @@ def global_token_attention_kernel(
 
 
 class SparseAttention(nn.Module):
-    """BigBird-style sparse attention with segment-aware global tokens"""
+    """
+    BigBird-style sparse attention with GQA support.
+    
+    Multi-Head Attention with:
+      - Grouped Query Attention (GQA) when num_kv_heads < num_heads
+      - Segment-aware global tokens
+      - Local window attention
+      - Random block attention
+      - ALiBi positional bias
+    """
 
-    def __init__(self, config, is_causal=False):
+    def __init__(self, config: SparseAttentionConfig, is_causal=False):
         super().__init__()
 
         self.config            = config
         self.is_causal         = is_causal
         self.embed_dim         = config.embed_dim
         self.num_heads         = config.num_heads
+        self.num_kv_heads      = config.num_kv_heads
         self.head_dim          = config.embed_dim // config.num_heads
+        self.kv_dim            = self.head_dim * config.num_kv_heads
         self.block_size        = config.block_size
         self.window_size       = config.window_size
         self.num_global_tokens = config.num_global_tokens
         self.num_random_blocks = config.num_random_blocks
         self.softmax_scale     = 1.0 / math.sqrt(self.head_dim)
+        
+        # Validate GQA config
+        assert config.num_heads % config.num_kv_heads == 0, \
+            f"num_heads ({config.num_heads}) must be divisible by num_kv_heads ({config.num_kv_heads})"
+        self.num_groups = config.num_heads // config.num_kv_heads
 
+        # Q projection: full num_heads
         self.q = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
-        self.k = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
-        self.v = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
+        # K, V projections: num_kv_heads (smaller for GQA)
+        self.k = nn.Linear(config.embed_dim, self.kv_dim, bias=False)
+        self.v = nn.Linear(config.embed_dim, self.kv_dim, bias=False)
+        # Output projection
         self.o = nn.Linear(config.embed_dim, config.embed_dim, bias=False)
 
         self.dropout = nn.Dropout(config.dropout)
@@ -398,9 +428,29 @@ class SparseAttention(nn.Module):
 
         self._block_indices_cache[cache_key] = block_indices
         return block_indices
+    
+    def _expand_kv_heads(self, x):
+        """Expand KV heads to match Q heads for GQA"""
+        # x: (B, num_kv_heads, L, head_dim)
+        # returns: (B, num_heads, L, head_dim)
+        if self.num_groups == 1:
+            return x
+        B, _, L, D = x.shape
+        return x.unsqueeze(2).expand(B, self.num_kv_heads, self.num_groups, L, D).reshape(B, self.num_heads, L, D)
 
     def forward(self, hidden_states, attention_mask=None, segment_ids=None):
-        """Forward with optional segment masking for packed sequences"""
+        """
+        Forward with optional segment masking for packed sequences.
+        
+        Args:
+            hidden_states: (B, L, D) input tensor
+            attention_mask: optional attention mask
+            segment_ids: optional (B, L) segment IDs for packed sequences
+            
+        Returns:
+            output: (B, L, D) attention output
+            attn_weights: None (not computed for efficiency)
+        """
 
         B, L, D = hidden_states.shape
 
@@ -413,10 +463,13 @@ class SparseAttention(nn.Module):
         else:
             L_padded = L
 
+        # Q: (B, L, num_heads, head_dim)
         q = self.q(hidden_states).view(B, L_padded, self.num_heads, self.head_dim)
-        k = self.k(hidden_states).view(B, L_padded, self.num_heads, self.head_dim)
-        v = self.v(hidden_states).view(B, L_padded, self.num_heads, self.head_dim)
+        # K, V: (B, L, num_kv_heads, head_dim)
+        k = self.k(hidden_states).view(B, L_padded, self.num_kv_heads, self.head_dim)
+        v = self.v(hidden_states).view(B, L_padded, self.num_kv_heads, self.head_dim)
 
+        # Permute to (B, heads, L, head_dim)
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
@@ -430,6 +483,7 @@ class SparseAttention(nn.Module):
 
         out = torch.empty_like(q)
 
+        # Global K, V: (B, num_kv_heads, num_global, head_dim)
         global_k = k[:, :, :self.num_global_tokens, :].contiguous()
         global_v = v[:, :, :self.num_global_tokens, :].contiguous()
 
@@ -452,7 +506,7 @@ class SparseAttention(nn.Module):
         global_token_attention_kernel[grid_global](
             q, k, v, out,
             segment_ids if use_segment_mask else q,
-            L_padded, self.num_heads, self.head_dim,
+            L_padded, self.num_heads, self.num_kv_heads, self.head_dim,
             self.num_global_tokens,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
@@ -481,7 +535,7 @@ class SparseAttention(nn.Module):
             global_k, global_v,
             block_indices,
             segment_ids if use_segment_mask else q,
-            L_padded, self.num_heads, self.head_dim,
+            L_padded, self.num_heads, self.num_kv_heads, self.head_dim,
             self.num_global_tokens, blocks_per_query,
             num_global_blocks,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),

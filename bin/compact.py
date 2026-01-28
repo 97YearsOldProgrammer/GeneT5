@@ -102,15 +102,13 @@ if args.compact_target:
     
     compact_start = time.time()
     
+    # Fixed: removed unsupported keyword arguments (tokenizer_path, n_workers, batch_size)
     compacted_groups, stats = ds.compact_chunks(
         all_chunks, 
         args.compact_target, 
         hard_limit, 
         tokenizer, 
         args.seed,
-        tokenizer_path=tokenizer_path,
-        n_workers=n_workers,
-        batch_size=args.batch_size
     )
     
     all_chunks = ds.flatten_groups(compacted_groups)

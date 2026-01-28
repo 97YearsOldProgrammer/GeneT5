@@ -17,14 +17,30 @@ parser.add_argument("--new_tokens", type=str, nargs="*", default=None,
     help="New tokens to add to tokenizer.")
 parser.add_argument("--new_tokens_file", type=str, default=None,
     help="Path to file containing new tokens (one per line).")
-parser.add_argument("--block_size", type=int, default=64, 
-    help="Block size for sparse attention.")
-parser.add_argument("--window_size", type=int, default=256,
-    help="Local window size for sparse attention.")
-parser.add_argument("--num_global_tokens", type=int, default=64,
-    help="Number of global tokens for sparse attention.")
-parser.add_argument("--num_rand_blocks", type=int, default=3,
-    help="Number of random blocks for sparse attention.")
+parser.add_argument("--encoder_block_size", type=int, default=64, 
+    help="Block size for encoder sparse attention.")
+parser.add_argument("--encoder_window_size", type=int, default=256,
+    help="Local window size for encoder sparse attention.")
+parser.add_argument("--encoder_num_global_tokens", type=int, default=64,
+    help="Number of global tokens for encoder sparse attention.")
+parser.add_argument("--encoder_num_rand_blocks", type=int, default=3,
+    help="Number of random blocks for encoder sparse attention.")
+parser.add_argument("--decoder_block_size", type=int, default=None, 
+    help="Block size for decoder sparse attention. Defaults to encoder value.")
+parser.add_argument("--decoder_window_size", type=int, default=None,
+    help="Local window size for decoder sparse attention. Defaults to encoder value.")
+parser.add_argument("--decoder_num_global_tokens", type=int, default=None,
+    help="Number of global tokens for decoder sparse attention. Defaults to encoder value.")
+parser.add_argument("--decoder_num_rand_blocks", type=int, default=None,
+    help="Number of random blocks for decoder sparse attention. Defaults to encoder value.")
+parser.add_argument("--block_size", type=int, default=None, 
+    help="[DEPRECATED] Use --encoder_block_size instead. Block size for sparse attention.")
+parser.add_argument("--window_size", type=int, default=None,
+    help="[DEPRECATED] Use --encoder_window_size instead. Local window size for sparse attention.")
+parser.add_argument("--num_global_tokens", type=int, default=None,
+    help="[DEPRECATED] Use --encoder_num_global_tokens instead. Number of global tokens.")
+parser.add_argument("--num_rand_blocks", type=int, default=None,
+    help="[DEPRECATED] Use --encoder_num_rand_blocks instead. Number of random blocks.")
 parser.add_argument("--decoder_layers", type=int, default=None, 
     help="Number of decoder layers. Defaults to matching encoder.")
 parser.add_argument("--decoder_heads", type=int, default=None,
@@ -68,32 +84,58 @@ if args.new_tokens_file:
         file_tokens = [line.strip() for line in f if line.strip()]
     new_tokens_list.extend(file_tokens)
 
+# Handle legacy args with deprecation warning
+encoder_block_size        = args.encoder_block_size
+encoder_window_size       = args.encoder_window_size
+encoder_num_global_tokens = args.encoder_num_global_tokens
+encoder_num_rand_blocks   = args.encoder_num_rand_blocks
+
+if args.block_size is not None:
+    print("WARNING: --block_size is deprecated. Use --encoder_block_size instead.")
+    encoder_block_size = args.block_size
+if args.window_size is not None:
+    print("WARNING: --window_size is deprecated. Use --encoder_window_size instead.")
+    encoder_window_size = args.window_size
+if args.num_global_tokens is not None:
+    print("WARNING: --num_global_tokens is deprecated. Use --encoder_num_global_tokens instead.")
+    encoder_num_global_tokens = args.num_global_tokens
+if args.num_rand_blocks is not None:
+    print("WARNING: --num_rand_blocks is deprecated. Use --encoder_num_rand_blocks instead.")
+    encoder_num_rand_blocks = args.num_rand_blocks
+
 print(f"\n{' GeneT5 Initialization ':=^60}")
     
 saved_path = build_gt5(
-    dnabert_model_name   = args.dnabert_path,
-    save_dir             = args.save_dir,
-    block_size           = args.block_size,
-    window_size          = args.window_size,
-    num_global_tokens    = args.num_global_tokens,
-    num_rand_blocks      = args.num_rand_blocks,
-    decoder_num_layers   = args.decoder_layers,
-    decoder_num_heads    = args.decoder_heads,
-    decoder_num_kv_heads = args.decoder_kv_heads,
-    decoder_ff_dim       = args.decoder_ff_dim,
-    decoder_dropout      = args.decoder_dropout,
-    decoder_use_alibi    = True,
-    decoder_use_moe      = args.use_moe,
-    decoder_num_experts  = args.num_experts,
-    decoder_moe_top_k    = args.moe_top_k,
-    vocab_size           = args.vocab_size,
-    tie_weights          = args.tie_weights,
-    new_tokens_list      = new_tokens_list if new_tokens_list else None,
-    init_std             = args.init_std,
-    init_embed_std       = args.init_embed_std,
-    init_ffn_std         = args.init_ffn_std,
-    init_attn_std        = args.init_attn_std,
-    init_moe_router_std  = args.init_moe_router_std,
+    dnabert_model_name        = args.dnabert_path,
+    save_dir                  = args.save_dir,
+    # Encoder sparse attention config
+    encoder_block_size        = encoder_block_size,
+    encoder_window_size       = encoder_window_size,
+    encoder_num_global_tokens = encoder_num_global_tokens,
+    encoder_num_rand_blocks   = encoder_num_rand_blocks,
+    # Decoder sparse attention config
+    decoder_block_size        = args.decoder_block_size,
+    decoder_window_size       = args.decoder_window_size,
+    decoder_num_global_tokens = args.decoder_num_global_tokens,
+    decoder_num_rand_blocks   = args.decoder_num_rand_blocks,
+    # Decoder architecture config
+    decoder_num_layers        = args.decoder_layers,
+    decoder_num_heads         = args.decoder_heads,
+    decoder_num_kv_heads      = args.decoder_kv_heads,
+    decoder_ff_dim            = args.decoder_ff_dim,
+    decoder_dropout           = args.decoder_dropout,
+    decoder_use_alibi         = True,
+    decoder_use_moe           = args.use_moe,
+    decoder_num_experts       = args.num_experts,
+    decoder_moe_top_k         = args.moe_top_k,
+    vocab_size                = args.vocab_size,
+    tie_weights               = args.tie_weights,
+    new_tokens_list           = new_tokens_list if new_tokens_list else None,
+    init_std                  = args.init_std,
+    init_embed_std            = args.init_embed_std,
+    init_ffn_std              = args.init_ffn_std,
+    init_attn_std             = args.init_attn_std,
+    init_moe_router_std       = args.init_moe_router_std,
 )
         
 print(f"\nSUCCESS: Model initialized and saved to:")

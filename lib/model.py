@@ -3,8 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import json
 
-from pathlib    import Path
-from typing     import Optional, Dict, List, Tuple
+from pathlib import Path
 from lib.blocks import Encoder, Decoder
 
 
@@ -14,8 +13,6 @@ class GeneT5(nn.Module):
     
     Encoder: BigBird sparse attention
     Decoder: Causal attention + cross-attention, optional MoE
-    
-    Initialized in FP32, trained with BF16 mixed precision.
     """
     
     def __init__(
@@ -35,10 +32,16 @@ class GeneT5(nn.Module):
         decoder_num_kv_heads= None,
         vocab_size          = 4096,
         tie_weights         = True,
-        block_size          = 64,
-        window_size         = 256,
-        num_global_tokens   = 64,
-        num_rand_blocks     = 3,
+        # Encoder sparse attention
+        encoder_block_size        = 64,
+        encoder_window_size       = 256,
+        encoder_num_global_tokens = 64,
+        encoder_num_rand_blocks   = 3,
+        # Decoder sparse attention
+        decoder_block_size        = 64,
+        decoder_window_size       = 256,
+        decoder_num_global_tokens = 64,
+        decoder_num_rand_blocks   = 3,
     ):
         super().__init__()
         
@@ -47,6 +50,16 @@ class GeneT5(nn.Module):
         
         if decoder_num_kv_heads is None:
             decoder_num_kv_heads = max(1, decoder_num_heads // 4)
+        
+        # Store sparse attention configs
+        self.encoder_block_size        = encoder_block_size
+        self.encoder_window_size       = encoder_window_size
+        self.encoder_num_global_tokens = encoder_num_global_tokens
+        self.encoder_num_rand_blocks   = encoder_num_rand_blocks
+        self.decoder_block_size        = decoder_block_size
+        self.decoder_window_size       = decoder_window_size
+        self.decoder_num_global_tokens = decoder_num_global_tokens
+        self.decoder_num_rand_blocks   = decoder_num_rand_blocks
         
         # Encoder embedding
         self.encoder_embed         = nn.Embedding(vocab_size, embed_dim)
@@ -62,10 +75,10 @@ class GeneT5(nn.Module):
             attn_dropout       = decoder_dropout,
             use_alibi          = True,
             use_bigbird_sparse = True,
-            block_size         = block_size,
-            window_size        = window_size,
-            num_global_tokens  = num_global_tokens,
-            num_random_blocks  = num_rand_blocks,
+            block_size         = encoder_block_size,
+            window_size        = encoder_window_size,
+            num_global_tokens  = encoder_num_global_tokens,
+            num_random_blocks  = encoder_num_rand_blocks,
         )
         
         # Decoder
@@ -81,10 +94,10 @@ class GeneT5(nn.Module):
             num_experts       = decoder_num_experts,
             moe_top_k         = decoder_moe_top_k,
             num_kv_heads      = decoder_num_kv_heads,
-            block_size        = block_size,
-            window_size       = window_size,
-            num_global_tokens = num_global_tokens,
-            num_random_blocks = num_rand_blocks,
+            block_size        = decoder_block_size,
+            window_size       = decoder_window_size,
+            num_global_tokens = decoder_num_global_tokens,
+            num_random_blocks = decoder_num_rand_blocks,
         )
         
         # Decoder embeddings
@@ -99,17 +112,9 @@ class GeneT5(nn.Module):
             self.lm_head.weight = self.decoder_embed.weight
     
     def encode(self, encoder_input_ids, encoder_attention_mask=None):
-
-        # Embed encoder inputs
         encoder_embeds = self.encoder_embed(encoder_input_ids)
         encoder_embeds = self.encoder_embed_dropout(encoder_embeds)
-        
-        # Pass through encoder
-        encoder_hidden = self.encoder(
-            encoder_embeds,
-            attention_mask=encoder_attention_mask
-        )
-        
+        encoder_hidden = self.encoder(encoder_embeds, attention_mask=encoder_attention_mask)
         return encoder_hidden
     
     def forward(
@@ -123,15 +128,11 @@ class GeneT5(nn.Module):
         past_key_values        = None,
         use_cache              = False
     ):
-
         # Encode (or use cached)
         if encoder_hidden_states is None:
-            encoder_hidden_states = self.encode(
-                encoder_input_ids,
-                encoder_attention_mask
-            )
+            encoder_hidden_states = self.encode(encoder_input_ids, encoder_attention_mask)
         
-        # Replace invalid indices (-100 or out of vocab) with pad token
+        # Replace invalid indices with pad token
         decoder_input_ids_safe = decoder_input_ids.clone()
         decoder_input_ids_safe[decoder_input_ids_safe < 0] = 0
         decoder_input_ids_safe[decoder_input_ids_safe >= self.vocab_size] = 0
@@ -185,16 +186,12 @@ class GeneT5(nn.Module):
         pad_token_id           = 0
     ):
         """Autoregressive generation"""
-        
         self.eval()
         device = encoder_input_ids.device
         batch  = encoder_input_ids.size(0)
         
         # Encode once
-        encoder_hidden = self.encode(
-            encoder_input_ids,
-            encoder_attention_mask
-        )
+        encoder_hidden = self.encode(encoder_input_ids, encoder_attention_mask)
         
         # Start with BOS
         generated = torch.full((batch, 1), bos_token_id, dtype=torch.long, device=device)
@@ -216,28 +213,23 @@ class GeneT5(nn.Module):
             
             # Top-K
             if top_k > 0:
-                indices_to_remove         = logits < torch.topk(logits, top_k)[0][..., -1, None]
+                indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
                 logits[indices_to_remove] = float('-inf')
             
-            # Top-P (nucleus)
+            # Top-P
             if top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                cumulative_probs              = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                
-                sorted_indices_to_remove          = cumulative_probs > top_p
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
                 sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                sorted_indices_to_remove[..., 0]  = 0
-                
+                sorted_indices_to_remove[..., 0] = 0
                 indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
                 logits[indices_to_remove] = float('-inf')
             
             # Sample
             probs      = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
-            
-            # Handle finished sequences
             next_token[finished] = pad_token_id
-            
             generated = torch.cat([generated, next_token], dim=1)
             
             # Check EOS
@@ -279,10 +271,8 @@ class GeneT5(nn.Module):
             param.requires_grad = True
     
     def save(self, save_path):
-        """Save model state in FP32."""
         path = Path(save_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        
         torch.save({
             "encoder_embed": self.encoder_embed.state_dict(),
             "encoder":       self.encoder.state_dict(),
@@ -293,47 +283,47 @@ class GeneT5(nn.Module):
         print(f"Saved to {path}")
     
     def load(self, checkpoint_path, strict=False):
-        """Load model state."""
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-        
         if "encoder_embed" in ckpt:
             self.encoder_embed.load_state_dict(ckpt["encoder_embed"], strict=strict)
-        
         self.encoder.load_state_dict(ckpt["encoder"], strict=strict)
         self.decoder.load_state_dict(ckpt["decoder"], strict=strict)
         self.decoder_embed.load_state_dict(ckpt["decoder_embed"], strict=strict)
         self.lm_head.load_state_dict(ckpt["lm_head"], strict=strict)
-        
         print(f"Loaded from {checkpoint_path}")
     
     @classmethod
     def from_pretrained(cls, checkpoint_dir, device="cpu", dtype=torch.float32):
-        """Load model from build_model.py output"""
+        """Load model from checkpoint directory"""
         path = Path(checkpoint_dir)
         
         with open(path / "config.json", "r") as f:
             config = json.load(f)
         
         model = cls(
-            embed_dim           = config["embed_dim"],
-            encoder_num_layers  = config["encoder_num_layers"],
-            encoder_num_heads   = config["encoder_num_heads"],
-            encoder_ff_dim      = config["encoder_ff_dim"],
-            decoder_num_layers  = config["decoder_num_layers"],
-            decoder_num_heads   = config["decoder_num_heads"],
-            decoder_ff_dim      = config["decoder_ff_dim"],
-            decoder_dropout     = config["decoder_dropout"],
-            decoder_use_alibi   = config["decoder_use_alibi"],
-            decoder_use_moe     = config["decoder_use_moe"],
-            decoder_num_experts = config.get("decoder_num_experts", 8),
-            decoder_moe_top_k   = config.get("decoder_moe_top_k", 2),
-            decoder_num_kv_heads= config.get("decoder_num_kv_heads"),
-            vocab_size          = config["vocab_size"],
-            tie_weights         = config["tie_weights"],
-            block_size          = config.get("block_size", 64),
-            window_size         = config.get("window_size", 256),
-            num_global_tokens   = config.get("num_global_tokens", 64),
-            num_rand_blocks     = config.get("num_rand_blocks", 3),
+            embed_dim                 = config["embed_dim"],
+            encoder_num_layers        = config["encoder_num_layers"],
+            encoder_num_heads         = config["encoder_num_heads"],
+            encoder_ff_dim            = config["encoder_ff_dim"],
+            decoder_num_layers        = config["decoder_num_layers"],
+            decoder_num_heads         = config["decoder_num_heads"],
+            decoder_ff_dim            = config["decoder_ff_dim"],
+            decoder_dropout           = config["decoder_dropout"],
+            decoder_use_alibi         = config["decoder_use_alibi"],
+            decoder_use_moe           = config["decoder_use_moe"],
+            decoder_num_experts       = config.get("decoder_num_experts", 8),
+            decoder_moe_top_k         = config.get("decoder_moe_top_k", 2),
+            decoder_num_kv_heads      = config.get("decoder_num_kv_heads"),
+            vocab_size                = config["vocab_size"],
+            tie_weights               = config["tie_weights"],
+            encoder_block_size        = config.get("encoder_block_size", 64),
+            encoder_window_size       = config.get("encoder_window_size", 256),
+            encoder_num_global_tokens = config.get("encoder_num_global_tokens", 64),
+            encoder_num_rand_blocks   = config.get("encoder_num_rand_blocks", 3),
+            decoder_block_size        = config.get("decoder_block_size", 64),
+            decoder_window_size       = config.get("decoder_window_size", 256),
+            decoder_num_global_tokens = config.get("decoder_num_global_tokens", 64),
+            decoder_num_rand_blocks   = config.get("decoder_num_rand_blocks", 3),
         )
         
         model.load(path / "pytorch_model.bin")
