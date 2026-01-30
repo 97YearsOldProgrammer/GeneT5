@@ -154,15 +154,16 @@ class ModelOutputParser:
 
 class GFFConverter:
     """Converts parsed model output to GFF3 format"""
-    
-    def __init__(self, seqid="seq", source="GeneT5", offset=0, score=".", id_prefix="gene"):
+
+    def __init__(self, seqid="seq", source="GeneT5", offset=0, score=".", id_prefix="gene", include_introns=False):
         """Initialize converter with output settings"""
-        
-        self.seqid     = seqid
-        self.source    = source
-        self.offset    = offset
-        self.score     = score
-        self.id_prefix = id_prefix
+
+        self.seqid          = seqid
+        self.source         = source
+        self.offset         = offset
+        self.score          = score
+        self.id_prefix      = id_prefix
+        self.include_introns = include_introns
     
     def _make_gene_id(self, gene_idx):
         """Generate gene ID string"""
@@ -179,9 +180,40 @@ class GFFConverter:
     
     def _make_feature_id(self, gene_idx, transcript_idx, feature_type, feature_num):
         """Generate feature ID string"""
-        
+
         transcript_id = self._make_transcript_id(gene_idx, transcript_idx)
         return f"{transcript_id}.{feature_type}{feature_num}"
+
+    def _compute_introns(self, exons, gene_idx, transcript_idx):
+        """Compute introns as intervals between consecutive exons"""
+
+        if len(exons) < 2:
+            return []
+
+        sorted_exons = sorted(exons, key=lambda e: e.start)
+        introns      = []
+
+        for i in range(len(sorted_exons) - 1):
+            curr_exon = sorted_exons[i]
+            next_exon = sorted_exons[i + 1]
+
+            intron_start = curr_exon.end + 1
+            intron_end   = next_exon.start - 1
+
+            if intron_start <= intron_end:
+                introns.append(ParsedFeature(
+                    feature_type   = "intron",
+                    start          = intron_start,
+                    end            = intron_end,
+                    strand         = curr_exon.strand,
+                    phase          = ".",
+                    biotype        = curr_exon.biotype,
+                    gene_idx       = gene_idx,
+                    transcript_idx = transcript_idx,
+                    raw_line       = "",
+                ))
+
+        return introns
     
     def convert_feature(self, feature, feature_num=1):
         """Convert a single ParsedFeature to GFFFeature"""
@@ -273,12 +305,21 @@ class GFFConverter:
                     attributes = {"ID": transcript_id, "Parent": gene_id},
                 ))
                 
+                # Compute introns from exons if enabled
+                if self.include_introns:
+                    exons   = [f for f in transcript_features if f.feature_type == "exon"]
+                    introns = self._compute_introns(exons, gene_idx, transcript_idx)
+                    transcript_features = transcript_features + introns
+
+                # Sort features by position for consistent output
+                transcript_features = sorted(transcript_features, key=lambda f: (f.start, f.feature_type))
+
                 feature_counts = {}
                 for f in transcript_features:
                     ftype                 = f.feature_type
                     feature_counts[ftype] = feature_counts.get(ftype, 0) + 1
                     gff_features.append(self.convert_feature(f, feature_counts[ftype]))
-        
+
         return gff_features
 
 
@@ -287,14 +328,14 @@ class GFFConverter:
 ##########################
 
 
-def parse_model_output(text, seqid="seq", source="GeneT5", offset=0, strict=False):
+def parse_model_output(text, seqid="seq", source="GeneT5", offset=0, strict=False, include_introns=False):
     """Parse model output and convert to GFF features"""
-    
+
     parser           = ModelOutputParser(strict=strict)
-    converter        = GFFConverter(seqid=seqid, source=source, offset=offset)
+    converter        = GFFConverter(seqid=seqid, source=source, offset=offset, include_introns=include_introns)
     parsed_sequences = parser.parse_sequence(text)
     gff_sequences    = [converter.convert_sequence(seq) for seq in parsed_sequences]
-    
+
     return gff_sequences
 
 
@@ -310,46 +351,48 @@ def write_gff3(features, output_path, append=False):
             f.write(feature.to_gff_line() + "\n")
 
 
-def model_output_to_gff3(model_output, output_path, seqid="seq", source="GeneT5", offset=0, strict=False):
+def model_output_to_gff3(model_output, output_path, seqid="seq", source="GeneT5", offset=0, strict=False, include_introns=False):
     """Complete pipeline to parse model output and write to GFF3 file"""
-    
+
     sequences    = parse_model_output(
-        text   = model_output,
-        seqid  = seqid,
-        source = source,
-        offset = offset,
-        strict = strict,
+        text            = model_output,
+        seqid           = seqid,
+        source          = source,
+        offset          = offset,
+        strict          = strict,
+        include_introns = include_introns,
     )
     all_features = [f for seq in sequences for f in seq]
-    
+
     write_gff3(all_features, output_path)
-    
+
     return len(all_features)
 
 
-def process_batch_outputs(outputs, seqids=None, output_dir=".", source="GeneT5", offsets=None):
+def process_batch_outputs(outputs, seqids=None, output_dir=".", source="GeneT5", offsets=None, include_introns=False):
     """Process multiple model outputs to individual GFF3 files"""
-    
+
     output_dir = pl.Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     if seqids is None:
         seqids = [f"seq_{i}" for i in range(len(outputs))]
-    
+
     if offsets is None:
         offsets = [0] * len(outputs)
-    
+
     output_paths = []
-    
+
     for i, (output, seqid, offset) in enumerate(zip(outputs, seqids, offsets)):
         output_path = output_dir / f"{seqid}.gff3"
         model_output_to_gff3(
-            model_output = output,
-            output_path  = output_path,
-            seqid        = seqid,
-            source       = source,
-            offset       = offset,
+            model_output    = output,
+            output_path     = output_path,
+            seqid           = seqid,
+            source          = source,
+            offset          = offset,
+            include_introns = include_introns,
         )
         output_paths.append(output_path)
-    
+
     return output_paths

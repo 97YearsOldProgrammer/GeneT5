@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn.functional as F
 
-import lib.model as model_lib
+import lib.model        as model_lib
 import lib.util._output as output_lib
 
 
@@ -103,15 +103,16 @@ class InferenceResult:
 class GeneT5Inference:
     """Inference wrapper for GeneT5 model with automatic GFF conversion"""
     
-    def __init__(self, model, tokenizer, device=None, dtype=None):
+    def __init__(self, model, tokenizer, device=None, dtype=None, include_introns=False):
         """Initialize inference wrapper with model and tokenizer"""
-        
-        self.device    = device or auto_detect_device()
-        self.dtype     = dtype or select_dtype(self.device)
-        self.model     = model.to(device=self.device, dtype=self.dtype)
-        self.tokenizer = tokenizer
-        self.parser    = output_lib.ModelOutputParser(strict=False)
-        self.converter = output_lib.GFFConverter()
+
+        self.device          = device or auto_detect_device()
+        self.dtype           = dtype or select_dtype(self.device)
+        self.model           = model.to(device=self.device, dtype=self.dtype)
+        self.tokenizer       = tokenizer
+        self.include_introns = include_introns
+        self.parser          = output_lib.ModelOutputParser(strict=False)
+        self.converter       = output_lib.GFFConverter(include_introns=include_introns)
         
         info = get_device_info(self.device)
         print(f"GeneT5Inference initialized on {info['device']}")
@@ -121,18 +122,18 @@ class GeneT5Inference:
         print(f"  Dtype: {self.dtype}")
     
     @classmethod
-    def from_pretrained(cls, checkpoint_path, tokenizer_path=None, device=None, dtype=None):
+    def from_pretrained(cls, checkpoint_path, tokenizer_path=None, device=None, dtype=None, include_introns=False):
         """Load model from checkpoint directory"""
-        
+
         checkpoint_path = pl.Path(checkpoint_path)
         tokenizer_path  = pl.Path(tokenizer_path) if tokenizer_path else checkpoint_path
         target_device   = device or auto_detect_device()
         target_dtype    = dtype or select_dtype(target_device)
-        
+
         model     = model_lib.GeneT5.from_pretrained(checkpoint_path, device=target_device, dtype=target_dtype)
         tokenizer = cls._load_tokenizer(tokenizer_path)
-        
-        return cls(model=model, tokenizer=tokenizer, device=target_device, dtype=target_dtype)
+
+        return cls(model=model, tokenizer=tokenizer, device=target_device, dtype=target_dtype, include_introns=include_introns)
     
     @staticmethod
     def _load_tokenizer(tokenizer_path):
@@ -199,56 +200,64 @@ class GeneT5Inference:
             pad_token_id           = config.pad_token_id,
         )
     
-    def predict(self, sequences, seqids=None, output_dir=None, source="GeneT5", 
-                offsets=None, gen_config=None, max_input_length=2048, batch_size=1):
-        """Run inference on sequences and optionally save GFF3 output"""
-        
+    def predict(self, sequences, seqids=None, output_dir=None, source="GeneT5",
+                offsets=None, gen_config=None, max_input_length=2048, batch_size=1, include_introns=None):
+        """Run inference on sequences and optionally save GFF3 output
+
+        Args:
+            include_introns: If None, uses instance default. If bool, overrides for this call.
+        """
+
         if seqids is None:
             seqids = [f"seq_{i}" for i in range(len(sequences))]
         if offsets is None:
             offsets = [0] * len(sequences)
-        
+
         if output_dir:
             output_dir = pl.Path(output_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
-        
+
+        # Use instance default if not specified
+        use_introns = self.include_introns if include_introns is None else include_introns
+
         gen_config = gen_config or GenerationConfig()
         results    = []
-        
+
         for batch_start in range(0, len(sequences), batch_size):
             batch_end  = min(batch_start + batch_size, len(sequences))
             batch_seqs = sequences[batch_start:batch_end]
             batch_ids  = seqids[batch_start:batch_end]
             batch_offs = offsets[batch_start:batch_end]
-            
+
             encoded = self.encode(batch_seqs, max_length=max_input_length)
-            
+
             with torch.amp.autocast(self.device.type, dtype=self.dtype):
                 generated = self.generate(
                     encoder_input_ids      = encoded["input_ids"],
                     encoder_attention_mask = encoded["attention_mask"],
                     config                 = gen_config,
                 )
-            
+
             decoded_outputs = self.decode(generated)
-            
+
             for i, (seq, seqid, offset, raw_output) in enumerate(
                 zip(batch_seqs, batch_ids, batch_offs, decoded_outputs)
             ):
                 decoded         = self._clean_output(raw_output)
                 parsed_seqs     = self.parser.parse_sequence(decoded)
                 parsed_features = parsed_seqs[0] if parsed_seqs else []
-                
-                self.converter.seqid  = seqid
-                self.converter.source = source
-                self.converter.offset = offset
-                gff_features          = self.converter.convert_sequence(parsed_features)
-                
+
+                self.converter.seqid           = seqid
+                self.converter.source          = source
+                self.converter.offset          = offset
+                self.converter.include_introns = use_introns
+                gff_features                   = self.converter.convert_sequence(parsed_features)
+
                 gff_path = None
                 if output_dir:
                     gff_path = output_dir / f"{seqid}.gff3"
                     output_lib.write_gff3(gff_features, gff_path)
-                
+
                 results.append(InferenceResult(
                     input_sequence  = seq,
                     raw_output      = raw_output,
@@ -256,9 +265,9 @@ class GeneT5Inference:
                     parsed_features = parsed_features,
                     gff_features    = gff_features,
                     gff_path        = gff_path,
-                    metadata        = {"seqid": seqid, "offset": offset, "source": source},
+                    metadata        = {"seqid": seqid, "offset": offset, "source": source, "include_introns": use_introns},
                 ))
-        
+
         return results
     
     def _clean_output(self, raw_output):
@@ -272,30 +281,31 @@ class GeneT5Inference:
         
         return output
     
-    def predict_single(self, sequence, seqid="seq", output_path=None, source="GeneT5", 
-                       offset=0, gen_config=None):
+    def predict_single(self, sequence, seqid="seq", output_path=None, source="GeneT5",
+                       offset=0, gen_config=None, include_introns=None):
         """Convenience method for single sequence prediction"""
-        
+
         output_dir = None
         if output_path:
             output_path = pl.Path(output_path)
             output_dir  = output_path.parent
-        
+
         results = self.predict(
-            sequences  = [sequence],
-            seqids     = [seqid],
-            output_dir = output_dir,
-            source     = source,
-            offsets    = [offset],
-            gen_config = gen_config,
+            sequences       = [sequence],
+            seqids          = [seqid],
+            output_dir      = output_dir,
+            source          = source,
+            offsets         = [offset],
+            gen_config      = gen_config,
+            include_introns = include_introns,
         )
-        
+
         result = results[0]
-        
+
         if output_path and result.gff_path and result.gff_path != output_path:
             result.gff_path.rename(output_path)
             result.gff_path = output_path
-        
+
         return result
 
 
