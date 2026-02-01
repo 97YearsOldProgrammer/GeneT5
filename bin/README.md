@@ -28,12 +28,8 @@ python3 -u bin/init_model.py \
     --init_moe_router_std 0.006 \
     --encoder_block_size 256 \
     --encoder_window_size 34560 \
-    --encoder_num_global_tokens 0 \
-    --encoder_num_rand_blocks 0 \
     --decoder_block_size 16 \
     --decoder_window_size 1600 \
-    --decoder_num_global_tokens 0 \
-    --decoder_num_rand_blocks 0 \
     2>&1 | tee ../logs/init.log
 ```
 
@@ -98,6 +94,15 @@ python3 bin/resize_model.py model_path tokenizer_path
 
 ---
 
+### Bake Data
+
+```python3
+python -u bin/bake_data --raw_dir ../raw --baked_dir ../baked --n_workers 15 --species_parallel 5 --tokenizer ../model/init --compact --compact_target 30000 --compact_hard_limit 32768 2>&1 | tee ../logs/bake.log 
+```
+
+
+---
+
 
 ### Compacting All Binary File
 
@@ -112,7 +117,6 @@ After parse all datas, remember to run the compacting function.
   --hard_limit 32768 \
   --workers 10 \     
   2>&1 | tee ../logs/compact.log
-
 ```
 
 
@@ -130,12 +134,15 @@ python -u bin/finet \
   ../model/init \
   --lr 1e-4 \
   --batch_size 4 \
-  --grad_accum 64 \
+  --grad_accum 256 \
   --weight_decay 0.01 \
   --warmup_ratio 0.03 \
   --max_grad_norm 1.0 \
   --gradient_checkpointing \
   --optim_8bit \
   --label_smoothing 0.1 \
+  --early_stopping 2 \
+  --save_steps 500 \
+  --log_memory \
   2>&1 | tee ../logs/tune/1.log
 ```

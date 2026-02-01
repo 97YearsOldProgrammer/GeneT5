@@ -34,27 +34,29 @@ ChunkMeta = namedtuple('ChunkMeta', ['file_idx', 'chunk_idx', 'token_length', 'e
 
 
 def _process_single_file(args):
-    """Process a single file and return its metadata. Used by parallel extraction."""
-    file_idx, file_path, tokenizer, batch_size, n_workers, block_size, isolation_pad = args
+    """Process a single file and return its metadata"""
+
+    file_idx, file_path, block_size, isolation_pad = args
     from lib.dataset._binary import read_binary
 
-    # Load and tokenize
     chunks = read_binary(file_path)
-    file_lengths = _tokenize_file_chunks(chunks, tokenizer, batch_size, n_workers)
 
-    # Extract metadata
     file_metadata = []
-    raw_count = 0
-    aug_count = 0
+    raw_count     = 0
+    aug_count     = 0
 
-    for chunk_idx, (chunk, token_len) in enumerate(zip(chunks, file_lengths)):
-        eff_len = align_to_block(token_len, block_size) + isolation_pad
-        meta = ChunkMeta(
-            file_idx=file_idx,
-            chunk_idx=chunk_idx,
-            token_length=token_len,
-            eff_length=eff_len,
-            is_augmented=chunk.is_augmented,
+    for chunk_idx, chunk in enumerate(chunks):
+        if chunk.input_len is None:
+            raise ValueError(f"Chunk {chunk_idx} in {file_path} missing input_len - run parse_data first")
+
+        token_len = chunk.input_len
+        eff_len   = align_to_block(token_len, block_size) + isolation_pad
+        meta      = ChunkMeta(
+            file_idx     = file_idx,
+            chunk_idx    = chunk_idx,
+            token_length = token_len,
+            eff_length   = eff_len,
+            is_augmented = chunk.is_augmented,
         )
         file_metadata.append(meta)
 
@@ -64,61 +66,43 @@ def _process_single_file(args):
             raw_count += 1
 
     chunk_count = len(chunks)
-
-    # Free memory
     del chunks
-    del file_lengths
 
     return file_idx, file_path.name, chunk_count, raw_count, aug_count, file_metadata
 
 
 def stream_extract_metadata(
     file_paths,
-    tokenizer,
-    batch_size=1000,
-    n_workers=4,
     file_parallel=1,
     block_size=64,
     window_size=256,
 ):
     """
-    Phase 1: Stream through files, extract only metadata.
+    Phase 1: Stream through files, extract only metadata
 
     Memory: O(file_parallel * max_file_size) + O(n) for metadata
-    With file_parallel=2, loads 2 files simultaneously.
-
-    Args:
-        file_paths: List of input file paths
-        tokenizer: HuggingFace tokenizer
-        batch_size: Tokenization batch size
-        n_workers: Workers per file for tokenization
-        file_parallel: Number of files to process in parallel (default 1)
-        block_size: Alignment block size
-        window_size: Attention window size
+    Requires pre-tokenized data with input_len stored in chunks
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     isolation_pad = window_size + block_size
-    total_files = len(file_paths)
+    total_files   = len(file_paths)
+
+    # Prepare arguments for each file
+    work_items = [
+        (file_idx, file_path, block_size, isolation_pad)
+        for file_idx, file_path in enumerate(file_paths)
+    ]
+
+    all_metadata = []
+    total_chunks = 0
+    raw_count    = 0
+    aug_count    = 0
 
     if file_parallel > 1:
-        print(f"    Processing {file_parallel} files in parallel...")
-        print(f"    (Memory: ~{file_parallel}x largest file size)\n")
-
-        # Prepare arguments for each file
-        work_items = [
-            (file_idx, file_path, tokenizer, batch_size, n_workers, block_size, isolation_pad)
-            for file_idx, file_path in enumerate(file_paths)
-        ]
-
-        # Process files in parallel
-        all_metadata = []
-        total_chunks = 0
-        raw_count = 0
-        aug_count = 0
+        print(f"    Processing {file_parallel} files in parallel...\n")
         completed = 0
 
-        # Use thread pool - tokenizers release GIL so this works well
         with ThreadPoolExecutor(max_workers=file_parallel) as executor:
             futures = {executor.submit(_process_single_file, item): item[0] for item in work_items}
 
@@ -126,33 +110,26 @@ def stream_extract_metadata(
                 file_idx, file_name, chunk_count, file_raw, file_aug, file_metadata = future.result()
                 all_metadata.extend(file_metadata)
                 total_chunks += chunk_count
-                raw_count += file_raw
-                aug_count += file_aug
-                completed += 1
+                raw_count    += file_raw
+                aug_count    += file_aug
+                completed    += 1
                 print(f"    [{completed}/{total_files}] {file_name}: {chunk_count:,} chunks")
 
-        # Sort metadata by file_idx to maintain consistent ordering
         all_metadata.sort(key=lambda m: (m.file_idx, m.chunk_idx))
 
     else:
-        # Sequential processing (original behavior)
-        all_metadata = []
-        total_chunks = 0
-        raw_count = 0
-        aug_count = 0
-
         for file_idx, file_path in enumerate(file_paths):
             print(f"    [{file_idx + 1}/{total_files}] {file_path.name}...", end=' ', flush=True)
 
             result = _process_single_file(
-                (file_idx, file_path, tokenizer, batch_size, n_workers, block_size, isolation_pad)
+                (file_idx, file_path, block_size, isolation_pad)
             )
             _, _, chunk_count, file_raw, file_aug, file_metadata = result
 
             all_metadata.extend(file_metadata)
             total_chunks += chunk_count
-            raw_count += file_raw
-            aug_count += file_aug
+            raw_count    += file_raw
+            aug_count    += file_aug
             print(f"{chunk_count:,} chunks")
 
     print(f"\n  Total: {total_chunks:,} chunks (raw: {raw_count:,}, aug: {aug_count:,})")
@@ -160,30 +137,6 @@ def stream_extract_metadata(
 
     return all_metadata
 
-
-def _tokenize_file_chunks(chunks, tokenizer, batch_size, n_workers):
-    """Tokenize chunks from a single file using parallel batches."""
-    total = len(chunks)
-    if total == 0:
-        return []
-
-    lengths = [0] * total
-
-    def process_batch(start_idx):
-        end_idx = min(start_idx + batch_size, total)
-        texts = [chunks[i].get_input_text() for i in range(start_idx, end_idx)]
-        encoded = tokenizer(texts, add_special_tokens=False, truncation=False)
-        return start_idx, [len(ids) for ids in encoded['input_ids']]
-
-    batch_starts = list(range(0, total, batch_size))
-
-    with ThreadPoolExecutor(max_workers=n_workers) as executor:
-        futures = [executor.submit(process_batch, start) for start in batch_starts]
-        for future in as_completed(futures):
-            start_idx, batch_lengths = future.result()
-            lengths[start_idx:start_idx + len(batch_lengths)] = batch_lengths
-
-    return lengths
 
 
 def pack_from_metadata(
@@ -344,16 +297,14 @@ def stream_write_compacted(
     file_paths,
     group_assignments: Dict[Tuple[int, int], int],
     output_path,
-    compress=False,
     show_progress=True,
 ):
     """
-    Phase 3: Re-read chunks and write to output with group assignments.
+    Phase 3: Re-read chunks and write to output with group assignments
 
-    Memory: O(file_size) - only one input file loaded at a time.
-    Chunks are written immediately then the file is freed.
-    Uses v2 format with 64-bit offsets for files >4GB.
+    Memory: O(file_size) - only one input file loaded at a time
     """
+
     import pathlib
     import struct
     from lib.dataset._binary import read_binary, MAGIC_HEADER, FORMAT_VERSION, OFFSET_ENTRY_SIZE_V2
@@ -366,44 +317,33 @@ def stream_write_compacted(
     print(f"    Writing {total_chunks:,} chunks to {output_path.name}...")
 
     with open(output_path, 'wb') as f:
-        # Write header
         f.write(MAGIC_HEADER)
-        f.write(struct.pack('<B', FORMAT_VERSION))  # v2
-        f.write(struct.pack('<B', 1 if compress else 0))
+        f.write(struct.pack('<B', FORMAT_VERSION))
+        f.write(struct.pack('<B', 0))
         f.write(struct.pack('<I', total_chunks))
 
-        # Placeholder offset table (will seek back to fill)
-        # v2: 12 bytes per entry (QI: 64-bit offset + 32-bit length)
         offset_table_pos = f.tell()
         f.write(b'\x00' * (total_chunks * OFFSET_ENTRY_SIZE_V2))
 
-        # Write chunks in order sorted by (file_idx, chunk_idx)
         chunk_order = sorted(group_assignments.keys())
-        offsets = []
+        offsets     = []
 
-        written = 0
         current_file_idx = -1
-        current_chunks = None
+        current_chunks   = None
 
         for file_idx, chunk_idx in chunk_order:
-            # Load new file if needed
             if file_idx != current_file_idx:
                 if current_chunks is not None:
                     del current_chunks
                 print(f"    Loading file {file_idx + 1}/{len(file_paths)}...", end='\r')
-                current_chunks = read_binary(file_paths[file_idx])
+                current_chunks   = read_binary(file_paths[file_idx])
                 current_file_idx = file_idx
 
-            # Get chunk and set group
-            chunk = current_chunks[chunk_idx]
+            chunk              = current_chunks[chunk_idx]
             chunk.compact_group = group_assignments[(file_idx, chunk_idx)]
 
-            # Serialize and write immediately
             current_offset = f.tell()
-            chunk_bytes = chunk.to_bytes()
-            if compress:
-                import zlib
-                chunk_bytes = zlib.compress(chunk_bytes, level=6)
+            chunk_bytes    = chunk.to_bytes()
 
             f.write(chunk_bytes)
             offsets.append((current_offset, len(chunk_bytes)))

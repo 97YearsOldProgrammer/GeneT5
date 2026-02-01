@@ -83,23 +83,6 @@ def compute_all_complexities(gene_groups):
 #######################
 
 
-def identify_long_genes(gene_groups, complexity_cache, top_k=5):
-    """Identify top-k longest genes"""
-
-    scored = []
-
-    for gene_id, gene_data in gene_groups.items():
-        gene_start = gene_data.get("start", 0)
-        gene_end   = gene_data.get("end", 0)
-        gene_len   = gene_end - gene_start + 1
-
-        scored.append((gene_id, gene_data, gene_len))
-
-    scored.sort(key=lambda x: -x[2])
-
-    return scored[:top_k]
-
-
 def identify_complex_loci(gene_groups, complexity_cache, top_k=5):
     """Identify top-K most complex loci using precomputed complexity scores"""
 
@@ -187,15 +170,14 @@ def identify_mean_complexity_genes(gene_groups, complexity_cache, exclude_ids, n
 
 
 def build_scenarios(gene_id, gene_data, seed=42):
-    """Build multiple validation scenarios for a single gene"""
+    """Build validation scenarios: 50% ab initio, 50% hinted"""
 
     random.seed(seed)
 
-    noiser         = nosing.GFFNoiser()
-    features       = gene_data.get("features", [])
-    transcripts    = gene_data.get("transcripts", {})
-    scenarios      = []
-    scenario_types = ["perfect", "good", "bad", "empty"]
+    noiser      = nosing.GFFNoiser()
+    features    = gene_data.get("features", [])
+    transcripts = gene_data.get("transcripts", {})
+    scenarios   = []
 
     enriched_features = []
     for feat in features:
@@ -215,44 +197,46 @@ def build_scenarios(gene_id, gene_data, seed=42):
             "biotype":       biotype,
         })
 
-    for stype in scenario_types:
-        random.seed(seed + hash(stype) % 10000)
+    # Ab initio scenario (no hints)
+    scenarios.append({
+        "gene_id":       gene_id,
+        "scenario_type": "empty",
+        "features":      [f.copy() for f in enriched_features],
+        "hints":         [],
+        "start":         gene_data.get("start", 0),
+        "end":           gene_data.get("end", 0),
+        "strand":        gene_data.get("strand", "+"),
+    })
 
-        if stype == "empty":
-            hints = []
-        elif stype == "perfect":
-            hints = [f.copy() for f in enriched_features]
-        else:
-            hints, _, _ = noiser.noise_features(enriched_features, "", scenario=stype)
+    # Hinted scenario (noised hints from ab initio)
+    random.seed(seed + hash(gene_id) % 10000)
+    hints, _, _ = noiser.noise_features(enriched_features, "")
 
-        scenarios.append({
-            "gene_id":       gene_id,
-            "scenario_type": stype,
-            "features":      [f.copy() for f in enriched_features],
-            "hints":         hints,
-            "start":         gene_data.get("start", 0),
-            "end":           gene_data.get("end", 0),
-            "strand":        gene_data.get("strand", "+"),
-        })
+    scenarios.append({
+        "gene_id":       gene_id,
+        "scenario_type": "hinted",
+        "features":      [f.copy() for f in enriched_features],
+        "hints":         hints,
+        "start":         gene_data.get("start", 0),
+        "end":           gene_data.get("end", 0),
+        "strand":        gene_data.get("strand", "+"),
+    })
 
     return scenarios
 
 
 def build_validation_set(
     gene_groups,
-    top_k_long    = 5,
-    top_k_complex = 5,
-    num_normal    = 5,
-    num_easy      = 5,
-    seed          = 42,
+    num_complex = 5,
+    num_normal  = 5,
+    num_easy    = 5,
+    seed        = 42,
 ):
-    """Build validation set using feature-based selection with cached complexity"""
+    """Build validation set: 50% ab initio, 50% hinted per gene category"""
 
-    # Compute complexity once for all genes
     complexity_cache = compute_all_complexities(gene_groups)
 
     validation = {
-        "long_genes":   [],
         "complex_loci": [],
         "normal_genes": [],
         "easy_samples": [],
@@ -260,26 +244,8 @@ def build_validation_set(
         "scenarios":    [],
     }
 
-    # Get top K long genes
-    long_genes = identify_long_genes(gene_groups, complexity_cache, top_k_long)
-    for gene_id, gene_data, length in long_genes:
-        validation["long_genes"].append({
-            "gene_id": gene_id,
-            "length":  length,
-            "start":   gene_data.get("start", 0),
-            "end":     gene_data.get("end", 0),
-        })
-        validation["all_ids"].add(gene_id)
-
-        scenarios = build_scenarios(gene_id, gene_data, seed)
-        validation["scenarios"].extend(scenarios)
-
     # Get top K complex loci
-    remaining = {
-        gid: gdata for gid, gdata in gene_groups.items()
-        if gid not in validation["all_ids"]
-    }
-    complex_loci = identify_complex_loci(remaining, complexity_cache, top_k_complex)
+    complex_loci = identify_complex_loci(gene_groups, complexity_cache, num_complex)
     for gene_id, gene_data, score in complex_loci:
         validation["complex_loci"].append({
             "gene_id":    gene_id,
@@ -288,15 +254,10 @@ def build_validation_set(
             "end":        gene_data.get("end", 0),
         })
         validation["all_ids"].add(gene_id)
-
-        scenarios = build_scenarios(gene_id, gene_data, seed)
-        validation["scenarios"].extend(scenarios)
+        validation["scenarios"].extend(build_scenarios(gene_id, gene_data, seed))
 
     # Get easy samples
-    remaining = {
-        gid: gdata for gid, gdata in gene_groups.items()
-        if gid not in validation["all_ids"]
-    }
+    remaining    = {gid: gdata for gid, gdata in gene_groups.items() if gid not in validation["all_ids"]}
     easy_samples = identify_easy_genes(remaining, complexity_cache, num_easy, seed)
     for gene_id, gene_data in easy_samples:
         validation["easy_samples"].append({
@@ -305,17 +266,11 @@ def build_validation_set(
             "end":     gene_data.get("end", 0),
         })
         validation["all_ids"].add(gene_id)
-
-        scenarios = build_scenarios(gene_id, gene_data, seed)
-        validation["scenarios"].extend(scenarios)
+        validation["scenarios"].extend(build_scenarios(gene_id, gene_data, seed))
 
     # Get normal genes (around mean complexity)
     normal_genes = identify_mean_complexity_genes(
-        gene_groups,
-        complexity_cache,
-        validation["all_ids"],
-        num_normal,
-        seed,
+        gene_groups, complexity_cache, validation["all_ids"], num_normal, seed
     )
     for gene_id, gene_data in normal_genes:
         validation["normal_genes"].append({
@@ -325,9 +280,7 @@ def build_validation_set(
             "end":        gene_data.get("end", 0),
         })
         validation["all_ids"].add(gene_id)
-
-        scenarios = build_scenarios(gene_id, gene_data, seed)
-        validation["scenarios"].extend(scenarios)
+        validation["scenarios"].extend(build_scenarios(gene_id, gene_data, seed))
 
     return validation
 
@@ -344,7 +297,6 @@ def save_validation_set(validation, output_path):
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     save_data = {
-        "long_genes":   validation["long_genes"],
         "complex_loci": validation["complex_loci"],
         "normal_genes": validation["normal_genes"],
         "easy_samples": validation["easy_samples"],
@@ -355,13 +307,15 @@ def save_validation_set(validation, output_path):
     with open(output_path, 'w') as f:
         json.dump(save_data, f, indent=2)
 
+    n_genes     = len(validation['all_ids'])
+    n_scenarios = len(validation['scenarios'])
+
     print(f"\n  Validation Set:")
-    print(f"    Long genes:    {len(validation['long_genes'])}")
     print(f"    Complex loci:  {len(validation['complex_loci'])}")
     print(f"    Normal genes:  {len(validation['normal_genes'])}")
     print(f"    Easy samples:  {len(validation['easy_samples'])}")
-    print(f"    Total genes:   {len(validation['all_ids'])}")
-    print(f"    Scenarios:     {len(validation['scenarios'])}")
+    print(f"    Total genes:   {n_genes}")
+    print(f"    Scenarios:     {n_scenarios} ({n_scenarios//2} ab initio + {n_scenarios//2} hinted)")
 
     return output_path
 
@@ -369,10 +323,12 @@ def save_validation_set(validation, output_path):
 def print_validation_stats(validation):
     """Print validation statistics"""
 
+    n_genes     = len(validation.get('all_ids', []))
+    n_scenarios = len(validation.get('scenarios', []))
+
     print(f"\n  Validation:")
-    print(f"    Long genes:   {len(validation.get('long_genes', []))}")
     print(f"    Complex loci: {len(validation.get('complex_loci', []))}")
     print(f"    Normal genes: {len(validation.get('normal_genes', []))}")
     print(f"    Easy samples: {len(validation.get('easy_samples', []))}")
-    print(f"    Total genes:  {len(validation.get('all_ids', []))}")
-    print(f"    Scenarios:    {len(validation.get('scenarios', []))}")
+    print(f"    Total genes:  {n_genes}")
+    print(f"    Scenarios:    {n_scenarios} ({n_scenarios//2} ab initio + {n_scenarios//2} hinted)")

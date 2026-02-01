@@ -132,9 +132,9 @@ def find_genome_files(species_dir):
 #################################
 
 
-def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_dir, token_file=None, n_workers=1):
+def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_dir, token_file=None, tokenizer_path=None, n_workers=1):
     """Run parse_data.py for a single species"""
-    
+
     cmd = [
         "python3", "bin/parse_data.py",
         str(fasta_path),
@@ -143,9 +143,12 @@ def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_di
         "--limit", str(limit),
         "--n_workers", str(n_workers),
     ]
-    
+
     if token_file:
         cmd.extend(["--extract_tokens", token_file])
+
+    if tokenizer_path:
+        cmd.extend(["--tokenizer", str(tokenizer_path)])
     
     log_file = log_dir / f"{species_name}.log"
     
@@ -214,32 +217,32 @@ def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_di
 
 def process_species(args):
     """Worker function for parallel species processing"""
-    
-    species_name, raw_dir, baked_dir, log_dir, limit, token_file, n_workers = args
-    
+
+    species_name, raw_dir, baked_dir, log_dir, limit, token_file, tokenizer_path, n_workers = args
+
     species_raw_dir = pathlib.Path(raw_dir) / species_name
-    
+
     if not species_raw_dir.exists():
         return {
             "species": species_name,
             "success": False,
             "error":   f"Directory not found: {species_raw_dir}",
         }
-    
+
     fasta_file, gff_file = find_genome_files(species_raw_dir)
-    
+
     if fasta_file is None or gff_file is None:
         return {
             "species": species_name,
             "success": False,
             "error":   f"Missing FASTA or GFF in: {species_raw_dir}",
         }
-    
+
     output_dir = pathlib.Path(baked_dir) / species_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     return run_parse_data(
-        species_name, fasta_file, gff_file, output_dir, limit, log_dir, token_file, n_workers
+        species_name, fasta_file, gff_file, output_dir, limit, log_dir, token_file, tokenizer_path, n_workers
     )
 
 
@@ -326,7 +329,6 @@ def collect_species_stats(baked_dir, species_name):
         "val_size":      0,
         "raw_count":     0,
         "aug_count":     0,
-        "long_genes":    0,
         "complex_loci":  0,
         "normal_genes":  0,
         "easy_samples":  0,
@@ -365,7 +367,6 @@ def collect_species_stats(baked_dir, species_name):
         try:
             with open(val_meta, 'r') as f:
                 meta = json.load(f)
-            stats["long_genes"]    = len(meta.get("long_genes", []))
             stats["complex_loci"]  = len(meta.get("complex_loci", []))
             stats["normal_genes"]  = len(meta.get("normal_genes", []))
             stats["easy_samples"]  = len(meta.get("easy_samples", []))
@@ -432,25 +433,23 @@ def write_bake_summary(log_path, run_config, species_results, species_stats, tok
         total_train_size   = sum(s["train_size"] for s in species_stats)
         total_val_size     = sum(s["val_size"] for s in species_stats)
         
-        total_long_genes = sum(s["long_genes"] for s in species_stats)
-        total_complex    = sum(s["complex_loci"] for s in species_stats)
-        total_normal     = sum(s["normal_genes"] for s in species_stats)
-        total_easy       = sum(s["easy_samples"] for s in species_stats)
-        total_scenarios  = sum(s["val_scenarios"] for s in species_stats)
-        
+        total_complex   = sum(s["complex_loci"] for s in species_stats)
+        total_normal    = sum(s["normal_genes"] for s in species_stats)
+        total_easy      = sum(s["easy_samples"] for s in species_stats)
+        total_scenarios = sum(s["val_scenarios"] for s in species_stats)
+
         f.write(f"\n  Training Data:\n")
         f.write(f"    Total chunks:     {total_train_chunks:,}\n")
         f.write(f"    Raw chunks:       {total_raw:,}\n")
         f.write(f"    Augmented chunks: {total_aug:,}\n")
         f.write(f"    Total size:       {ds.format_size(total_train_size)}\n")
-        
+
         f.write(f"\n  Validation Data:\n")
         f.write(f"    Total chunks:     {total_val_chunks:,}\n")
-        f.write(f"    Long genes:       {total_long_genes}\n")
         f.write(f"    Complex loci:     {total_complex}\n")
         f.write(f"    Normal genes:     {total_normal}\n")
         f.write(f"    Easy samples:     {total_easy}\n")
-        f.write(f"    Total scenarios:  {total_scenarios}\n")
+        f.write(f"    Scenarios:        {total_scenarios} ({total_scenarios//2} ab initio + {total_scenarios//2} hinted)\n")
         f.write(f"    Total size:       {ds.format_size(total_val_size)}\n")
         f.write(f"\n")
         

@@ -2,7 +2,8 @@
 
 import sys
 import argparse
-import subprocess
+import tempfile
+import shutil
 import multiprocessing
 import pathlib
 import concurrent.futures
@@ -10,33 +11,31 @@ import concurrent.futures
 import lib.util as util
 
 parser = argparse.ArgumentParser(
-    description="Bake all species data with taxa-specific parameters")
-parser.add_argument("--raw_dir",   type=str, default="../raw",
+    description="Bake all species data: parse, tokenize, compact")
+parser.add_argument("--raw_dir",    type=str, default="../raw",
     help="Directory containing species subdirectories [%(default)s]")
-parser.add_argument("--baked_dir", type=str, default="../baked",
-    help="Output directory for baked data [%(default)s]")
-parser.add_argument("--log_dir",   type=str, default="../logs/baker",
+parser.add_argument("--output_dir", type=str, default="../baked",
+    help="Output directory for final training.bin and validation.bin [%(default)s]")
+parser.add_argument("--log_dir",    type=str, default="../logs/baker",
     help="Directory for log files [%(default)s]")
-parser.add_argument("--taxa",      type=str, nargs='+', default=None,
+parser.add_argument("--taxa",       type=str, nargs='+', default=None,
     help="Process only specific taxa (default: all)")
-parser.add_argument("--species",   type=str, nargs='+', default=None,
+parser.add_argument("--species",    type=str, nargs='+', default=None,
     help="Process only specific species (default: all)")
 parser.add_argument("--species_parallel", type=int, default=2,
     help="Number of species to process in parallel [%(default)s]")
-parser.add_argument("--n_workers", type=int, default=None,
+parser.add_argument("--n_workers",  type=int, default=None,
     help="Workers per species for chunking [auto]")
-parser.add_argument("--token_file", type=str, default="data/new_tokens.txt",
-    help="File to collect extracted tokens [%(default)s]")
-parser.add_argument("--tokenizer",  type=str, default=None,
-    help="Tokenizer path for expansion and compacting")
-parser.add_argument("--skip_tokenizer_expansion", action="store_true",
-    help="Skip tokenizer expansion after processing")
-parser.add_argument("--compact",        action="store_true",
-    help="Compact all training.bin files after baking (requires --tokenizer)")
-parser.add_argument("--compact_target", type=int, default=8192,
+parser.add_argument("--tokenizer",  type=str, required=True,
+    help="Tokenizer path (required for tokenization)")
+parser.add_argument("--compact_target",     type=int, default=8192,
     help="Target tokens for compacting [%(default)s]")
+parser.add_argument("--compact_hard_limit", type=int, default=None,
+    help="Hard limit for compacting (default: target * 1.1)")
 parser.add_argument("--compact_file_parallel", type=int, default=2,
     help="Files to process in parallel during compacting [%(default)s]")
+parser.add_argument("--keep_temp",  action="store_true",
+    help="Keep temporary per-species files (for debugging)")
 
 args = parser.parse_args()
 
@@ -48,19 +47,21 @@ if not species_to_process:
     sys.exit(0)
 
 raw_dir    = pathlib.Path(args.raw_dir)
-baked_dir  = pathlib.Path(args.baked_dir)
+output_dir = pathlib.Path(args.output_dir)
 log_dir    = pathlib.Path(args.log_dir)
-token_file = pathlib.Path(args.token_file)
 
-baked_dir.mkdir(parents=True, exist_ok=True)
+output_dir.mkdir(parents=True, exist_ok=True)
 log_dir.mkdir(parents=True, exist_ok=True)
-token_file.parent.mkdir(parents=True, exist_ok=True)
+
+# Create temp directory for intermediate files
+temp_dir = pathlib.Path(tempfile.mkdtemp(prefix="bake_"))
 
 print(f"\n{' GeneT5 Data Baker ':=^60}")
-print(f"  Raw directory:   {raw_dir}")
-print(f"  Baked directory: {baked_dir}")
-print(f"  Log directory:   {log_dir}")
-print(f"  Token file:      {token_file}")
+print(f"  Raw directory:    {raw_dir}")
+print(f"  Output directory: {output_dir}")
+print(f"  Temp directory:   {temp_dir}")
+print(f"  Tokenizer:        {args.tokenizer}")
+print(f"  Compact target:   {args.compact_target:,} tokens")
 print(f"  Species parallel: {args.species_parallel}")
 print(f"  Workers/species:  {n_workers_per_species}")
 print(f"  Species:          {len(species_to_process)}")
@@ -75,8 +76,9 @@ for sp, limit, taxa in species_to_process:
 for taxa, info in taxa_counts.items():
     print(f"  {taxa:15s}: {info['count']:2d} species @ {info['limit']:,} bp")
 
+# Process species - output to temp directory
 work_items = [
-    (sp, raw_dir, baked_dir, log_dir, limit, str(token_file), n_workers_per_species)
+    (sp, raw_dir, temp_dir, log_dir, limit, None, args.tokenizer, n_workers_per_species)
     for sp, limit, taxa in species_to_process
 ]
 
@@ -88,13 +90,13 @@ failed  = 0
 
 with concurrent.futures.ProcessPoolExecutor(max_workers=args.species_parallel) as executor:
     futures = {executor.submit(util.process_species, item): item[0] for item in work_items}
-    
+
     for future in concurrent.futures.as_completed(futures):
         species_name = futures[future]
         try:
             result = future.result()
             results.append(result)
-            
+
             if result["success"]:
                 success += 1
                 print(f"  ✓ {species_name}")
@@ -102,7 +104,7 @@ with concurrent.futures.ProcessPoolExecutor(max_workers=args.species_parallel) a
                 failed += 1
                 error = result.get("error", "Unknown error")
                 print(f"  ✗ {species_name}: {error}")
-        
+
         except Exception as e:
             failed += 1
             results.append({"species": species_name, "success": False, "error": str(e)})
@@ -112,148 +114,109 @@ print(f"\n{' Processing Results ':=^60}")
 print(f"  Success: {success}")
 print(f"  Failed:  {failed}")
 
-# Track tokenizer and compact results for summary
-tokenizer_result = None
-compact_result   = None
+if success == 0:
+    print("\nNo species processed successfully. Exiting.")
+    if not args.keep_temp:
+        shutil.rmtree(temp_dir)
+    sys.exit(1)
 
-if args.tokenizer and not args.skip_tokenizer_expansion and success > 0:
-    print(f"\n{' Tokenizer Expansion ':=^60}")
-    
-    if not token_file.exists():
-        print(f"  WARNING: Token file not found: {token_file}")
-        tokenizer_result = {"success": False, "error": "Token file not found"}
+# Compact training and validation
+script_dir     = pathlib.Path(__file__).parent.resolve()
+compact_script = script_dir / "compact.py"
+
+import subprocess
+
+# Compact training files
+print(f"\n{' Compacting Training ':=^60}")
+
+training_files = list(temp_dir.glob("*/training.bin"))
+
+if not training_files:
+    print("  No training.bin files found!")
+else:
+    print(f"  Found {len(training_files)} training files")
+
+    output_path = output_dir / "training.bin"
+    compact_cmd = [
+        "python3", str(compact_script),
+    ] + [str(f) for f in training_files] + [
+        "-o", str(output_path),
+        "--compact_target", str(args.compact_target),
+        "--file_parallel", str(args.compact_file_parallel),
+    ]
+    if args.compact_hard_limit:
+        compact_cmd += ["--hard_limit", str(args.compact_hard_limit)]
+
+    result = subprocess.run(compact_cmd, capture_output=True, text=True)
+
+    if result.returncode == 0:
+        print(f"  ✓ Training compacting complete")
+        if result.stdout:
+            lines = result.stdout.strip().split('\n')
+            for line in lines[-5:]:
+                print(f"    {line}")
+        output_size = output_path.stat().st_size if output_path.exists() else 0
+        print(f"    Output: {output_path}")
+        print(f"    Size:   {output_size / 1024 / 1024:.2f} MB")
     else:
-        with open(token_file, 'r') as f:
-            tokens = [line.strip() for line in f if line.strip()]
-        print(f"  Tokens extracted: {len(tokens)}")
-        
-        if tokens:
-            tokenizer_result = util.run_tokenizer_expansion(
-                str(token_file),
-                args.tokenizer,
-            )
-            
-            if tokenizer_result["success"]:
-                print(f"  ✓ Tokenizer expansion complete")
-                if tokenizer_result.get("stdout"):
-                    for line in tokenizer_result["stdout"].split('\n'):
-                        if line.strip() and not line.startswith('='):
-                            print(f"    {line.strip()}")
-            else:
-                error = tokenizer_result.get("error", "Unknown error")
-                print(f"  ✗ Tokenizer expansion failed: {error}")
-                if tokenizer_result.get("stderr"):
-                    print(f"    {tokenizer_result['stderr']}")
-        else:
-            print(f"  No new tokens to add")
-            tokenizer_result = {"success": True, "tokens_in_file": 0, "message": "No tokens"}
+        print(f"  ✗ Training compacting failed")
+        if result.stderr:
+            print(f"    {result.stderr}")
 
-if args.compact and success > 0:
-    print(f"\n{' Compacting ':=^60}")
+# Compact validation files
+print(f"\n{' Compacting Validation ':=^60}")
 
-    # Tokenizer is required for compacting
-    if not args.tokenizer:
-        print("  ERROR: --tokenizer required for compacting")
-        print("  Skipping compaction step.")
-        compact_result = {"success": False, "error": "Tokenizer not specified"}
+validation_files = list(temp_dir.glob("*/validation.bin"))
+
+if not validation_files:
+    print("  No validation.bin files found!")
+else:
+    print(f"  Found {len(validation_files)} validation files")
+
+    val_output_path = output_dir / "validation.bin"
+    val_compact_cmd = [
+        "python3", str(compact_script),
+    ] + [str(f) for f in validation_files] + [
+        "-o", str(val_output_path),
+        "--compact_target", str(args.compact_target),
+        "--file_parallel", str(args.compact_file_parallel),
+    ]
+    if args.compact_hard_limit:
+        val_compact_cmd += ["--hard_limit", str(args.compact_hard_limit)]
+
+    val_result = subprocess.run(val_compact_cmd, capture_output=True, text=True)
+
+    if val_result.returncode == 0:
+        print(f"  ✓ Validation compacting complete")
+        if val_result.stdout:
+            lines = val_result.stdout.strip().split('\n')
+            for line in lines[-5:]:
+                print(f"    {line}")
+        val_size = val_output_path.stat().st_size if val_output_path.exists() else 0
+        print(f"    Output: {val_output_path}")
+        print(f"    Size:   {val_size / 1024 / 1024:.2f} MB")
     else:
-        training_files = list(baked_dir.glob("*/training.bin"))
+        print(f"  ✗ Validation compacting failed")
+        if val_result.stderr:
+            print(f"    {val_result.stderr}")
 
-        if not training_files:
-            print("  No training.bin files found!")
-            compact_result = {"success": False, "error": "No training.bin files found"}
-        else:
-            print(f"  Found {len(training_files)} training files")
+# Cleanup temp directory
+if args.keep_temp:
+    print(f"\n  Temp files kept at: {temp_dir}")
+else:
+    shutil.rmtree(temp_dir)
+    print(f"\n  Temp files cleaned up")
 
-            output_path = baked_dir / "all_training.bin"
-            script_dir = pathlib.Path(__file__).parent.resolve()
-            compact_script = script_dir / "compact.py"
+# Summary
+print(f"\n{' Final Output ':=^60}")
+train_path = output_dir / "training.bin"
+val_path   = output_dir / "validation.bin"
 
-            compact_cmd = [
-                "python3", str(compact_script),
-            ] + [str(f) for f in training_files] + [
-                "-o", str(output_path),
-                "--tokenizer", args.tokenizer,
-                "--compact_target", str(args.compact_target),
-                "--workers", str(n_workers_per_species),
-                "--file_parallel", str(args.compact_file_parallel),
-            ]
-
-            print(f"  Running streaming compact (file_parallel={args.compact_file_parallel})...")
-            result = subprocess.run(compact_cmd, capture_output=True, text=True)
-
-            if result.returncode == 0:
-                print(f"  ✓ Compacting complete")
-                if result.stdout:
-                    # Print last few lines of output
-                    lines = result.stdout.strip().split('\n')
-                    for line in lines[-10:]:
-                        print(f"    {line}")
-                output_size = output_path.stat().st_size if output_path.exists() else 0
-                compact_result = {
-                    "success": True,
-                    "output":  str(output_path),
-                    "size":    f"{output_size / 1024 / 1024:.2f} MB",
-                }
-            else:
-                print(f"  ✗ Compacting failed")
-                if result.stderr:
-                    print(f"    {result.stderr}")
-                compact_result = {"success": False, "error": result.stderr or "Unknown error"}
-
-# Collect stats and write summary
-print(f"\n{' Collecting Statistics ':=^60}")
-
-species_stats = []
-for sp, limit, taxa in species_to_process:
-    stats = util.collect_species_stats(baked_dir, sp)
-    stats["taxa"]  = taxa
-    stats["limit"] = limit
-    species_stats.append(stats)
-
-# Build run config for summary
-run_config = {
-    "raw_dir":          str(raw_dir),
-    "baked_dir":        str(baked_dir),
-    "species_parallel": args.species_parallel,
-    "n_workers":        n_workers_per_species,
-    "tokenizer":        args.tokenizer,
-    "compact":          args.compact,
-    "compact_target":   args.compact_target,
-}
-
-# Write comprehensive summary
-summary_path = log_dir / "bake_summary.log"
-util.write_bake_summary(
-    summary_path,
-    run_config,
-    results,
-    species_stats,
-    tokenizer_result,
-    compact_result,
-)
-
-print(f"  Summary written: {summary_path}")
-
-# Print quick stats
-total_chunks = sum(s["train_chunks"] for s in species_stats)
-total_val    = sum(s["val_chunks"] for s in species_stats)
-total_long   = sum(s["long_genes"] for s in species_stats)
-total_complex = sum(s["complex_loci"] for s in species_stats)
-
-print(f"\n{' Quick Summary ':=^60}")
-print(f"  Species processed: {success}/{len(species_to_process)}")
-print(f"  Training chunks:   {total_chunks:,}")
-print(f"  Validation chunks: {total_val:,}")
-print(f"  Long genes:        {total_long}")
-print(f"  Complex loci:      {total_complex}")
+if train_path.exists():
+    print(f"  Training:   {train_path} ({train_path.stat().st_size / 1024 / 1024:.2f} MB)")
+if val_path.exists():
+    print(f"  Validation: {val_path} ({val_path.stat().st_size / 1024 / 1024:.2f} MB)")
 
 print(f"\n{'='*60}")
 print("Done!")
-
-if args.tokenizer and not args.skip_tokenizer_expansion:
-    print("\nNext steps:")
-    print("  1. Run resize_model.py to resize model embeddings")
-    print(f"     python bin/resize_model.py {args.tokenizer}")
-
 print(f"{'='*60}")

@@ -1,6 +1,5 @@
 import struct
 import json
-import zlib
 import pathlib
 
 
@@ -40,6 +39,8 @@ class BinaryChunk:
         chunk_index   = 0,
         is_augmented  = False,
         compact_group = None,
+        input_len     = None,
+        target_len    = None,
     ):
 
         self.seqid         = seqid
@@ -55,6 +56,8 @@ class BinaryChunk:
         self.chunk_index   = chunk_index
         self.is_augmented  = is_augmented
         self.compact_group = compact_group
+        self.input_len     = input_len
+        self.target_len    = target_len
 
     def to_bytes(self):
         """Serialize chunk to bytes"""
@@ -70,6 +73,8 @@ class BinaryChunk:
             "chunk_index":   self.chunk_index,
             "is_augmented":  self.is_augmented,
             "compact_group": self.compact_group,
+            "input_len":     self.input_len,
+            "target_len":    self.target_len,
         }
 
         meta_json  = json.dumps(meta).encode('utf-8')
@@ -124,6 +129,8 @@ class BinaryChunk:
             chunk_index   = meta.get("chunk_index", 0),
             is_augmented  = meta.get("is_augmented", False),
             compact_group = meta.get("compact_group"),
+            input_len     = meta.get("input_len"),
+            target_len    = meta.get("target_len"),
         )
 
     def _build_gene_transcript_indices(self):
@@ -233,41 +240,35 @@ class BinaryChunk:
 #################
 
 
-def write_binary(chunks, output_path, compress=True, show_progress=True):
+def write_binary(chunks, output_path, show_progress=True):
     """
-    Write chunks to binary file with optional compression.
+    Write chunks to binary file (uncompressed for fast streaming)
 
     Uses streaming write with seek-based offset table to minimize memory:
     - Memory: O(n) for offset array (~12MB per 1M chunks) + O(1) chunk buffer
     - Single pass through chunks, single serialization per chunk
-    - v2 format: 64-bit offsets support files >4GB
+    - v3 format: 64-bit offsets, uncompressed
     """
+
     output_path = pathlib.Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     num_chunks = len(chunks)
 
     with open(output_path, 'wb') as f:
-        # Write header (10 bytes total)
-        f.write(MAGIC_HEADER)                              # 4 bytes
-        f.write(struct.pack('<B', FORMAT_VERSION))         # 1 byte (v2)
-        f.write(struct.pack('<B', 1 if compress else 0))   # 1 byte
-        f.write(struct.pack('<I', num_chunks))             # 4 bytes
+        f.write(MAGIC_HEADER)
+        f.write(struct.pack('<B', FORMAT_VERSION))
+        f.write(struct.pack('<B', 0))
+        f.write(struct.pack('<I', num_chunks))
 
-        # Write placeholder offset table (will seek back to fill)
-        # v2: 12 bytes per entry (QI: 64-bit offset + 32-bit length)
-        offset_table_pos = f.tell()  # Position 10
+        offset_table_pos = f.tell()
         f.write(b'\x00' * (num_chunks * OFFSET_ENTRY_SIZE_V2))
 
-        # Stream chunks directly to file, record offsets
         offsets = []
 
         for i, chunk in enumerate(chunks):
             current_offset = f.tell()
-
-            chunk_bytes = chunk.to_bytes()
-            if compress:
-                chunk_bytes = zlib.compress(chunk_bytes, level=6)
+            chunk_bytes    = chunk.to_bytes()
 
             f.write(chunk_bytes)
             offsets.append((current_offset, len(chunk_bytes)))
@@ -279,7 +280,6 @@ def write_binary(chunks, output_path, compress=True, show_progress=True):
         if show_progress and num_chunks > 50000:
             print(f"    Writing: {num_chunks:,}/{num_chunks:,} (100.0%)")
 
-        # Seek back and write real offset table (v2: QI format)
         f.seek(offset_table_pos)
         for offset, length in offsets:
             f.write(struct.pack('<QI', offset, length))
@@ -288,7 +288,9 @@ def write_binary(chunks, output_path, compress=True, show_progress=True):
 
 
 def read_binary(input_path):
-    """Read all chunks from binary file (supports v1 and v2 formats)"""
+    """Read all chunks from binary file (supports v1-v3 formats)"""
+
+    import zlib
 
     with open(input_path, 'rb') as f:
         magic = f.read(4)
@@ -299,15 +301,12 @@ def read_binary(input_path):
         compressed = struct.unpack('<B', f.read(1))[0]
         num_chunks = struct.unpack('<I', f.read(4))[0]
 
-        # Read offset table based on version
         offsets = []
         if version >= 2:
-            # v2: QI format (64-bit offset, 32-bit length)
             for _ in range(num_chunks):
                 offset, length = struct.unpack('<QI', f.read(12))
                 offsets.append((offset, length))
         else:
-            # v1: II format (32-bit offset, 32-bit length)
             for _ in range(num_chunks):
                 offset, length = struct.unpack('<II', f.read(8))
                 offsets.append((offset, length))
@@ -327,7 +326,9 @@ def read_binary(input_path):
 
 
 def read_chunk_at_index(input_path, index):
-    """Read single chunk by index without loading entire file (supports v1 and v2)"""
+    """Read single chunk by index without loading entire file"""
+
+    import zlib
 
     with open(input_path, 'rb') as f:
         magic = f.read(4)
@@ -341,12 +342,11 @@ def read_chunk_at_index(input_path, index):
         if index >= num_chunks:
             raise IndexError(f"Index {index} out of range (total: {num_chunks})")
 
-        # Seek to correct offset entry based on version
         if version >= 2:
-            f.seek(10 + index * 12)  # v2: 12 bytes per entry
+            f.seek(10 + index * 12)
             offset, length = struct.unpack('<QI', f.read(12))
         else:
-            f.seek(10 + index * 8)   # v1: 8 bytes per entry
+            f.seek(10 + index * 8)
             offset, length = struct.unpack('<II', f.read(8))
 
         f.seek(offset)

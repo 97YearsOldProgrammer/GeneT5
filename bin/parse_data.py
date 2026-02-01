@@ -25,20 +25,16 @@ parser.add_argument('--seed', required=False, type=int, default=42,
     metavar='<int>', help='random seed [%(default)i]')
 parser.add_argument('--extract_tokens', required=False, type=str, default=None,
     metavar='<file>', help='extract tokens to file')
-parser.add_argument('--top_k_long', required=False, type=int, default=5,
-    metavar='<int>', help='top K long genes for validation [%(default)i]')
-parser.add_argument('--top_k_complex', required=False, type=int, default=5,
-    metavar='<int>', help='top K complex genes for validation [%(default)i]')
+parser.add_argument('--num_complex', required=False, type=int, default=5,
+    metavar='<int>', help='number of complex genes for validation [%(default)i]')
 parser.add_argument('--num_normal', required=False, type=int, default=5,
     metavar='<int>', help='number of mean-complexity genes [%(default)i]')
 parser.add_argument('--num_easy', required=False, type=int, default=5,
     metavar='<int>', help='number of easy genes [%(default)i]')
 parser.add_argument('--n_workers', required=False, type=int, default=None,
     metavar='<int>', help='parallel workers [auto]')
-parser.add_argument('--compress', action='store_true', default=True,
-    help='compress output binary')
-parser.add_argument('--no_compress', action='store_false', dest='compress',
-    help='do not compress output binary')
+parser.add_argument('--tokenizer', required=False, type=str, default=None,
+    metavar='<path>', help='tokenizer path for storing token lengths')
 
 args = parser.parse_args()
 
@@ -70,8 +66,7 @@ print(f"\n{' Building Validation Set ':=^60}")
 
 validation = ds.build_validation_set(
     gene_index,
-    args.top_k_long,
-    args.top_k_complex,
+    args.num_complex,
     args.num_normal,
     args.num_easy,
     args.seed,
@@ -115,6 +110,36 @@ aug_count = sum(1 for c in all_chunks if c.is_augmented)
 print(f"  Raw chunks:       {raw_count}")
 print(f"  Augmented chunks: {aug_count}")
 
+# Tokenize if tokenizer provided
+tokenizer = None
+if args.tokenizer:
+    print(f"\n{' Batch Tokenizing Chunks ':=^60}")
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
+    print(f"  Vocab size: {len(tokenizer)}")
+
+    batch_size   = 1000
+    total_chunks = len(all_chunks)
+
+    for batch_start in range(0, total_chunks, batch_size):
+        batch_end    = min(batch_start + batch_size, total_chunks)
+        batch_chunks = all_chunks[batch_start:batch_end]
+
+        input_texts  = [c.get_input_text() for c in batch_chunks]
+        target_texts = [c.get_target_text() for c in batch_chunks]
+
+        input_enc  = tokenizer(input_texts, add_special_tokens=False)
+        target_enc = tokenizer(target_texts, add_special_tokens=False)
+
+        for i, chunk in enumerate(batch_chunks):
+            chunk.input_len  = len(input_enc['input_ids'][i])
+            chunk.target_len = len(target_enc['input_ids'][i])
+
+        pct = 100 * batch_end / total_chunks
+        print(f"    Tokenized: {batch_end:,}/{total_chunks:,} ({pct:.1f}%)", end='\r')
+
+    print(f"    Tokenized: {total_chunks:,}/{total_chunks:,} (100.0%)")
+
 # Write outputs
 output_dir = pathlib.Path(args.output_dir)
 output_dir.mkdir(parents=True, exist_ok=True)
@@ -123,7 +148,7 @@ print(f"\n{' Writing Outputs ':=^60}")
 
 # Write training
 train_path = output_dir / 'training.bin'
-ds.write_binary(all_chunks, train_path, args.compress)
+ds.write_binary(all_chunks, train_path)
 train_size = train_path.stat().st_size
 print(f"  Training:   {train_path} ({ds.format_size(train_size)})")
 
@@ -162,9 +187,21 @@ for scenario in validation.get('scenarios', []):
     )
     val_chunks.append(chunk)
 
+# Batch tokenize validation chunks
+if tokenizer and val_chunks:
+    input_texts  = [c.get_input_text() for c in val_chunks]
+    target_texts = [c.get_target_text() for c in val_chunks]
+
+    input_enc  = tokenizer(input_texts, add_special_tokens=False)
+    target_enc = tokenizer(target_texts, add_special_tokens=False)
+
+    for i, chunk in enumerate(val_chunks):
+        chunk.input_len  = len(input_enc['input_ids'][i])
+        chunk.target_len = len(target_enc['input_ids'][i])
+
 # Write validation
 val_path = output_dir / 'validation.bin'
-ds.write_binary(val_chunks, val_path, args.compress)
+ds.write_binary(val_chunks, val_path)
 val_size = val_path.stat().st_size
 print(f"  Validation: {val_path} ({ds.format_size(val_size)})")
 
@@ -187,5 +224,5 @@ print('Done!')
 print()
 print('Next steps:')
 print('  1. Update tokenizer with extracted tokens (if --extract_tokens used)')
-print('  2. Optionally compact with: bin/compact.py --tokenizer <path>')
+print('  2. Optionally compact with: bin/compact.py -o output.bin --compact_target N *.bin')
 print(f"{'='*60}")
