@@ -110,8 +110,7 @@ After parse all datas, remember to run the compacting function.
   --tokenizer ../model/init/ \
   --compact_target 30000 \
   --hard_limit 32768 \
-  --workers 15 \     
-  --batch_size 5000 \  
+  --workers 10 \     
   2>&1 | tee ../logs/compact.log
 
 ```

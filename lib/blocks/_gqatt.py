@@ -624,8 +624,9 @@ class GQAttention(nn.Module):
             stride_kvsegb = 0
             stride_kvsegs = 0
 
-        BLOCK_M      = 64
-        BLOCK_N      = 64
+        # Reduced block sizes to fit in shared memory (101KB limit on GB10)
+        BLOCK_M      = 32
+        BLOCK_N      = 32
         BLOCK_D      = self.head_dim
         num_m_blocks = (L_q + BLOCK_M - 1) // BLOCK_M
         grid         = (B, self.num_kv_heads, num_m_blocks)
@@ -676,8 +677,10 @@ class GQAttention(nn.Module):
             stride_segb = 0
             stride_segs = 0
 
-        BLOCK_M      = 64
-        BLOCK_N      = 64
+        # Reduced block sizes to fit in shared memory (101KB limit on GB10)
+        # Original 64x64 needs 128KB, 32x32 needs ~32KB
+        BLOCK_M      = 32
+        BLOCK_N      = 32
         BLOCK_D      = self.head_dim
         num_m_blocks = (L + BLOCK_M - 1) // BLOCK_M
         grid         = (B, self.num_kv_heads, num_m_blocks)
@@ -719,11 +722,19 @@ class GQAttention(nn.Module):
 
         if self.is_cross_attn and key_value_states is not None:
             if use_triton:
-                return self._forward_triton_cross(hidden_states, key_value_states, attention_mask, q_segment_ids, kv_segment_ids)
+                try:
+                    return self._forward_triton_cross(hidden_states, key_value_states, attention_mask, q_segment_ids, kv_segment_ids)
+                except Exception:
+                    # Fall back to PyTorch on Triton errors (e.g., shared memory limit)
+                    self._triton_supported = False
             return self._forward_pytorch_cross(hidden_states, key_value_states, attention_mask, q_segment_ids, kv_segment_ids)
         else:
             if use_triton:
-                return self._forward_triton_self(hidden_states, attention_mask, segment_ids)
+                try:
+                    return self._forward_triton_self(hidden_states, attention_mask, segment_ids)
+                except Exception:
+                    # Fall back to PyTorch on Triton errors (e.g., shared memory limit)
+                    self._triton_supported = False
             return self._forward_pytorch_self(hidden_states, attention_mask, position_bias, segment_ids)
 
     def get_kv_cache_size(self, batch_size, seq_len):

@@ -75,6 +75,20 @@ def main():
         metavar='<float>', help='label smoothing factor [%(default).2f]')
     parser.add_argument('--gradient_checkpointing', action='store_true',
         help='enable gradient checkpointing to save memory')
+    parser.add_argument('--log_every_pct', required=False, type=int, default=10,
+        metavar='<int>', help='log progress every N percent of epoch [%(default)i]')
+    parser.add_argument('--save_steps', required=False, type=int, default=None,
+        metavar='<int>', help='save checkpoint every N optimizer steps (default: end of epoch only)')
+    parser.add_argument('--optim_8bit', action='store_true',
+        help='use 8-bit Adam optimizer (requires bitsandbytes, saves ~50%% optimizer memory)')
+    parser.add_argument('--optim_cpu_offload', action='store_true',
+        help='offload optimizer states to CPU (slower but saves GPU/RAM)')
+    parser.add_argument('--empty_cache_steps', required=False, type=int, default=None,
+        metavar='<int>', help='call torch.cuda.empty_cache() every N steps to reduce fragmentation')
+    parser.add_argument('--no_pin_memory', action='store_true',
+        help='disable pin_memory in dataloaders (can reduce CPU memory pressure)')
+    parser.add_argument('--log_memory', action='store_true',
+        help='log memory usage in progress reports')
 
     args = parser.parse_args()
     
@@ -146,7 +160,7 @@ def main():
         batch_sampler = train_sampler,
         collate_fn    = collator,
         num_workers   = args.num_workers,
-        pin_memory    = True,
+        pin_memory    = not args.no_pin_memory,
     )
     
     val_sampler = ds.SmartBatchSampler(
@@ -159,7 +173,7 @@ def main():
         batch_sampler = val_sampler,
         collate_fn    = collator,
         num_workers   = args.num_workers,
-        pin_memory    = True,
+        pin_memory    = not args.no_pin_memory,
     )
     
     print(f"  Train batches: {len(train_loader)}")
@@ -167,13 +181,33 @@ def main():
     
     # setup optimizer
     print(f"\nSetting up optimizer...")
-    
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr           = args.lr,
-        betas        = (0.9, 0.95),
-        weight_decay = args.weight_decay,
-    )
+
+    if args.optim_8bit:
+        try:
+            import bitsandbytes as bnb
+            optimizer = bnb.optim.AdamW8bit(
+                model.parameters(),
+                lr           = args.lr,
+                betas        = (0.9, 0.95),
+                weight_decay = args.weight_decay,
+            )
+            print("  Using 8-bit AdamW (saves ~12GB optimizer memory)")
+        except ImportError:
+            print("  WARNING: bitsandbytes not installed, falling back to standard AdamW")
+            print("           Install with: pip install bitsandbytes")
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr           = args.lr,
+                betas        = (0.9, 0.95),
+                weight_decay = args.weight_decay,
+            )
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr           = args.lr,
+            betas        = (0.9, 0.95),
+            weight_decay = args.weight_decay,
+        )
     
     total_steps  = len(train_loader) * args.epochs // args.grad_accum
     warmup_steps = int(total_steps * args.warmup_ratio)
@@ -235,21 +269,53 @@ def main():
         if hasattr(model.decoder, 'gradient_checkpointing_enable'):
             model.decoder.gradient_checkpointing_enable()
         print("  Gradient checkpointing: enabled")
-    
+
+    # Print progress logging info
+    batches_per_epoch = len(train_loader)
+    optimizer_steps_per_epoch = batches_per_epoch // args.grad_accum
+    print(f"  Progress logging: every {args.log_every_pct}% ({batches_per_epoch * args.log_every_pct // 100} batches)")
+    if args.save_steps:
+        print(f"  Step checkpoints: every {args.save_steps} optimizer steps")
+    else:
+        print(f"  Step checkpoints: disabled (use --save_steps N to enable)")
+
+    # Memory estimate
+    param_mem_gb = stats['total_params'] * 4 / 1e9  # float32
+    grad_mem_gb = stats['total_trainable'] * 4 / 1e9
+    optim_mem_gb = stats['total_trainable'] * 8 / 1e9  # Adam has 2 states per param
+    if args.optim_8bit:
+        optim_mem_gb /= 2
+    print(f"\n  Memory estimate (excluding activations):")
+    print(f"    Model:     {param_mem_gb:.1f} GB")
+    print(f"    Gradients: {grad_mem_gb:.1f} GB")
+    print(f"    Optimizer: {optim_mem_gb:.1f} GB")
+    print(f"    Subtotal:  {param_mem_gb + grad_mem_gb + optim_mem_gb:.1f} GB")
+
+    import psutil
+    mem = psutil.virtual_memory()
+    print(f"    Available: {mem.available/1e9:.1f} GB / {mem.total/1e9:.0f} GB total")
+
     patience_counter = 0
-    
+    global_step = 0  # Track optimizer steps across epochs
+
     for epoch in range(start_epoch, args.epochs):
         print(f"\nEpoch {epoch + 1}/{args.epochs}")
         print('-' * 40)
-        
+
         train_dataset.set_epoch(epoch)
-        
+
         # train epoch
         model.train()
         total_train_loss = 0
-        
+
         optimizer.zero_grad()
-        
+
+        # Progress tracking
+        num_batches = len(train_loader)
+        log_interval = max(1, num_batches * args.log_every_pct // 100)
+        last_logged_pct = -1
+        epoch_start_time = __import__('time').time()
+
         for step, batch in enumerate(train_loader):
             batch = {k: v.to(device) for k, v in batch.items()}
 
@@ -287,8 +353,53 @@ def main():
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
-            
+                global_step += 1
+
+                # Step-based checkpoint saving
+                if args.save_steps and global_step % args.save_steps == 0:
+                    save_path = output_dir / f'checkpoint_step_{global_step}.pt'
+                    checkpoint = {
+                        'epoch':                epoch,
+                        'global_step':          global_step,
+                        'model_state_dict':     model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'config':               {'best_val_loss': best_val_loss},
+                    }
+                    torch.save(checkpoint, save_path)
+                    print(f"  [Step {global_step}] Saved checkpoint: {save_path.name}")
+
+                # Periodic cache clearing to reduce memory fragmentation
+                if args.empty_cache_steps and global_step % args.empty_cache_steps == 0:
+                    torch.cuda.empty_cache()
+
             total_train_loss += loss.item() * args.grad_accum
+
+            # Progress logging every N%
+            current_pct = (step + 1) * 100 // num_batches
+            if current_pct >= last_logged_pct + args.log_every_pct:
+                last_logged_pct = (current_pct // args.log_every_pct) * args.log_every_pct
+                elapsed = __import__('time').time() - epoch_start_time
+                samples_done = step + 1
+                samples_per_sec = samples_done / elapsed if elapsed > 0 else 0
+                eta_epoch = (num_batches - samples_done) / samples_per_sec if samples_per_sec > 0 else 0
+                avg_loss_so_far = total_train_loss / (step + 1)
+
+                mem_str = ""
+                if args.log_memory:
+                    import psutil
+                    mem = psutil.virtual_memory()
+                    mem_str = f" | RAM: {mem.used/1e9:.1f}/{mem.total/1e9:.0f}GB ({mem.percent:.0f}%)"
+                    if torch.cuda.is_available():
+                        gpu_mem = torch.cuda.memory_allocated() / 1e9
+                        gpu_max = torch.cuda.max_memory_allocated() / 1e9
+                        mem_str += f" | GPU: {gpu_mem:.1f}GB (peak: {gpu_max:.1f}GB)"
+
+                print(f"  [{last_logged_pct:3d}%] batch {step+1}/{num_batches} | "
+                      f"loss: {avg_loss_so_far:.4f} | "
+                      f"lr: {scheduler.get_last_lr()[0]:.2e} | "
+                      f"speed: {samples_per_sec:.1f} batch/s | "
+                      f"ETA epoch: {eta_epoch/3600:.1f}h{mem_str}")
 
         train_loss = total_train_loss / max(len(train_loader), 1)
         

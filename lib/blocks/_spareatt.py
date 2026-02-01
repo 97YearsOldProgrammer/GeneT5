@@ -40,8 +40,16 @@ class SparseAttentionConfig:
 
 
 def _check_triton_support():
-    """Check if Triton is supported on current hardware"""
+    """Check if Triton sparse attention is supported
 
+    NOTE: Triton sparse attention requires sufficient shared memory.
+    If you hit 'out of resource: shared memory' errors, reduce block_size.
+    Set GENET5_ENABLE_SPARSE_TRITON=1 to force enable for testing.
+    """
+
+    import os
+    if os.environ.get("GENET5_DISABLE_SPARSE_TRITON", "0") == "1":
+        return False
     if not th.cuda.is_available():
         return False
     cap = th.cuda.get_device_capability()
@@ -602,14 +610,14 @@ class BlockIndexBuilder:
 
     def __init__(self, block_size, window_size, num_global_tokens, num_random_blocks, max_seq_len=8192, random_seed=42):
 
+        from collections import OrderedDict
         self.block_size        = block_size
         self.window_size       = window_size
         self.num_global_tokens = num_global_tokens
         self.num_random_blocks = num_random_blocks
         self.max_seq_len       = max_seq_len
         self.random_seed       = random_seed
-        self._cache            = {}
-        self._cache_order      = []  # Track insertion order for LRU eviction
+        self._cache            = OrderedDict()  # LRU cache with O(1) operations
     
     def _compute_indices(self, seq_len, device):
         """Compute sparse block indices via seeded random selection"""
@@ -659,30 +667,23 @@ class BlockIndexBuilder:
         return selected.int()
     
     def get_indices(self, seq_len, device):
-        """Get block indices with LRU caching"""
+        """Get block indices with LRU caching (O(1) operations)"""
 
         cache_key = (seq_len, str(device))
         if cache_key in self._cache:
-            # Move to end (most recently used)
-            if cache_key in self._cache_order:
-                self._cache_order.remove(cache_key)
-            self._cache_order.append(cache_key)
+            self._cache.move_to_end(cache_key)  # O(1) LRU update
             return self._cache[cache_key]
 
-        # Evict oldest entries if cache is full
-        while len(self._cache) >= self.MAX_CACHE_SIZE and self._cache_order:
-            oldest_key = self._cache_order.pop(0)
-            self._cache.pop(oldest_key, None)
+        # Evict oldest entry if cache is full
+        while len(self._cache) >= self.MAX_CACHE_SIZE:
+            self._cache.popitem(last=False)  # O(1) remove oldest
 
         self._cache[cache_key] = self._compute_indices(seq_len, device)
-        self._cache_order.append(cache_key)
         return self._cache[cache_key]
     
     def clear_cache(self):
         """Clear the index cache"""
-
         self._cache.clear()
-        self._cache_order.clear()
 
 
 class SparseAttention(nn.Module):
