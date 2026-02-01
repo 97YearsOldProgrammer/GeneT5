@@ -15,43 +15,39 @@ from lib.blocks._moe       import MoE, MoEConfig
 
 
 class DecoderBlock(nn.Module):
-    
+
     def __init__(
-        self, 
-        embed_dim, 
-        num_heads, 
-        ff_dim, 
-        dropout            = 0.0, 
-        attn_dropout       = 0.0, 
-        use_alibi          = True,
-        use_moe            = False,
-        num_experts        = 8,
-        moe_top_k          = 2,
-        moe_load_balance   = 0.01,
-        moe_router_z       = 0.001,
-        num_kv_heads       = None,
-        block_size         = 64,
-        window_size        = 256,
-        num_global_tokens  = 64,
-        num_random_blocks  = 3,
+        self,
+        embed_dim,
+        num_heads,
+        ff_dim,
+        dropout          = 0.0,
+        attn_dropout     = 0.0,
+        use_alibi        = True,
+        use_moe          = False,
+        num_experts      = 8,
+        moe_top_k        = 2,
+        moe_load_balance = 0.01,
+        moe_router_z     = 0.001,
+        num_kv_heads     = None,
+        block_size       = 64,
+        window_size      = 256,
     ):
         super().__init__()
-        
+
         self.use_moe = use_moe
-        
+
         if num_kv_heads is None:
             num_kv_heads = max(1, num_heads // 4)
-        
+
         # Self-attention: SparseAttention (weight-compatible with standard attention)
         sparse_config = SparseAttentionConfig(
-            embed_dim         = embed_dim,
-            num_heads         = num_heads,
-            block_size        = block_size,
-            window_size       = window_size,
-            num_global_tokens = num_global_tokens,
-            num_random_blocks = num_random_blocks,
-            dropout           = attn_dropout,
-            use_alibi         = use_alibi,
+            embed_dim   = embed_dim,
+            num_heads   = num_heads,
+            block_size  = block_size,
+            window_size = window_size,
+            dropout     = attn_dropout,
+            use_alibi   = use_alibi,
         )
         self.self_attn = SparseAttention(config=sparse_config, is_causal=True)
         self.norm1     = LayerNorm(embed_dim)
@@ -122,53 +118,49 @@ class DecoderBlock(nn.Module):
 
 
 class Decoder(nn.Module):
-    
+
     def __init__(
-        self, 
-        num_layers, 
-        embed_dim, 
-        num_heads, 
-        ff_dim, 
-        dropout            = 0.0, 
-        attn_dropout       = 0.0,
-        use_alibi          = True,
-        use_moe            = True,
-        num_experts        = 8,
-        moe_top_k          = 2,
-        moe_load_balance   = 0.01,
-        moe_router_z       = 0.001,
-        num_kv_heads       = None,
-        block_size         = 64,
-        window_size        = 256,
-        num_global_tokens  = 64,
-        num_random_blocks  = 3,
+        self,
+        num_layers,
+        embed_dim,
+        num_heads,
+        ff_dim,
+        dropout          = 0.0,
+        attn_dropout     = 0.0,
+        use_alibi        = True,
+        use_moe          = True,
+        num_experts      = 8,
+        moe_top_k        = 2,
+        moe_load_balance = 0.01,
+        moe_router_z     = 0.001,
+        num_kv_heads     = None,
+        block_size       = 64,
+        window_size      = 256,
     ):
         super().__init__()
-        
+
         self.use_moe   = use_moe
         self.use_alibi = use_alibi
-        
+
         if num_kv_heads is None:
             num_kv_heads = max(1, num_heads // 4)
-        
+
         self.layers = nn.ModuleList([
             DecoderBlock(
-                embed_dim          = embed_dim,
-                num_heads          = num_heads,
-                ff_dim             = ff_dim,
-                dropout            = dropout,
-                attn_dropout       = attn_dropout,
-                use_alibi          = use_alibi,
-                use_moe            = use_moe,
-                num_experts        = num_experts,
-                moe_top_k          = moe_top_k,
-                moe_load_balance   = moe_load_balance,
-                moe_router_z       = moe_router_z,
-                num_kv_heads       = num_kv_heads,
-                block_size         = block_size,
-                window_size        = window_size,
-                num_global_tokens  = num_global_tokens,
-                num_random_blocks  = num_random_blocks,
+                embed_dim        = embed_dim,
+                num_heads        = num_heads,
+                ff_dim           = ff_dim,
+                dropout          = dropout,
+                attn_dropout     = attn_dropout,
+                use_alibi        = use_alibi,
+                use_moe          = use_moe,
+                num_experts      = num_experts,
+                moe_top_k        = moe_top_k,
+                moe_load_balance = moe_load_balance,
+                moe_router_z     = moe_router_z,
+                num_kv_heads     = num_kv_heads,
+                block_size       = block_size,
+                window_size      = window_size,
             )
             for _ in range(num_layers)
         ])

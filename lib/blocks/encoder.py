@@ -13,35 +13,31 @@ from lib.blocks._spareatt  import SparseAttention, SparseAttentionConfig
 
 
 class EncoderBlock(nn.Module):
-    
+
     def __init__(
-        self, 
+        self,
         embed_dim,
-        num_heads, 
-        ff_dim, 
-        dropout            =0.0, 
-        attn_dropout       =0.0, 
+        num_heads,
+        ff_dim,
+        dropout            =0.0,
+        attn_dropout       =0.0,
         use_alibi          =False,
         use_bigbird_sparse =False,
         block_size         =64,
         window_size        =256,
-        num_global_tokens  =64,
-        num_random_blocks  =3
     ):
         super().__init__()
-        
+
         self.use_bigbird_sparse = use_bigbird_sparse
-        
+
         if use_bigbird_sparse:
             sparse_config = SparseAttentionConfig(
-                embed_dim         =embed_dim,
-                num_heads         =num_heads,
-                block_size        =block_size,
-                window_size       =window_size,
-                num_global_tokens =num_global_tokens,
-                num_random_blocks =num_random_blocks,
-                dropout           =attn_dropout,
-                use_alibi         =use_alibi
+                embed_dim   =embed_dim,
+                num_heads   =num_heads,
+                block_size  =block_size,
+                window_size =window_size,
+                dropout     =attn_dropout,
+                use_alibi   =use_alibi
             )
             self.self_attn = SparseAttention(
                 config    =sparse_config,
@@ -85,27 +81,25 @@ class EncoderBlock(nn.Module):
 
 
 class Encoder(nn.Module):
-    
+
     def __init__(
-        self, 
-        num_layers, 
-        embed_dim, 
-        num_heads, 
-        ff_dim, 
-        dropout            =0.0, 
+        self,
+        num_layers,
+        embed_dim,
+        num_heads,
+        ff_dim,
+        dropout            =0.0,
         attn_dropout       =0.0,
         use_alibi          =False,
         use_bigbird_sparse =False,
         block_size         =64,
         window_size        =256,
-        num_global_tokens  =64,
-        num_random_blocks  =3
     ):
         super().__init__()
-        
+
         self.use_bigbird_sparse = use_bigbird_sparse
         self.use_alibi          = use_alibi
-        
+
         self.layers = nn.ModuleList([
             EncoderBlock(
                 embed_dim          =embed_dim,
@@ -117,8 +111,6 @@ class Encoder(nn.Module):
                 use_bigbird_sparse =use_bigbird_sparse,
                 block_size         =block_size,
                 window_size        =window_size,
-                num_global_tokens  =num_global_tokens,
-                num_random_blocks  =num_random_blocks
             )
             for i in range(num_layers)
         ])

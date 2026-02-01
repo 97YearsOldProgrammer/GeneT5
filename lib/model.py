@@ -17,54 +17,46 @@ class GeneT5(nn.Module):
     
     def __init__(
         self,
-        embed_dim           = 768,
-        encoder_num_layers  = 12,
-        encoder_num_heads   = 12,
-        encoder_ff_dim      = 3072,
-        decoder_num_layers  = 12,
-        decoder_num_heads   = 12,
-        decoder_ff_dim      = 3072,
-        decoder_dropout     = 0.1,
-        decoder_use_alibi   = True,
-        decoder_use_moe     = True,
-        decoder_num_experts = 8,
-        decoder_moe_top_k   = 2,
-        decoder_num_kv_heads= None,
-        vocab_size          = 4096,
-        tie_weights         = True,
+        embed_dim            = 768,
+        encoder_num_layers   = 12,
+        encoder_num_heads    = 12,
+        encoder_ff_dim       = 3072,
+        decoder_num_layers   = 12,
+        decoder_num_heads    = 12,
+        decoder_ff_dim       = 3072,
+        decoder_dropout      = 0.1,
+        decoder_use_alibi    = True,
+        decoder_use_moe      = True,
+        decoder_num_experts  = 8,
+        decoder_moe_top_k    = 2,
+        decoder_num_kv_heads = None,
+        vocab_size           = 4096,
+        tie_weights          = True,
         # Encoder sparse attention
-        encoder_block_size        = 64,
-        encoder_window_size       = 256,
-        encoder_num_global_tokens = 64,
-        encoder_num_rand_blocks   = 3,
+        encoder_block_size   = 64,
+        encoder_window_size  = 256,
         # Decoder sparse attention
-        decoder_block_size        = 64,
-        decoder_window_size       = 256,
-        decoder_num_global_tokens = 64,
-        decoder_num_rand_blocks   = 3,
+        decoder_block_size   = 64,
+        decoder_window_size  = 256,
     ):
         super().__init__()
-        
+
         self.embed_dim  = embed_dim
         self.vocab_size = vocab_size
-        
+
         if decoder_num_kv_heads is None:
             decoder_num_kv_heads = max(1, decoder_num_heads // 4)
-        
+
         # Store sparse attention configs
-        self.encoder_block_size        = encoder_block_size
-        self.encoder_window_size       = encoder_window_size
-        self.encoder_num_global_tokens = encoder_num_global_tokens
-        self.encoder_num_rand_blocks   = encoder_num_rand_blocks
-        self.decoder_block_size        = decoder_block_size
-        self.decoder_window_size       = decoder_window_size
-        self.decoder_num_global_tokens = decoder_num_global_tokens
-        self.decoder_num_rand_blocks   = decoder_num_rand_blocks
-        
+        self.encoder_block_size  = encoder_block_size
+        self.encoder_window_size = encoder_window_size
+        self.decoder_block_size  = decoder_block_size
+        self.decoder_window_size = decoder_window_size
+
         # Encoder embedding
         self.encoder_embed         = nn.Embedding(vocab_size, embed_dim)
         self.encoder_embed_dropout = nn.Dropout(decoder_dropout)
-        
+
         # Encoder
         self.encoder = Encoder(
             num_layers         = encoder_num_layers,
@@ -77,27 +69,23 @@ class GeneT5(nn.Module):
             use_bigbird_sparse = True,
             block_size         = encoder_block_size,
             window_size        = encoder_window_size,
-            num_global_tokens  = encoder_num_global_tokens,
-            num_random_blocks  = encoder_num_rand_blocks,
         )
-        
+
         # Decoder
         self.decoder = Decoder(
-            num_layers        = decoder_num_layers,
-            embed_dim         = embed_dim,
-            num_heads         = decoder_num_heads,
-            ff_dim            = decoder_ff_dim,
-            dropout           = decoder_dropout,
-            attn_dropout      = decoder_dropout,
-            use_alibi         = decoder_use_alibi,
-            use_moe           = decoder_use_moe,
-            num_experts       = decoder_num_experts,
-            moe_top_k         = decoder_moe_top_k,
-            num_kv_heads      = decoder_num_kv_heads,
-            block_size        = decoder_block_size,
-            window_size       = decoder_window_size,
-            num_global_tokens = decoder_num_global_tokens,
-            num_random_blocks = decoder_num_rand_blocks,
+            num_layers   = decoder_num_layers,
+            embed_dim    = embed_dim,
+            num_heads    = decoder_num_heads,
+            ff_dim       = decoder_ff_dim,
+            dropout      = decoder_dropout,
+            attn_dropout = decoder_dropout,
+            use_alibi    = decoder_use_alibi,
+            use_moe      = decoder_use_moe,
+            num_experts  = decoder_num_experts,
+            moe_top_k    = decoder_moe_top_k,
+            num_kv_heads = decoder_num_kv_heads,
+            block_size   = decoder_block_size,
+            window_size  = decoder_window_size,
         )
         
         # Decoder embeddings
@@ -308,29 +296,25 @@ class GeneT5(nn.Module):
             config = json.load(f)
         
         model = cls(
-            embed_dim                 = config["embed_dim"],
-            encoder_num_layers        = config["encoder_num_layers"],
-            encoder_num_heads         = config["encoder_num_heads"],
-            encoder_ff_dim            = config["encoder_ff_dim"],
-            decoder_num_layers        = config["decoder_num_layers"],
-            decoder_num_heads         = config["decoder_num_heads"],
-            decoder_ff_dim            = config["decoder_ff_dim"],
-            decoder_dropout           = config["decoder_dropout"],
-            decoder_use_alibi         = config["decoder_use_alibi"],
-            decoder_use_moe           = config["decoder_use_moe"],
-            decoder_num_experts       = config.get("decoder_num_experts", 8),
-            decoder_moe_top_k         = config.get("decoder_moe_top_k", 2),
-            decoder_num_kv_heads      = config.get("decoder_num_kv_heads"),
-            vocab_size                = config["vocab_size"],
-            tie_weights               = config["tie_weights"],
-            encoder_block_size        = config.get("encoder_block_size", 64),
-            encoder_window_size       = config.get("encoder_window_size", 256),
-            encoder_num_global_tokens = config.get("encoder_num_global_tokens", 64),
-            encoder_num_rand_blocks   = config.get("encoder_num_rand_blocks", 3),
-            decoder_block_size        = config.get("decoder_block_size", 64),
-            decoder_window_size       = config.get("decoder_window_size", 256),
-            decoder_num_global_tokens = config.get("decoder_num_global_tokens", 64),
-            decoder_num_rand_blocks   = config.get("decoder_num_rand_blocks", 3),
+            embed_dim            = config["embed_dim"],
+            encoder_num_layers   = config["encoder_num_layers"],
+            encoder_num_heads    = config["encoder_num_heads"],
+            encoder_ff_dim       = config["encoder_ff_dim"],
+            decoder_num_layers   = config["decoder_num_layers"],
+            decoder_num_heads    = config["decoder_num_heads"],
+            decoder_ff_dim       = config["decoder_ff_dim"],
+            decoder_dropout      = config["decoder_dropout"],
+            decoder_use_alibi    = config["decoder_use_alibi"],
+            decoder_use_moe      = config["decoder_use_moe"],
+            decoder_num_experts  = config.get("decoder_num_experts", 8),
+            decoder_moe_top_k    = config.get("decoder_moe_top_k", 2),
+            decoder_num_kv_heads = config.get("decoder_num_kv_heads"),
+            vocab_size           = config["vocab_size"],
+            tie_weights          = config["tie_weights"],
+            encoder_block_size   = config.get("encoder_block_size", 64),
+            encoder_window_size  = config.get("encoder_window_size", 256),
+            decoder_block_size   = config.get("decoder_block_size", 64),
+            decoder_window_size  = config.get("decoder_window_size", 256),
         )
         
         model.load(path / "pytorch_model.bin")

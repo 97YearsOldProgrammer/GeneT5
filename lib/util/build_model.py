@@ -15,22 +15,18 @@ from lib.blocks import Encoder, Decoder
 
 
 ENCODER_DEFAULTS = {
-    "block_size":        64,
-    "window_size":       256,
-    "num_global_tokens": 64,
-    "num_rand_blocks":   3,
+    "block_size":  64,
+    "window_size": 256,
 }
 
 DECODER_DEFAULTS = {
-    "block_size":        64,
-    "window_size":       256,
-    "num_global_tokens": 64,
-    "num_rand_blocks":   3,
-    "dropout":           0.1,
-    "use_alibi":         True,
-    "use_moe":           True,
-    "num_experts":       8,
-    "moe_top_k":         2,
+    "block_size":   64,
+    "window_size":  256,
+    "dropout":      0.1,
+    "use_alibi":    True,
+    "use_moe":      True,
+    "num_experts":  8,
+    "moe_top_k":    2,
 }
 
 INIT_DEFAULTS = {
@@ -43,38 +39,34 @@ INIT_DEFAULTS = {
 
 
 def build_gt5(
-    dnabert_model_name   = "zhihan1996/DNABERT-2-117M",
-    save_dir             = "./checkpoints/genet5_init",
+    dnabert_model_name  = "zhihan1996/DNABERT-2-117M",
+    save_dir            = "./checkpoints/genet5_init",
     # Encoder sparse attention
-    encoder_block_size        = ENCODER_DEFAULTS["block_size"],
-    encoder_window_size       = ENCODER_DEFAULTS["window_size"],
-    encoder_num_global_tokens = ENCODER_DEFAULTS["num_global_tokens"],
-    encoder_num_rand_blocks   = ENCODER_DEFAULTS["num_rand_blocks"],
+    encoder_block_size  = ENCODER_DEFAULTS["block_size"],
+    encoder_window_size = ENCODER_DEFAULTS["window_size"],
     # Decoder sparse attention
-    decoder_block_size        = DECODER_DEFAULTS["block_size"],
-    decoder_window_size       = DECODER_DEFAULTS["window_size"],
-    decoder_num_global_tokens = DECODER_DEFAULTS["num_global_tokens"],
-    decoder_num_rand_blocks   = DECODER_DEFAULTS["num_rand_blocks"],
+    decoder_block_size  = DECODER_DEFAULTS["block_size"],
+    decoder_window_size = DECODER_DEFAULTS["window_size"],
     # Decoder architecture
-    decoder_num_layers   = None,  # defaults to encoder
-    decoder_num_heads    = None,  # defaults to encoder
-    decoder_num_kv_heads = None,  # defaults to heads // 4
-    decoder_ff_dim       = None,  # defaults to encoder
-    decoder_dropout      = DECODER_DEFAULTS["dropout"],
-    decoder_use_alibi    = DECODER_DEFAULTS["use_alibi"],
-    decoder_use_moe      = DECODER_DEFAULTS["use_moe"],
-    decoder_num_experts  = DECODER_DEFAULTS["num_experts"],
-    decoder_moe_top_k    = DECODER_DEFAULTS["moe_top_k"],
+    decoder_num_layers  = None,  # defaults to encoder
+    decoder_num_heads   = None,  # defaults to encoder
+    decoder_num_kv_heads= None,  # defaults to heads // 4
+    decoder_ff_dim      = None,  # defaults to encoder
+    decoder_dropout     = DECODER_DEFAULTS["dropout"],
+    decoder_use_alibi   = DECODER_DEFAULTS["use_alibi"],
+    decoder_use_moe     = DECODER_DEFAULTS["use_moe"],
+    decoder_num_experts = DECODER_DEFAULTS["num_experts"],
+    decoder_moe_top_k   = DECODER_DEFAULTS["moe_top_k"],
     # Vocab
-    vocab_size      = None,
-    tie_weights     = True,
-    new_tokens_list = None,
+    vocab_size          = None,
+    tie_weights         = True,
+    new_tokens_list     = None,
     # Init
-    init_std             = INIT_DEFAULTS["std"],
-    init_embed_std       = INIT_DEFAULTS["embed_std"],
-    init_ffn_std         = INIT_DEFAULTS["ffn_std"],
-    init_attn_std        = INIT_DEFAULTS["attn_std"],
-    init_moe_router_std  = INIT_DEFAULTS["router_std"],
+    init_std            = INIT_DEFAULTS["std"],
+    init_embed_std      = INIT_DEFAULTS["embed_std"],
+    init_ffn_std        = INIT_DEFAULTS["ffn_std"],
+    init_attn_std       = INIT_DEFAULTS["attn_std"],
+    init_moe_router_std = INIT_DEFAULTS["router_std"],
 ):
     """
     Build GeneT5 from DNABERT-2 and save clean checkpoint.
@@ -98,10 +90,6 @@ def build_gt5(
         decoder_block_size = DECODER_DEFAULTS["block_size"]
     if decoder_window_size is None:
         decoder_window_size = DECODER_DEFAULTS["window_size"]
-    if decoder_num_global_tokens is None:
-        decoder_num_global_tokens = DECODER_DEFAULTS["num_global_tokens"]
-    if decoder_num_rand_blocks is None:
-        decoder_num_rand_blocks = DECODER_DEFAULTS["num_rand_blocks"]
     if init_embed_std is None:
         init_embed_std = init_std
     if init_ffn_std is None:
@@ -143,8 +131,8 @@ def build_gt5(
     
     print(f"\n    DNABERT-2: hidden={dna_config.hidden_size}, layers={dna_config.num_hidden_layers}, heads={dna_config.num_attention_heads}")
     print(f"    Decoder:   layers={decoder_num_layers}, heads={decoder_num_heads}, kv_heads={decoder_num_kv_heads}, moe={decoder_use_moe}")
-    print(f"    Encoder Sparse: block={encoder_block_size}, window={encoder_window_size}, global={encoder_num_global_tokens}, rand={encoder_num_rand_blocks}")
-    print(f"    Decoder Sparse: block={decoder_block_size}, window={decoder_window_size}, global={decoder_num_global_tokens}, rand={decoder_num_rand_blocks}")
+    print(f"    Encoder Sparse: block={encoder_block_size}, window={encoder_window_size}")
+    print(f"    Decoder Sparse: block={decoder_block_size}, window={decoder_window_size}")
     
     # Get BERT backbone
     bert = original_model.bert if hasattr(original_model, 'bert') else original_model
@@ -177,8 +165,6 @@ def build_gt5(
         use_bigbird_sparse = True,
         block_size         = encoder_block_size,
         window_size        = encoder_window_size,
-        num_global_tokens  = encoder_num_global_tokens,
-        num_random_blocks  = encoder_num_rand_blocks,
     )
     
     # Transfer Encoder Weights
@@ -265,21 +251,19 @@ def build_gt5(
     # Build Decoder
     print(f"\n[5] Building Decoder")
     decoder = Decoder(
-        num_layers        = decoder_num_layers,
-        embed_dim         = dna_config.hidden_size,
-        num_heads         = decoder_num_heads,
-        ff_dim            = decoder_ff_dim,
-        dropout           = decoder_dropout,
-        attn_dropout      = decoder_dropout,
-        use_alibi         = decoder_use_alibi,
-        use_moe           = decoder_use_moe,
-        num_experts       = decoder_num_experts,
-        moe_top_k         = decoder_moe_top_k,
-        num_kv_heads      = decoder_num_kv_heads,
-        block_size        = decoder_block_size,
-        window_size       = decoder_window_size,
-        num_global_tokens = decoder_num_global_tokens,
-        num_random_blocks = decoder_num_rand_blocks,
+        num_layers   = decoder_num_layers,
+        embed_dim    = dna_config.hidden_size,
+        num_heads    = decoder_num_heads,
+        ff_dim       = decoder_ff_dim,
+        dropout      = decoder_dropout,
+        attn_dropout = decoder_dropout,
+        use_alibi    = decoder_use_alibi,
+        use_moe      = decoder_use_moe,
+        num_experts  = decoder_num_experts,
+        moe_top_k    = decoder_moe_top_k,
+        num_kv_heads = decoder_num_kv_heads,
+        block_size   = decoder_block_size,
+        window_size  = decoder_window_size,
     )
     
     # Transfer Decoder Self-Attention from Encoder
@@ -341,29 +325,25 @@ def build_gt5(
     save_path.mkdir(parents=True, exist_ok=True)
     
     config = {
-        "embed_dim":                 dna_config.hidden_size,
-        "encoder_num_layers":        dna_config.num_hidden_layers,
-        "encoder_num_heads":         dna_config.num_attention_heads,
-        "encoder_ff_dim":            dna_config.intermediate_size,
-        "decoder_num_layers":        decoder_num_layers,
-        "decoder_num_heads":         decoder_num_heads,
-        "decoder_num_kv_heads":      decoder_num_kv_heads,
-        "decoder_ff_dim":            decoder_ff_dim,
-        "decoder_dropout":           decoder_dropout,
-        "decoder_use_alibi":         decoder_use_alibi,
-        "decoder_use_moe":           decoder_use_moe,
-        "decoder_num_experts":       decoder_num_experts,
-        "decoder_moe_top_k":         decoder_moe_top_k,
-        "vocab_size":                vocab_size,
-        "tie_weights":               tie_weights,
-        "encoder_block_size":        encoder_block_size,
-        "encoder_window_size":       encoder_window_size,
-        "encoder_num_global_tokens": encoder_num_global_tokens,
-        "encoder_num_rand_blocks":   encoder_num_rand_blocks,
-        "decoder_block_size":        decoder_block_size,
-        "decoder_window_size":       decoder_window_size,
-        "decoder_num_global_tokens": decoder_num_global_tokens,
-        "decoder_num_rand_blocks":   decoder_num_rand_blocks,
+        "embed_dim":            dna_config.hidden_size,
+        "encoder_num_layers":   dna_config.num_hidden_layers,
+        "encoder_num_heads":    dna_config.num_attention_heads,
+        "encoder_ff_dim":       dna_config.intermediate_size,
+        "decoder_num_layers":   decoder_num_layers,
+        "decoder_num_heads":    decoder_num_heads,
+        "decoder_num_kv_heads": decoder_num_kv_heads,
+        "decoder_ff_dim":       decoder_ff_dim,
+        "decoder_dropout":      decoder_dropout,
+        "decoder_use_alibi":    decoder_use_alibi,
+        "decoder_use_moe":      decoder_use_moe,
+        "decoder_num_experts":  decoder_num_experts,
+        "decoder_moe_top_k":    decoder_moe_top_k,
+        "vocab_size":           vocab_size,
+        "tie_weights":          tie_weights,
+        "encoder_block_size":   encoder_block_size,
+        "encoder_window_size":  encoder_window_size,
+        "decoder_block_size":   decoder_block_size,
+        "decoder_window_size":  decoder_window_size,
     }
     
     with open(save_path / "config.json", "w") as f:
