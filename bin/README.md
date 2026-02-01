@@ -97,7 +97,7 @@ python3 bin/resize_model.py model_path tokenizer_path
 ### Bake Data
 
 ```python3
-python -u bin/bake_data --raw_dir ../raw --output_dir ../baked --n_workers 15 --species_parallel 5 --tokenizer ../model/init --compact_target 30000 --compact_hard_limit 32768 2>&1 | tee ../logs/bake.log 
+python -u bin/bake_data --raw_dir ../raw --output_dir ../baked --n_workers 6 --species_parallel 3 --tokenizer ../model/init --compact_target 30000 --compact_hard_limit 32768 2>&1 | tee ../logs/bake.log 
 ```
 
 
@@ -128,8 +128,8 @@ After parse all datas, remember to run the compacting function.
 
 ```python3
 python -u bin/finet \
-  ../baked/33/train.bin \
-  ../baked/33/validation.bin \
+  ../baked/training.bin \
+  ../baked/validation.bin \
   ../model/trial1 \
   ../model/init \
   --epochs 4 \

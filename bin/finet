@@ -269,7 +269,8 @@ def main():
         print(f"  Step checkpoints: disabled (use --save_steps N to enable)")
 
     # Memory estimate
-    param_mem_gb = stats['total_params'] * 4 / 1e9  # float32
+    total_params = stats['total_trainable'] + stats['total_frozen']
+    param_mem_gb = total_params * 4 / 1e9  # float32
     grad_mem_gb = stats['total_trainable'] * 4 / 1e9
     optim_mem_gb = stats['total_trainable'] * 8 / 1e9  # Adam has 2 states per param
     if args.optim_8bit:
