@@ -268,15 +268,13 @@ class MoE(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.config               = config
-        self.embed_dim            = config.embed_dim
-        self.ff_dim               = config.ff_dim
-        self.num_experts          = config.num_experts
-        self.top_k                = config.top_k
-        self.capacity_factor      = config.capacity_factor
-        self.eval_capacity_factor = config.eval_capacity_factor
-        self.load_balance_weight  = config.load_balance_weight
-        self.router_z_weight      = config.router_z_loss_weight
+        self.config              = config
+        self.embed_dim           = config.embed_dim
+        self.ff_dim              = config.ff_dim
+        self.num_experts         = config.num_experts
+        self.top_k               = config.top_k
+        self.load_balance_weight = config.load_balance_weight
+        self.router_z_weight     = config.router_z_loss_weight
 
         self.gate           = nn.Linear(config.embed_dim, config.num_experts, bias=False)
         self.expert_weights = FusedExpertWeights(config.num_experts, config.embed_dim, config.ff_dim)
