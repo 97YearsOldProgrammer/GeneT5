@@ -327,6 +327,7 @@ def stream_write_compacted(
 
         chunk_order = sorted(group_assignments.keys())
         offsets     = []
+        written     = 0
 
         current_file_idx = -1
         current_chunks   = None

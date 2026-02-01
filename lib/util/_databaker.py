@@ -47,7 +47,6 @@ TAXA_CONFIG = {
     "Vertebrates": {
         "limit":   90000,
         "species": [
-            "Axolotl",
             "C.jacchus",
             "Chicken",
             "C.porcellus",
