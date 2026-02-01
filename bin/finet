@@ -16,8 +16,6 @@ import lib.model as mdl
 
 
 DEFAULTS = {
-    'max_input_len':  4096,
-    'max_target_len': 2048,
     'batch_size':     4,
     'lr':             1e-4,
     'epochs':         3,
@@ -49,10 +47,6 @@ def main():
         metavar='<int>', help='batch size [%(default)i]')
     parser.add_argument('--lr', required=False, type=float, default=DEFAULTS['lr'],
         metavar='<float>', help='learning rate [%(default)g]')
-    parser.add_argument('--max_input_len', required=False, type=int, default=DEFAULTS['max_input_len'],
-        metavar='<int>', help='max input length [%(default)i]')
-    parser.add_argument('--max_target_len', required=False, type=int, default=DEFAULTS['max_target_len'],
-        metavar='<int>', help='max target length [%(default)i]')
     parser.add_argument('--grad_accum', required=False, type=int, default=DEFAULTS['grad_accum'],
         metavar='<int>', help='gradient accumulation steps [%(default)i]')
     parser.add_argument('--weight_decay', required=False, type=float, default=DEFAULTS['weight_decay'],
@@ -128,14 +122,9 @@ def main():
     
     # load datasets
     print(f"\nLoading datasets...")
-    
-    train_dataset = ds.BinaryTrainDataset(
-        args.train_bin, tokenizer, args.max_input_len, args.max_target_len, args.seed
-    )
-    
-    val_dataset = ds.BinaryTrainDataset(
-        args.val_bin, tokenizer, args.max_input_len, args.max_target_len, args.seed
-    )
+
+    train_dataset = ds.BinaryTrainDataset(args.train_bin, tokenizer, args.seed)
+    val_dataset   = ds.BinaryTrainDataset(args.val_bin, tokenizer, args.seed)
     
     print(f"  Train: {len(train_dataset)}")
     print(f"  Val:   {len(val_dataset)}")

@@ -135,7 +135,7 @@ python -u bin/finet \
   --warmup_ratio 0.03 \
   --max_grad_norm 1.0 \
   --gradient_checkpointing \
-  --max_input_len 4096 \
-  --max_target_len 2048 \
+  --optim_8bit \
+  --label_smoothing 0.1 \
   2>&1 | tee ../logs/tune/1.log
 ```

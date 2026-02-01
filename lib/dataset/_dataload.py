@@ -96,14 +96,12 @@ class BinaryDatasetReader:
 class BinaryTrainDataset:
     """Dataset wrapper for binary training files"""
 
-    def __init__(self, binary_path, tokenizer, max_input_len, max_target_len, seed=42):
+    def __init__(self, binary_path, tokenizer, seed=42):
 
-        self.binary_path    = binary_path
-        self.tokenizer      = tokenizer
-        self.max_input_len  = max_input_len
-        self.max_target_len = max_target_len
-        self.seed           = seed
-        self.epoch          = 0
+        self.binary_path = binary_path
+        self.tokenizer   = tokenizer
+        self.seed        = seed
+        self.epoch       = 0
 
         self._info    = binary.get_binary_info(binary_path)
         self._length  = self._info["num_chunks"]
@@ -137,12 +135,6 @@ class BinaryTrainDataset:
         input_ids  = self.tokenizer.encode(sample["input_text"], add_special_tokens=False)
         target_ids = self.tokenizer.encode(sample["target_text"], add_special_tokens=False)
 
-        if len(input_ids) > self.max_input_len:
-            input_ids = input_ids[:self.max_input_len]
-
-        if len(target_ids) > self.max_target_len:
-            target_ids = target_ids[:self.max_target_len]
-
         return {
             "input_ids":      input_ids,
             "attention_mask": [1] * len(input_ids),
@@ -162,18 +154,10 @@ class BinaryTrainDataset:
 
         results = []
         for i in range(len(indices)):
-            input_ids  = input_enc["input_ids"][i]
-            target_ids = target_enc["input_ids"][i]
-
-            if len(input_ids) > self.max_input_len:
-                input_ids = input_ids[:self.max_input_len]
-            if len(target_ids) > self.max_target_len:
-                target_ids = target_ids[:self.max_target_len]
-
             results.append({
-                "input_ids":      input_ids,
-                "attention_mask": [1] * len(input_ids),
-                "labels":         target_ids,
+                "input_ids":      input_enc["input_ids"][i],
+                "attention_mask": [1] * len(input_enc["input_ids"][i]),
+                "labels":         target_enc["input_ids"][i],
                 "compact_group":  samples[i].get("compact_group"),
             })
 
