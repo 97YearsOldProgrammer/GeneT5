@@ -252,13 +252,15 @@ def _augment_chunk_batch(args):
     """Augment a batch of chunks with hints - for parallel execution"""
 
     chunk_batch, seed_offset = args
-    
+
     noiser    = nosing.GFFNoiser()
     augmented = []
 
     for i, chunk in enumerate(chunk_batch):
         random.seed(seed_offset + i)
-        hints, _, _ = noiser.noise_features(chunk.features, chunk.sequence)
+        hints, scenario, _ = noiser.noise_features(chunk.features, chunk.sequence)
+
+        has_hints = len(hints) > 0
 
         aug_chunk = binary.BinaryChunk(
             seqid        = chunk.seqid,
@@ -269,7 +271,7 @@ def _augment_chunk_batch(args):
             features     = chunk.features,
             biotype      = chunk.biotype,
             gene_ids     = chunk.gene_ids,
-            has_hints    = True,
+            has_hints    = has_hints,
             hints        = hints,
             chunk_index  = chunk.chunk_index,
             is_augmented = True,

@@ -17,6 +17,8 @@ parser.add_argument('--compact_target', required=True, type=int,
     metavar='<int>', help='target tokens per packed sequence')
 parser.add_argument('--hard_limit', required=False, type=int, default=None,
     metavar='<int>', help='hard limit for compacting (default: target * 1.1)')
+parser.add_argument('--max_input_tokens', required=False, type=int, default=None,
+    metavar='<int>', help='filter chunks exceeding this token count')
 parser.add_argument('--seed', required=False, type=int, default=42,
     metavar='<int>', help='random seed [%(default)i]')
 parser.add_argument('--file_parallel', required=False, type=int, default=1,
@@ -47,10 +49,12 @@ if not file_paths:
 hard_limit = args.hard_limit or int(args.compact_target * 1.1)
 
 print(f"\n  Configuration:")
-print(f"    Input files:   {len(file_paths)}")
-print(f"    Target length: {args.compact_target:,} tokens")
-print(f"    Hard limit:    {hard_limit:,} tokens")
-print(f"    File parallel: {args.file_parallel}")
+print(f"    Input files:      {len(file_paths)}")
+print(f"    Target length:    {args.compact_target:,} tokens")
+print(f"    Hard limit:       {hard_limit:,} tokens")
+if args.max_input_tokens:
+    print(f"    Max input tokens: {args.max_input_tokens:,} tokens")
+print(f"    File parallel:    {args.file_parallel}")
 
 
 # Extract metadata
@@ -62,6 +66,7 @@ phase1_start = time.time()
 metadata = ds.stream_extract_metadata(
     file_paths,
     file_parallel=args.file_parallel,
+    max_input_tokens=args.max_input_tokens,
 )
 
 phase1_time = time.time() - phase1_start

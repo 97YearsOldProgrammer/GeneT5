@@ -1128,3 +1128,5 @@ replication_start_site
 sequence_alteration_artifact
 sequence_comparison
 vault_rna
+intron_hc
+intron_lc

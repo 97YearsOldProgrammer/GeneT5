@@ -36,7 +36,7 @@ ChunkMeta = namedtuple('ChunkMeta', ['file_idx', 'chunk_idx', 'token_length', 'e
 def _process_single_file(args):
     """Process a single file and return its metadata"""
 
-    file_idx, file_path, block_size, isolation_pad = args
+    file_idx, file_path, block_size, isolation_pad, max_input_tokens = args
     from lib.dataset._binary import read_binary
 
     chunks = read_binary(file_path)
@@ -44,14 +44,20 @@ def _process_single_file(args):
     file_metadata = []
     raw_count     = 0
     aug_count     = 0
+    filtered_count = 0
 
     for chunk_idx, chunk in enumerate(chunks):
         if chunk.input_len is None:
             raise ValueError(f"Chunk {chunk_idx} in {file_path} missing input_len - run parse_data first")
 
         token_len = chunk.input_len
-        eff_len   = align_to_block(token_len, block_size) + isolation_pad
-        meta      = ChunkMeta(
+
+        if max_input_tokens and token_len > max_input_tokens:
+            filtered_count += 1
+            continue
+
+        eff_len = align_to_block(token_len, block_size) + isolation_pad
+        meta    = ChunkMeta(
             file_idx     = file_idx,
             chunk_idx    = chunk_idx,
             token_length = token_len,
@@ -68,7 +74,7 @@ def _process_single_file(args):
     chunk_count = len(chunks)
     del chunks
 
-    return file_idx, file_path.name, chunk_count, raw_count, aug_count, file_metadata
+    return file_idx, file_path.name, chunk_count, raw_count, aug_count, filtered_count, file_metadata
 
 
 def stream_extract_metadata(
@@ -76,12 +82,16 @@ def stream_extract_metadata(
     file_parallel=1,
     block_size=64,
     window_size=256,
+    max_input_tokens=None,
 ):
     """
     Phase 1: Stream through files, extract only metadata
 
     Memory: O(file_parallel * max_file_size) + O(n) for metadata
     Requires pre-tokenized data with input_len stored in chunks
+
+    Args:
+        max_input_tokens: Filter out chunks exceeding this token count (default: no filter)
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -90,14 +100,15 @@ def stream_extract_metadata(
 
     # Prepare arguments for each file
     work_items = [
-        (file_idx, file_path, block_size, isolation_pad)
+        (file_idx, file_path, block_size, isolation_pad, max_input_tokens)
         for file_idx, file_path in enumerate(file_paths)
     ]
 
-    all_metadata = []
-    total_chunks = 0
-    raw_count    = 0
-    aug_count    = 0
+    all_metadata    = []
+    total_chunks    = 0
+    raw_count       = 0
+    aug_count       = 0
+    filtered_count  = 0
 
     if file_parallel > 1:
         print(f"    Processing {file_parallel} files in parallel...\n")
@@ -107,13 +118,17 @@ def stream_extract_metadata(
             futures = {executor.submit(_process_single_file, item): item[0] for item in work_items}
 
             for future in as_completed(futures):
-                file_idx, file_name, chunk_count, file_raw, file_aug, file_metadata = future.result()
+                file_idx, file_name, chunk_count, file_raw, file_aug, file_filtered, file_metadata = future.result()
                 all_metadata.extend(file_metadata)
-                total_chunks += chunk_count
-                raw_count    += file_raw
-                aug_count    += file_aug
-                completed    += 1
-                print(f"    [{completed}/{total_files}] {file_name}: {chunk_count:,} chunks")
+                total_chunks   += chunk_count
+                raw_count      += file_raw
+                aug_count      += file_aug
+                filtered_count += file_filtered
+                completed      += 1
+                if file_filtered > 0:
+                    print(f"    [{completed}/{total_files}] {file_name}: {chunk_count:,} chunks ({file_filtered} filtered)")
+                else:
+                    print(f"    [{completed}/{total_files}] {file_name}: {chunk_count:,} chunks")
 
         all_metadata.sort(key=lambda m: (m.file_idx, m.chunk_idx))
 
@@ -122,17 +137,24 @@ def stream_extract_metadata(
             print(f"    [{file_idx + 1}/{total_files}] {file_path.name}...", end=' ', flush=True)
 
             result = _process_single_file(
-                (file_idx, file_path, block_size, isolation_pad)
+                (file_idx, file_path, block_size, isolation_pad, max_input_tokens)
             )
-            _, _, chunk_count, file_raw, file_aug, file_metadata = result
+            _, _, chunk_count, file_raw, file_aug, file_filtered, file_metadata = result
 
             all_metadata.extend(file_metadata)
-            total_chunks += chunk_count
-            raw_count    += file_raw
-            aug_count    += file_aug
-            print(f"{chunk_count:,} chunks")
+            total_chunks   += chunk_count
+            raw_count      += file_raw
+            aug_count      += file_aug
+            filtered_count += file_filtered
+
+            if file_filtered > 0:
+                print(f"{chunk_count:,} chunks ({file_filtered} filtered)")
+            else:
+                print(f"{chunk_count:,} chunks")
 
     print(f"\n  Total: {total_chunks:,} chunks (raw: {raw_count:,}, aug: {aug_count:,})")
+    if filtered_count > 0:
+        print(f"  Filtered: {filtered_count:,} chunks exceeding {max_input_tokens:,} tokens")
     print(f"  Metadata size: ~{len(all_metadata) * 40 / 1024 / 1024:.1f} MB")
 
     return all_metadata

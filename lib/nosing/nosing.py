@@ -1,9 +1,7 @@
 import random
 from dataclasses import dataclass, field
 
-import lib.nosing._exon    as exon
-import lib.nosing._intron  as intron
-import lib.nosing._protein as protein
+import lib.nosing._intron as intron
 
 
 ####################
@@ -13,14 +11,13 @@ import lib.nosing._protein as protein
 
 @dataclass
 class NoisingConfig:
-    """Configuration for GFF noising during training"""
+    """Configuration for intron-focused hint generation"""
 
     scenario_weights: dict = field(default_factory=lambda: {
-        'full_mix':    0.40,
-        'intron_only': 0.25,
-        'cds_only':    0.20,
-        'degraded':    0.10,
-        'ab_initio':   0.05,
+        'intron_rich':    0.40,
+        'intron_sparse':  0.30,
+        'intron_noisy':   0.20,
+        'intron_minimal': 0.10,
     })
 
     intron_drop_base:        float = 0.10
@@ -31,21 +28,8 @@ class NoisingConfig:
     intron_min_length:       int   = 20
     intron_max_length:       int   = 50000
 
-    cds_jitter_sigma:      float = 20.0
-    cds_truncate_5_prob:   float = 0.12
-    cds_truncate_3_prob:   float = 0.10
-    cds_truncate_5_max:    int   = 60
-    cds_truncate_3_max:    int   = 45
-    cds_frameshift_prob:   float = 0.02
-    cds_wrong_strand_prob: float = 0.28
-
-    exon_boundary_lambda: float = 0.1
-    exon_boundary_max:    int   = 50
-    exon_merge_prob:      float = 0.02
-    exon_drop_prob:       float = 0.05
-
-    degraded_drop_mult:  float = 3.0
-    degraded_noise_mult: float = 2.0
+    max_hints:            int = 300
+    complexity_threshold: int = 500
 
 
 #######################
@@ -53,206 +37,202 @@ class NoisingConfig:
 #######################
 
 
-def select_scenario(config):
-    """Select a noise scenario based on configured weights"""
+def select_scenario(config, feature_count=0):
+    """Select scenario based on weights and complexity"""
+
+    if feature_count > config.complexity_threshold:
+        return 'intron_minimal'
 
     weights   = config.scenario_weights
     scenarios = list(weights.keys())
     probs     = [weights[s] for s in scenarios]
+
     return random.choices(scenarios, weights=probs, k=1)[0]
 
 
 class GFFNoiser:
-    """Noiser for generating training hints from GFF features"""
+    """Intron-focused noiser for training hints"""
 
     def __init__(self, config=None):
 
         self.config = config or NoisingConfig()
 
-    def extract_features_by_type(self, features):
-        """Separate features into exons and CDS"""
+    def extract_exons(self, features):
+        """Extract exons from features"""
 
-        exons    = []
-        cds_list = []
+        exons = []
 
         for feat in features:
             ftype = feat.get("type", "").lower()
             if ftype == "exon":
                 exons.append(feat)
-            elif ftype == "cds":
-                cds_list.append(feat)
 
-        return exons, cds_list
+        return exons
 
     def noise_features(self, features, sequence, scenario=None):
-        """Apply noise to features based on scenario"""
+        """Generate intron hints based on scenario"""
+
+        exons        = self.extract_exons(features)
+        feature_count = len(features)
 
         if scenario is None:
-            scenario = select_scenario(self.config)
-
-        exons, cds_features = self.extract_features_by_type(features)
-        hints               = []
-        degraded            = (scenario == "degraded")
+            scenario = select_scenario(self.config, feature_count)
 
         noise_log = {
-            "scenario":       scenario,
-            "original_exons": len(exons),
-            "original_cds":   len(cds_features),
+            "scenario":        scenario,
+            "original_exons":  len(exons),
+            "feature_count":   feature_count,
         }
 
-        if scenario == "ab_initio" or scenario == "empty":
-            noise_log["hint_introns"] = 0
-            noise_log["hint_exons"]   = 0
-            noise_log["hint_cds"]     = 0
+        if scenario == "ab_initio":
+            noise_log["intron_hc"] = 0
+            noise_log["intron_lc"] = 0
             return [], scenario, noise_log
 
-        if scenario == "perfect":
-            hints = [f.copy() for f in features]
-            noise_log["hint_introns"] = len([h for h in hints if h.get("type", "").lower() == "intron"])
-            noise_log["hint_exons"]   = len([h for h in hints if h.get("type", "").lower() == "exon"])
-            noise_log["hint_cds"]     = len([h for h in hints if h.get("type", "").lower() == "cds"])
-            return hints, scenario, noise_log
+        strand       = exons[0]["strand"] if exons else "+"
+        real_introns = intron.compute_introns_from_exons(exons, strand)
 
-        if scenario == "good":
-            hints = self._apply_good_noise(exons, cds_features)
-            noise_log["hint_introns"] = len([h for h in hints if h.get("type", "").lower() == "intron"])
-            noise_log["hint_exons"]   = len([h for h in hints if h.get("type", "").lower() == "exon"])
-            noise_log["hint_cds"]     = len([h for h in hints if h.get("type", "").lower() == "cds"])
-            return hints, scenario, noise_log
+        if scenario == "intron_rich":
+            hints = self._generate_rich_hints(real_introns, exons, sequence)
 
-        if scenario == "bad":
-            hints = self._apply_bad_noise(exons, cds_features, sequence)
-            noise_log["hint_introns"] = len([h for h in hints if h.get("type", "").lower() == "intron"])
-            noise_log["hint_exons"]   = len([h for h in hints if h.get("type", "").lower() == "exon"])
-            noise_log["hint_cds"]     = len([h for h in hints if h.get("type", "").lower() == "cds"])
-            return hints, scenario, noise_log
+        elif scenario == "intron_sparse":
+            hints = self._generate_sparse_hints(real_introns, exons, sequence)
 
-        if scenario in ("full_mix", "intron_only", "degraded"):
-            strand       = exons[0]["strand"] if exons else "+"
-            real_introns = intron.compute_introns_from_exons(exons, strand)
-            hint_introns = intron.noise_real_introns(real_introns, exons, self.config, degraded)
-            hints.extend(hint_introns)
+        elif scenario == "intron_noisy":
+            hints = self._generate_noisy_hints(real_introns, exons, sequence)
 
-            fake_introns = intron.generate_fake_introns(sequence, real_introns, features, self.config)
-            hints.extend(fake_introns)
+        elif scenario == "intron_minimal":
+            hints = self._generate_minimal_hints(real_introns, exons)
 
-            noise_log["hint_introns"] = len([h for h in hints if h["type"] == "intron"])
+        else:
+            hints = self._generate_sparse_hints(real_introns, exons, sequence)
 
-        if scenario in ("full_mix", "cds_only", "degraded"):
-            hint_exons = exon.noise_real_exons(exons, self.config, degraded)
-            hints.extend(hint_exons)
+        if len(hints) > self.config.max_hints:
+            hints = random.sample(hints, self.config.max_hints)
 
-            fake_exon = exon.generate_fake_exon(sequence, features, self.config)
-            if fake_exon and random.random() < 0.05:
-                hints.append(fake_exon)
-
-            hint_cds = protein.noise_real_cds(cds_features, self.config, degraded)
-            hints.extend(hint_cds)
-
-            fake_cds = protein.generate_fake_cds(sequence, features, self.config)
-            if fake_cds and random.random() < 0.03:
-                hints.append(fake_cds)
-
-            noise_log["hint_exons"] = len([h for h in hints if h.get("type", "").lower() == "exon"])
-            noise_log["hint_cds"]   = len([h for h in hints if h.get("type", "").lower() == "cds"])
+        noise_log["intron_hc"] = sum(1 for h in hints if h["type"] == "intron_hc")
+        noise_log["intron_lc"] = sum(1 for h in hints if h["type"] == "intron_lc")
 
         return hints, scenario, noise_log
 
-    def _apply_good_noise(self, exons, cds_features):
-        """Apply light noise for good quality hints"""
+    def _generate_rich_hints(self, real_introns, exons, sequence):
+        """Deep RNA-seq simulation: many high-confidence intron hints"""
 
-        hints  = []
-        strand = exons[0]["strand"] if exons else "+"
+        hints    = []
+        drop_rate = 0.05
 
-        real_introns = intron.compute_introns_from_exons(exons, strand)
         for intr in real_introns:
-            if random.random() < 0.05:
-                continue
-            hints.append(intr.copy())
-
-        for ex in exons:
-            if random.random() < 0.05:
+            if random.random() < drop_rate:
                 continue
 
-            jitter_start = int(random.gauss(0, 5))
-            jitter_end   = int(random.gauss(0, 5))
+            if intron.drop_intron_by_anchor(intr, exons, self.config):
+                if random.random() < 0.7:
+                    continue
 
             hints.append({
-                "type":   "exon",
-                "start":  max(1, ex["start"] + jitter_start),
-                "end":    ex["end"] + jitter_end,
-                "strand": ex["strand"],
+                "type":   "intron_hc",
+                "start":  intr["start"],
+                "end":    intr["end"],
+                "strand": intr["strand"],
             })
 
-        for cds in cds_features:
-            jitter_start = int(random.gauss(0, 5))
-            jitter_end   = int(random.gauss(0, 5))
-            jitter_start = (jitter_start // 3) * 3
-            jitter_end   = (jitter_end // 3) * 3
-
-            hints.append({
-                "type":   "CDS",
-                "start":  max(1, cds["start"] + jitter_start),
-                "end":    cds["end"] + jitter_end,
-                "strand": cds["strand"],
-                "phase":  cds.get("phase", "."),
-            })
+        fake_introns = intron.generate_fake_introns(
+            sequence, real_introns, exons, self.config
+        )
+        for fake in fake_introns:
+            fake["type"] = "intron_lc"
+            hints.append(fake)
 
         return hints
 
-    def _apply_bad_noise(self, exons, cds_features, sequence):
-        """Apply heavy noise for bad quality hints"""
+    def _generate_sparse_hints(self, real_introns, exons, sequence):
+        """Shallow RNA-seq simulation: mix of hc and lc introns"""
 
-        hints  = []
-        strand = exons[0]["strand"] if exons else "+"
+        hints     = []
+        drop_rate = 0.20
 
-        real_introns = intron.compute_introns_from_exons(exons, strand)
         for intr in real_introns:
-            if random.random() < 0.30:
-                continue
-            hints.append(intr.copy())
-
-        for ex in exons:
-            if random.random() < 0.30:
+            if random.random() < drop_rate:
                 continue
 
-            jitter_start = int(random.gauss(0, 30))
-            jitter_end   = int(random.gauss(0, 30))
+            if intron.drop_intron_by_anchor(intr, exons, self.config):
+                continue
+
+            if random.random() < 0.7:
+                hint_type = "intron_hc"
+            else:
+                hint_type = "intron_lc"
 
             hints.append({
-                "type":   "exon",
-                "start":  max(1, ex["start"] + jitter_start),
-                "end":    ex["end"] + jitter_end,
-                "strand": ex["strand"],
+                "type":   hint_type,
+                "start":  intr["start"],
+                "end":    intr["end"],
+                "strand": intr["strand"],
             })
 
-        for cds in cds_features:
-            if random.random() < 0.15:
+        fake_count = max(1, int(len(real_introns) * 0.05))
+        fake_introns = intron.generate_fake_introns(
+            sequence, real_introns, exons, self.config
+        )[:fake_count]
+
+        for fake in fake_introns:
+            fake["type"] = "intron_lc"
+            hints.append(fake)
+
+        return hints
+
+    def _generate_noisy_hints(self, real_introns, exons, sequence):
+        """Degraded RNA-seq simulation: mostly lc with more fakes"""
+
+        hints     = []
+        drop_rate = 0.35
+
+        for intr in real_introns:
+            if random.random() < drop_rate:
                 continue
 
-            jitter_start = int(random.gauss(0, 30))
-            jitter_end   = int(random.gauss(0, 30))
+            if intron.drop_intron_by_anchor(intr, exons, self.config):
+                continue
+
+            if random.random() < 0.3:
+                hint_type = "intron_hc"
+            else:
+                hint_type = "intron_lc"
 
             hints.append({
-                "type":   "CDS",
-                "start":  max(1, cds["start"] + jitter_start),
-                "end":    cds["end"] + jitter_end,
-                "strand": cds["strand"],
-                "phase":  cds.get("phase", "."),
+                "type":   hint_type,
+                "start":  intr["start"],
+                "end":    intr["end"],
+                "strand": intr["strand"],
             })
 
-        all_features = exons + cds_features
-        if all_features and random.random() < 0.15:
-            max_pos    = max(f["end"] for f in all_features)
-            fake_start = random.randint(1, max(1, max_pos - 200))
-            fake_end   = fake_start + random.randint(50, 200)
+        fake_count = max(2, int(len(real_introns) * 0.10))
+        for _ in range(fake_count):
+            strand = random.choice(["+", "-"])
+            fake   = intron.generate_fake_intron(sequence, exons, self.config, strand)
+            if fake:
+                fake["type"] = "intron_lc"
+                hints.append(fake)
 
+        return hints
+
+    def _generate_minimal_hints(self, real_introns, exons):
+        """Very sparse hints: few introns only"""
+
+        if not real_introns:
+            return []
+
+        keep_count = max(1, int(len(real_introns) * 0.15))
+        selected   = random.sample(real_introns, min(keep_count, len(real_introns)))
+
+        hints = []
+
+        for intr in selected:
             hints.append({
-                "type":   random.choice(["exon", "intron", "CDS"]),
-                "start":  fake_start,
-                "end":    fake_end,
-                "strand": random.choice(["+", "-"]),
-                "fake":   True,
+                "type":   "intron_hc",
+                "start":  intr["start"],
+                "end":    intr["end"],
+                "strand": intr["strand"],
             })
 
         return hints
