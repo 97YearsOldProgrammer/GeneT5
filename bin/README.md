@@ -57,13 +57,13 @@ For sake of saving life, please use the [bake_data_wrapper](run_bake_data.py) in
 python3 bin/run_bake_data.py H.archaea E.coli --limit 9000 --threshold 50000
 ```
 
-| Taxa           | Limit    | Token Est. (@4.5bp) 
-| :------------: | :------: | :------------------
-| Prokaryotes    | 9,000    | ~2k                 
-| Unicellular    | 22,500   | ~5k                 
-| Invertebrates  | 45,000   | ~10k                
-| Vertebrates    | 90,000   | ~20k                
-| Plants         | 45,000   | ~10k                
+| Taxa           | Limit    | Token Est. (@4.5bp) | Avg
+| :------------: | :------: | :-----------------: | :------------
+| Prokaryotes    | 10000    | ~2.2k               | 9000bps  = ~P99+ (no introns, avg 924 bp)
+| Unicellular    | 15000    | ~3.3k               | 15000bps = ~P95+ (yeast genes avg ~1.5 kb)
+| Invertebrates  | 30000    | ~6.6k               | 25000bps = ~P90 (Drosophila genes ~2-10 kb)
+| Vertebrates    | 40000    | ~8.8k               | 30000bps = ~P75 (median 23 kb, many >30kb)
+| Plants         | 30000    | ~6.6k               | 25000bps = ~P85-90 
 
 
 ---
@@ -97,7 +97,7 @@ python3 bin/resize_model.py model_path tokenizer_path
 ### Bake Data
 
 ```python3
-python -u bin/bake_data --raw_dir ../raw --output_dir ../baked --n_workers 6 --species_parallel 3 --tokenizer ../model/init --compact_target 30000 --compact_hard_limit 32768 2>&1 | tee ../logs/bake.log 
+python -u bin/bake_data --raw_dir ../raw --output_dir ../baked --n_workers 6 --species_parallel 3 --tokenizer ../model/init 2>&1 | tee ../logs/bake.log 
 ```
 
 

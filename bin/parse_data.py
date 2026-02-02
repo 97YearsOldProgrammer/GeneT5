@@ -70,6 +70,7 @@ validation = ds.build_validation_set(
     args.num_normal,
     args.num_easy,
     args.seed,
+    args.limit,
 )
 
 print(f"  Validation genes:     {len(validation['all_ids'])}")

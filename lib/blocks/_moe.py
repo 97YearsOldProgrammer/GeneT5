@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import torch
@@ -30,7 +29,9 @@ class MoEConfig:
 def _check_triton_support():
     """Check if Triton MoE is supported on current hardware
 
-    Fused Triton kernel is ~1.18x faster than PyTorch on GB10.
+    Auto-selects backend based on num_experts:
+    - num_experts >= 32: Triton (1.1-1.2x faster)
+    - num_experts < 32:  PyTorch (faster due to lower kernel overhead)
     Set GENET5_DISABLE_TRITON=1 to force PyTorch fallback.
     """
 
@@ -74,13 +75,14 @@ def fused_expert_kernel_v2(
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """Two-phase fused expert kernel for large ff_dim.
+    """Two-phase fused expert kernel for large ff_dim
 
     Phase 0: Compute hidden = silu(x @ gate_w) * (x @ up_w), store to Hidden_ptr
     Phase 1: Compute out = hidden @ down_w, atomic add to Out_ptr
 
     This allows processing large ff_dim in tiles.
     """
+
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
@@ -101,7 +103,7 @@ def fused_expert_kernel_v2(
         mask_n = offs_n < ff_dim
 
         gate_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        up_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        up_acc   = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
         for k_start in range(0, embed_dim, BLOCK_K):
             k_offs = k_start + offs_k
@@ -113,14 +115,14 @@ def fused_expert_kernel_v2(
 
             # Load gate_w: [BLOCK_K, BLOCK_N]
             gw_ptrs = Gate_W_ptr + k_offs[:, None] * stride_gw_d + offs_n[None, :] * stride_gw_f
-            gate_w = tl.load(gw_ptrs, mask=k_mask[:, None] & mask_n[None, :], other=0.0)
+            gate_w  = tl.load(gw_ptrs, mask=k_mask[:, None] & mask_n[None, :], other=0.0)
 
             # Load up_w: [BLOCK_K, BLOCK_N]
             uw_ptrs = Up_W_ptr + k_offs[:, None] * stride_uw_d + offs_n[None, :] * stride_uw_f
-            up_w = tl.load(uw_ptrs, mask=k_mask[:, None] & mask_n[None, :], other=0.0)
+            up_w    = tl.load(uw_ptrs, mask=k_mask[:, None] & mask_n[None, :], other=0.0)
 
             gate_acc += tl.dot(x_tile, gate_w)
-            up_acc += tl.dot(x_tile, up_w)
+            up_acc   += tl.dot(x_tile, up_w)
 
         # silu(gate) * up
         hidden = (gate_acc * tl.sigmoid(gate_acc)) * up_acc
@@ -131,7 +133,7 @@ def fused_expert_kernel_v2(
 
     else:
         # Phase 1: hidden @ down_w -> out (with atomic add)
-        mask_n = offs_n < embed_dim
+        mask_n        = offs_n < embed_dim
         token_weights = tl.load(token_weights_ptr + offs_m, mask=mask_m, other=0.0)
 
         out_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
@@ -146,97 +148,21 @@ def fused_expert_kernel_v2(
 
             # Load down_w: [BLOCK_K, BLOCK_N]
             dw_ptrs = Down_W_ptr + k_offs[:, None] * stride_dw_f + offs_n[None, :] * stride_dw_d
-            down_w = tl.load(dw_ptrs, mask=k_mask[:, None] & mask_n[None, :], other=0.0)
+            down_w  = tl.load(dw_ptrs, mask=k_mask[:, None] & mask_n[None, :], other=0.0)
 
             out_acc += tl.dot(h_tile, down_w)
 
         # Apply weights and atomic add
         out_weighted = out_acc * token_weights[:, None]
-        out_ptrs = Out_ptr + token_indices[:, None] * stride_o_t + offs_n[None, :] * stride_o_d
+        out_ptrs     = Out_ptr + token_indices[:, None] * stride_o_t + offs_n[None, :] * stride_o_d
         tl.atomic_add(out_ptrs, out_weighted, mask=mask_m[:, None] & mask_n[None, :])
-
-
-@triton.jit
-def expert_gemm_tiled_kernel(
-    X_ptr, W_ptr, Out_ptr,
-    token_indices_ptr, token_weights_ptr,
-    num_tokens, in_dim, out_dim,
-    stride_x_t, stride_x_d,
-    stride_w_in, stride_w_out,
-    stride_o_t, stride_o_d,
-    apply_weights: tl.constexpr,
-    use_atomic: tl.constexpr,
-    use_sequential_output: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    """Tiled GEMM kernel for expert computation
-
-    Computes: Out[output_idx] += (X[token_indices] @ W) * weights
-    where output_idx is either token_indices or sequential (0, 1, 2, ...)
-    Uses proper tiled matrix multiplication for efficiency.
-    """
-
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    m_start = pid_m * BLOCK_M
-    n_start = pid_n * BLOCK_N
-
-    offs_m = m_start + tl.arange(0, BLOCK_M)
-    offs_n = n_start + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-
-    mask_m = offs_m < num_tokens
-    mask_n = offs_n < out_dim
-
-    # Load token indices for input reads
-    token_indices = tl.load(token_indices_ptr + offs_m, mask=mask_m, other=0)
-
-    # Initialize accumulator
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-    # Tiled matrix multiplication
-    for k_start in range(0, in_dim, BLOCK_K):
-        k_offs = k_start + offs_k
-        k_mask = k_offs < in_dim
-
-        # Load X tile: [BLOCK_M, BLOCK_K]
-        x_ptrs = X_ptr + token_indices[:, None] * stride_x_t + k_offs[None, :] * stride_x_d
-        x_tile = tl.load(x_ptrs, mask=mask_m[:, None] & k_mask[None, :], other=0.0)
-
-        # Load W tile: [BLOCK_K, BLOCK_N]
-        w_ptrs = W_ptr + k_offs[:, None] * stride_w_in + offs_n[None, :] * stride_w_out
-        w_tile = tl.load(w_ptrs, mask=k_mask[:, None] & mask_n[None, :], other=0.0)
-
-        # Accumulate: [BLOCK_M, BLOCK_K] @ [BLOCK_K, BLOCK_N]
-        acc += tl.dot(x_tile, w_tile)
-
-    # Apply routing weights if needed
-    if apply_weights:
-        weights = tl.load(token_weights_ptr + offs_m, mask=mask_m, other=0.0)
-        acc     = acc * weights[:, None]
-
-    # Determine output indices: either token_indices or sequential
-    if use_sequential_output:
-        out_indices = offs_m
-    else:
-        out_indices = token_indices
-
-    # Store results
-    out_ptrs = Out_ptr + out_indices[:, None] * stride_o_t + offs_n[None, :] * stride_o_d
-
-    if use_atomic:
-        tl.atomic_add(out_ptrs, acc, mask=mask_m[:, None] & mask_n[None, :])
-    else:
-        tl.store(out_ptrs, acc, mask=mask_m[:, None] & mask_n[None, :])
 
 
 class FusedExpertWeights(nn.Module):
     """Fused expert weights for batched computation"""
 
     def __init__(self, num_experts, embed_dim, ff_dim):
+
         super().__init__()
 
         self.num_experts = num_experts
@@ -250,6 +176,7 @@ class FusedExpertWeights(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
+
         std = 0.02
         nn.init.normal_(self.gate_weights, std=std)
         nn.init.normal_(self.up_weights, std=std)
@@ -258,14 +185,15 @@ class FusedExpertWeights(nn.Module):
 
 class MoE(nn.Module):
     """Mixture of Experts with fused Triton kernels
-    
-    Fixed issues:
-    - Race condition with top-k > 1 using atomic operations
-    - Proper tiled GEMM for efficiency
-    - Removed dead code (Router class, unused kernel)
+
+    Features:
+    - Two-phase fused kernel (gate+up+silu -> hidden, hidden @ down -> out)
+    - Atomic operations for correct top-k > 1 handling
+    - Token sorting by expert for efficient batching
     """
 
     def __init__(self, config):
+
         super().__init__()
 
         self.config              = config
@@ -306,12 +234,10 @@ class MoE(nn.Module):
         Uses two-phase approach:
         Phase 0: gate + up + silu*mul -> hidden buffer
         Phase 1: hidden @ down -> atomic add to output
-
-        Reduces kernel launches from 96 (32 experts * 3) to 64 (32 * 2)
         """
 
         num_tokens, embed_dim = x_flat.shape
-        device = x_flat.device
+        device                = x_flat.device
 
         sorted_experts, sorted_tokens, sorted_weights, expert_offsets, expert_counts = \
             self._prepare_expert_batches(top_k_indices, top_k_probs, num_tokens, device)
@@ -322,7 +248,7 @@ class MoE(nn.Module):
             return output
 
         gate_w = self.expert_weights.gate_weights
-        up_w = self.expert_weights.up_weights
+        up_w   = self.expert_weights.up_weights
         down_w = self.expert_weights.down_weights
 
         # Block sizes
@@ -338,7 +264,7 @@ class MoE(nn.Module):
 
         for expert_id in range(self.num_experts):
             start = expert_offsets[expert_id].item()
-            end = expert_offsets[expert_id + 1].item()
+            end   = expert_offsets[expert_id + 1].item()
             count = end - start
 
             if count == 0:
@@ -346,10 +272,10 @@ class MoE(nn.Module):
 
             expert_token_indices = sorted_tokens[start:end]
             expert_weights_slice = sorted_weights[start:end]
-            hidden = hidden_buffer[:count]
+            hidden               = hidden_buffer[:count]
 
-            grid_m = (count + BLOCK_M - 1) // BLOCK_M
-            grid_n_ff = (self.ff_dim + BLOCK_N - 1) // BLOCK_N
+            grid_m       = (count + BLOCK_M - 1) // BLOCK_M
+            grid_n_ff    = (self.ff_dim + BLOCK_N - 1) // BLOCK_N
             grid_n_embed = (embed_dim + BLOCK_N - 1) // BLOCK_N
 
             # Phase 0: gate + up + silu*mul -> hidden
@@ -393,7 +319,7 @@ class MoE(nn.Module):
         return output
 
     def _forward_pytorch(self, x_flat, top_k_indices, top_k_probs):
-        """Optimized loop-based PyTorch - fastest for current hardware"""
+        """Optimized loop-based PyTorch fallback"""
 
         num_tokens, embed_dim = x_flat.shape
         device                = x_flat.device
@@ -428,7 +354,9 @@ class MoE(nn.Module):
 
         return output
 
+
     def forward(self, x):
+
         batch_size, seq_len, embed_dim = x.shape
         num_tokens                     = batch_size * seq_len
         x_flat                         = x.view(num_tokens, embed_dim)
@@ -438,12 +366,16 @@ class MoE(nn.Module):
         top_k_probs, top_k_indices = torch.topk(router_probs, self.top_k, dim=-1)
         top_k_probs                = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
 
-        # Use Triton fused path when available, fall back to PyTorch
-        if self._triton_supported and x_flat.is_cuda:
+        # Use Triton for many experts (32+), PyTorch for fewer
+        # Benchmarks on GB10 show PyTorch is faster for typical configs
+        use_triton = (self._triton_supported and
+                      x_flat.is_cuda and
+                      self.num_experts >= 32)
+
+        if use_triton:
             try:
                 output = self._forward_triton_fused(x_flat, top_k_indices, top_k_probs)
             except Exception:
-                # Reset CUDA state after error and fall back to PyTorch
                 torch.cuda.synchronize()
                 self._triton_supported = False
                 output = self._forward_pytorch(x_flat, top_k_indices, top_k_probs)

@@ -11,7 +11,7 @@ import lib.dataset as ds
 
 TAXA_CONFIG = {
     "Prokaryotes": {
-        "limit":   9000,
+        "limit":   10000,
         "species": [
             "E.coli",
             "B.subtilis",
@@ -22,7 +22,7 @@ TAXA_CONFIG = {
         ],
     },
     "Unicellular": {
-        "limit":   22500,
+        "limit":   15000,
         "species": [
             "S.cerevisiae",
             "S.pombe",
@@ -33,7 +33,7 @@ TAXA_CONFIG = {
         ],
     },
     "Invertebrates": {
-        "limit":   45000,
+        "limit":   30000,
         "species": [
             "C.elegan",
             "Fly",
@@ -45,7 +45,7 @@ TAXA_CONFIG = {
         ],
     },
     "Vertebrates": {
-        "limit":   90000,
+        "limit":   40000,
         "species": [
             "C.jacchus",
             "Chicken",
@@ -59,7 +59,7 @@ TAXA_CONFIG = {
         ],
     },
     "Plants": {
-        "limit":   45000,
+        "limit":   30000,
         "species": [
             "Earthmoss",
             "Maize",
@@ -131,7 +131,7 @@ def find_genome_files(species_dir):
 #################################
 
 
-def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_dir, token_file=None, tokenizer_path=None, n_workers=1):
+def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_dir, token_file=None, tokenizer_path=None, n_workers=1, num_complex=5, num_normal=5, num_easy=5):
     """Run parse_data.py for a single species"""
 
     cmd = [
@@ -141,6 +141,9 @@ def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_di
         str(output_dir),
         "--limit", str(limit),
         "--n_workers", str(n_workers),
+        "--num_complex", str(num_complex),
+        "--num_normal", str(num_normal),
+        "--num_easy", str(num_easy),
     ]
 
     if token_file:
@@ -217,7 +220,7 @@ def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_di
 def process_species(args):
     """Worker function for parallel species processing"""
 
-    species_name, raw_dir, baked_dir, log_dir, limit, token_file, tokenizer_path, n_workers = args
+    species_name, raw_dir, baked_dir, log_dir, limit, token_file, tokenizer_path, n_workers, num_complex, num_normal, num_easy = args
 
     species_raw_dir = pathlib.Path(raw_dir) / species_name
 
@@ -241,7 +244,7 @@ def process_species(args):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     return run_parse_data(
-        species_name, fasta_file, gff_file, output_dir, limit, log_dir, token_file, tokenizer_path, n_workers
+        species_name, fasta_file, gff_file, output_dir, limit, log_dir, token_file, tokenizer_path, n_workers, num_complex, num_normal, num_easy
     )
 
 

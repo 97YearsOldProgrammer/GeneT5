@@ -420,3 +420,20 @@ def build_segment_mask(segment_starts, segment_ends, seq_len):
             segment_ids[pos] = seg_idx
 
     return segment_ids
+
+
+def build_loss_labels(input_ids, segment_ids):
+    """
+    Build labels for loss computation with padding/separator masked
+
+    Positions with segment_id == -1 (padding, separator) get label -100,
+    which PyTorch CrossEntropyLoss ignores during gradient computation.
+    """
+
+    labels = list(input_ids)
+
+    for pos, seg_id in enumerate(segment_ids):
+        if seg_id == -1:
+            labels[pos] = -100
+
+    return labels

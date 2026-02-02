@@ -28,12 +28,18 @@ parser.add_argument("--n_workers",  type=int, default=None,
     help="Workers per species for chunking [auto]")
 parser.add_argument("--tokenizer",  type=str, required=True,
     help="Tokenizer path (required for tokenization)")
-parser.add_argument("--compact_target",     type=int, default=8192,
+parser.add_argument("--compact_target",     type=int, default=15000,
     help="Target tokens for compacting [%(default)s]")
-parser.add_argument("--compact_hard_limit", type=int, default=None,
+parser.add_argument("--compact_hard_limit", type=int, default=16500,
     help="Hard limit for compacting (default: target * 1.1)")
-parser.add_argument("--compact_file_parallel", type=int, default=2,
+parser.add_argument("--compact_file_parallel", type=int, default=5,
     help="Files to process in parallel during compacting [%(default)s]")
+parser.add_argument("--num_complex", type=int, default=7,
+    help="Number of complex genes for validation per species [%(default)s]")
+parser.add_argument("--num_normal",  type=int, default=7,
+    help="Number of normal genes for validation per species [%(default)s]")
+parser.add_argument("--num_easy",    type=int, default=7,
+    help="Number of easy genes for validation per species [%(default)s]")
 parser.add_argument("--keep_temp",  action="store_true",
     help="Keep temporary per-species files (for debugging)")
 
@@ -78,7 +84,7 @@ for taxa, info in taxa_counts.items():
 
 # Process species - output to temp directory
 work_items = [
-    (sp, raw_dir, temp_dir, log_dir, limit, None, args.tokenizer, n_workers_per_species)
+    (sp, raw_dir, temp_dir, log_dir, limit, None, args.tokenizer, n_workers_per_species, args.num_complex, args.num_normal, args.num_easy)
     for sp, limit, taxa in species_to_process
 ]
 

@@ -227,12 +227,37 @@ def build_scenarios(gene_id, gene_data, seed=42):
 
 def build_validation_set(
     gene_groups,
-    num_complex = 5,
-    num_normal  = 5,
-    num_easy    = 5,
-    seed        = 42,
+    num_complex     = 5,
+    num_normal      = 5,
+    num_easy        = 5,
+    seed            = 42,
+    max_gene_length = None,
 ):
-    """Build validation set: 50% ab initio, 50% hinted per gene category"""
+    """
+    Build validation set: 50% ab initio, 50% hinted per gene category
+
+    Filters genes by max_gene_length FIRST, then selects by complexity
+    """
+
+    # Filter genes by length before selection
+    if max_gene_length is not None:
+        filtered_groups = {}
+        filtered_count  = 0
+
+        for gene_id, gene_data in gene_groups.items():
+            gene_start = gene_data.get("start", 0)
+            gene_end   = gene_data.get("end", 0)
+            gene_len   = gene_end - gene_start + 1
+
+            if gene_len <= max_gene_length:
+                filtered_groups[gene_id] = gene_data
+            else:
+                filtered_count += 1
+
+        if filtered_count > 0:
+            print(f"  Filtered {filtered_count} genes exceeding {max_gene_length} bp")
+
+        gene_groups = filtered_groups
 
     complexity_cache = compute_all_complexities(gene_groups)
 
