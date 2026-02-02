@@ -5,6 +5,7 @@ import torch
 
 import lib.dataset._binary     as binary
 import lib.dataset._compacting as compacting
+import lib.dataset._packed     as packed
 
 
 #################
@@ -496,3 +497,95 @@ class CompactGroupSampler:
     def __len__(self):
 
         return len(self.group_ids)
+
+
+###############################
+#####  Packed Dataset     #####
+###############################
+
+
+class PackedTrainDataset:
+    """
+    Dataset for pre-packed training data
+
+    Streams pre-packed samples directly - no runtime packing overhead.
+    Each sample contains multiple segments already concatenated with isolation padding.
+    """
+
+    def __init__(self, packed_path, seed=42):
+
+        self.packed_path = packed_path
+        self.seed        = seed
+        self.epoch       = 0
+
+        self._info   = packed.get_packed_info(packed_path)
+        self._length = self._info["num_samples"]
+
+    def set_epoch(self, epoch):
+
+        self.epoch = epoch
+
+    def __len__(self):
+
+        return self._length
+
+    def __getitem__(self, idx):
+
+        sample = packed.read_packed_at_index(self.packed_path, idx)
+
+        return {
+            "input_ids":       sample.input_ids,
+            "labels":          sample.labels,
+            "segment_ids":     sample.segment_ids,
+            "segment_starts":  sample.segment_starts,
+            "segment_ends":    sample.segment_ends,
+            "num_segments":    sample.num_segments,
+        }
+
+
+class PackedCollator:
+    """
+    Simple collator for pre-packed samples
+
+    Just pads to max length in batch - no complex packing logic needed.
+    """
+
+    def __init__(self, pad_token_id, label_pad=-100):
+
+        self.pad_token_id = pad_token_id
+        self.label_pad    = label_pad
+
+    def __call__(self, batch):
+
+        max_input_len = max(len(b["input_ids"]) for b in batch)
+        max_label_len = max(len(b["labels"]) for b in batch)
+
+        input_ids      = []
+        attention_mask = []
+        labels         = []
+        segment_ids    = []
+        segment_info   = []
+
+        for b in batch:
+            inp_len = len(b["input_ids"])
+            lbl_len = len(b["labels"])
+            inp_pad = max_input_len - inp_len
+            lbl_pad = max_label_len - lbl_len
+
+            input_ids.append(b["input_ids"] + [self.pad_token_id] * inp_pad)
+            attention_mask.append([1 if s >= 0 else 0 for s in b["segment_ids"]] + [0] * inp_pad)
+            labels.append(b["labels"] + [self.label_pad] * lbl_pad)
+            segment_ids.append(b["segment_ids"] + [-1] * inp_pad)
+            segment_info.append({
+                "starts":       b["segment_starts"],
+                "ends":         b["segment_ends"],
+                "num_segments": b["num_segments"],
+            })
+
+        return {
+            "input_ids":      torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+            "labels":         torch.tensor(labels, dtype=torch.long),
+            "segment_ids":    segment_ids,
+            "segment_info":   segment_info,
+        }

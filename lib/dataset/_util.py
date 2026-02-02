@@ -41,17 +41,15 @@ def print_run_stats(run_stats, chunk_stats, validation, output_path):
     print(f"    Total:     {run_stats['total_samples']}")
 
     if chunk_stats:
-        print(f"\n  Chunking:")
-        print(f"    Total:      {chunk_stats['total_chunks']}")
-        print(f"    Backtracks: {chunk_stats['backtrack_count']}")
+        print(f"\n  Window Scanning:")
+        print(f"    Scanned:   {chunk_stats.get('windows_scanned', 0)}")
+        print(f"    Empty:     {chunk_stats.get('windows_empty', 0)}")
+        print(f"    N-heavy:   {chunk_stats.get('windows_n_heavy', 0)}")
+        print(f"    Kept:      {chunk_stats.get('windows_kept', 0)}")
 
-        if chunk_stats["genes_per_chunk"]:
-            avg_genes = sum(chunk_stats["genes_per_chunk"]) / len(chunk_stats["genes_per_chunk"])
-            print(f"    Avg genes:  {avg_genes:.2f}")
-
-        if chunk_stats["chunk_sizes"]:
-            avg_size = sum(chunk_stats["chunk_sizes"]) / len(chunk_stats["chunk_sizes"])
-            print(f"    Avg size:   {avg_size/1000:.1f} kb")
+        if chunk_stats.get("features_per_chunk"):
+            avg_feat = sum(chunk_stats["features_per_chunk"]) / len(chunk_stats["features_per_chunk"])
+            print(f"    Avg feat:  {avg_feat:.1f}")
 
     if validation:
         print(f"\n  Validation:")

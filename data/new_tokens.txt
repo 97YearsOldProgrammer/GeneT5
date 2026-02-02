@@ -1130,3 +1130,9 @@ sequence_comparison
 vault_rna
 intron_hc
 intron_lc
+N
+NN
+NNN
+NNNN
+NNNNN
+NNNNNN

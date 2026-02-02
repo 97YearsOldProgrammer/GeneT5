@@ -45,7 +45,7 @@ TAXA_CONFIG = {
         ],
     },
     "Vertebrates": {
-        "limit":   40000,
+        "limit":   45000,
         "species": [
             "C.jacchus",
             "Chicken",

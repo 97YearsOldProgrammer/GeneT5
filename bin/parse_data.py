@@ -16,9 +16,9 @@ parser.add_argument('output_dir', type=str, metavar='<output>',
 parser.add_argument('--limit', required=False, type=int, default=25000,
     metavar='<int>', help='chunk size limit in bp [%(default)i]')
 parser.add_argument('--overlap_ratio', required=False, type=float, default=1/2.718281828,
-    metavar='<float>', help='overlap ratio [%(default).4f]')
-parser.add_argument('--anchor_pad_ratio', required=False, type=float, default=1/2.718281828,
-    metavar='<float>', help='anchor padding ratio [%(default).4f]')
+    metavar='<float>', help='window overlap ratio (1/e) [%(default).4f]')
+parser.add_argument('--max_n_ratio', required=False, type=float, default=0.1,
+    metavar='<float>', help='max N ratio before skipping window [%(default).2f]')
 parser.add_argument('--hint_ratio', required=False, type=float, default=0.5,
     metavar='<float>', help='hint augmentation ratio [%(default).2f]')
 parser.add_argument('--seed', required=False, type=int, default=42,
@@ -79,13 +79,11 @@ print(f"  Validation scenarios: {len(validation['scenarios'])}")
 existing_val_ids = set()
 
 # Build training chunks
-print(f"\n{' Dynamic Chunking (Parallel) ':=^60}")
+print(f"\n{' Sliding Window Chunking ':=^60}")
 
-overlap    = int(args.limit * args.overlap_ratio)
-anchor_pad = int(args.limit * args.anchor_pad_ratio)
-
-print(f"  Limit:   {args.limit/1000:.1f} kb")
-print(f"  Overlap: {overlap/1000:.1f} kb")
+print(f"  Window size:   {args.limit/1000:.1f} kb")
+print(f"  Overlap ratio: {args.overlap_ratio:.4f} (1/e)")
+print(f"  Max N ratio:   {args.max_n_ratio*100:.0f}%")
 
 all_validation_ids = validation['all_ids'] | existing_val_ids
 train_gene_index   = {
@@ -95,11 +93,23 @@ train_gene_index   = {
 
 print(f"  Training genes: {len(train_gene_index)}")
 
-train_chunks, chunk_stats = ds.dynamic_chunking(
-    sequences, train_gene_index, args.limit, overlap, anchor_pad, n_workers
+train_chunks, chunk_stats = ds.sliding_window_chunking(
+    sequences,
+    train_gene_index,
+    window_size   = args.limit,
+    overlap_ratio = args.overlap_ratio,
+    max_n_ratio   = args.max_n_ratio,
+    n_workers     = n_workers,
 )
 
-print(f"  Created {len(train_chunks)} raw chunks")
+print(f"\n  Windows scanned: {chunk_stats['windows_scanned']:,}")
+print(f"  Windows empty:   {chunk_stats['windows_empty']:,}")
+print(f"  Windows N-heavy: {chunk_stats['windows_n_heavy']:,}")
+print(f"  Windows kept:    {chunk_stats['windows_kept']:,}")
+
+if chunk_stats['features_per_chunk']:
+    avg_feat = sum(chunk_stats['features_per_chunk']) / len(chunk_stats['features_per_chunk'])
+    print(f"  Avg features:    {avg_feat:.1f}")
 
 # Augment with hints (parallel)
 print(f"\n{' Hint Augmentation (Parallel) ':=^60}")
@@ -219,6 +229,23 @@ run_stats = {
 }
 
 ds.print_run_stats(run_stats, chunk_stats, validation, train_path)
+
+# Write stats JSON for aggregation
+import json
+stats_path = output_dir / 'stats.json'
+stats_json = {
+    'run_stats':   run_stats,
+    'chunk_stats': {k: v for k, v in chunk_stats.items() if k != 'features_per_chunk'},
+    'validation': {
+        'complex_loci':  len(validation.get('complex_loci', [])),
+        'normal_genes':  len(validation.get('normal_genes', [])),
+        'easy_samples':  len(validation.get('easy_samples', [])),
+        'all_ids':       len(validation.get('all_ids', [])),
+        'scenarios':     len(validation.get('scenarios', [])),
+    },
+}
+with open(stats_path, 'w') as f:
+    json.dump(stats_json, f, indent=2)
 
 print(f"\n{'='*60}")
 print('Done!')

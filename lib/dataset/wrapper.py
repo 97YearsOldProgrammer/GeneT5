@@ -5,6 +5,7 @@ import lib.dataset._compacting as compacting
 import lib.dataset._validation as validation
 import lib.dataset._dataload   as dataload
 import lib.dataset._util       as util
+import lib.dataset._packed     as packed
 
 
 #####################
@@ -36,8 +37,10 @@ read_chunk_at_index = binary.read_chunk_at_index
 #####################
 
 
-dynamic_chunking   = chunking.dynamic_chunking
-augment_with_hints = chunking.augment_with_hints
+dynamic_chunking        = chunking.dynamic_chunking
+sliding_window_chunking = chunking.sliding_window_chunking
+augment_with_hints      = chunking.augment_with_hints
+filter_n_heavy_chunks   = chunking.filter_n_heavy_chunks
 
 
 ######################
@@ -76,6 +79,8 @@ save_validation_set        = validation.save_validation_set
 BinaryTrainDataset      = dataload.BinaryTrainDataset
 DynamicPaddingCollator  = dataload.DynamicPaddingCollator
 SmartBatchSampler       = dataload.SmartBatchSampler
+PackedTrainDataset      = dataload.PackedTrainDataset
+PackedCollator          = dataload.PackedCollator
 
 
 ###################
@@ -87,3 +92,16 @@ append_tokens_to_txt   = util.append_tokens_to_txt
 format_size            = util.format_size
 print_run_stats        = util.print_run_stats
 print_validation_stats = validation.print_validation_stats
+
+
+#####################
+#####  Packed   #####
+#####################
+
+
+PackedSample         = packed.PackedSample
+pack_chunks_to_sample = packed.pack_chunks_to_sample
+write_packed         = packed.write_packed
+read_packed          = packed.read_packed
+read_packed_at_index = packed.read_packed_at_index
+get_packed_info      = packed.get_packed_info

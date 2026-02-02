@@ -62,7 +62,7 @@ python3 bin/run_bake_data.py H.archaea E.coli --limit 9000 --threshold 50000
 | Prokaryotes    | 10000    | ~2.2k               | 9000bps  = ~P99+ (no introns, avg 924 bp)
 | Unicellular    | 15000    | ~3.3k               | 15000bps = ~P95+ (yeast genes avg ~1.5 kb)
 | Invertebrates  | 30000    | ~6.6k               | 25000bps = ~P90 (Drosophila genes ~2-10 kb)
-| Vertebrates    | 40000    | ~8.8k               | 30000bps = ~P75 (median 23 kb, many >30kb)
+| Vertebrates    | 45000    | ~10k                | 30000bps = ~P75 (median 23 kb, many >30kb)
 | Plants         | 30000    | ~6.6k               | 25000bps = ~P85-90 
 
 

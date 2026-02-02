@@ -6,16 +6,18 @@ from lib.dataset.wrapper import (
     build_gene_index,
     extract_feature_types,
     extract_biotypes,
-    
+
     # Validation
     build_validation_set,
     save_validation_set,
-    
+
     # Chunking
     dynamic_chunking,
+    sliding_window_chunking,
     augment_with_hints,
-    
-    # Streaming Compacting
+    filter_n_heavy_chunks,
+
+    # Streaming Compacting (legacy - assigns group IDs only)
     ChunkMeta,
     stream_extract_metadata,
     pack_from_metadata,
@@ -27,19 +29,31 @@ from lib.dataset.wrapper import (
     build_segment_mask,
     align_to_block,
     compute_effective_length,
-    
-    # Binary I/O
+
+    # Binary I/O (individual chunks)
     write_binary,
     read_binary,
     get_binary_info,
     read_chunk_at_index,
     BinaryChunk,
-    
-    # Dataload
+
+    # Packed I/O (pre-packed sequences - ready to stream)
+    PackedSample,
+    pack_chunks_to_sample,
+    write_packed,
+    read_packed,
+    read_packed_at_index,
+    get_packed_info,
+
+    # Dataload (individual chunks - legacy)
     BinaryTrainDataset,
     DynamicPaddingCollator,
     SmartBatchSampler,
-    
+
+    # Dataload (pre-packed - recommended)
+    PackedTrainDataset,
+    PackedCollator,
+
     # Util
     append_tokens_to_txt,
     format_size,
