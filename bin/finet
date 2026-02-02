@@ -181,9 +181,9 @@ def main():
                 weight_decay = args.weight_decay,
             )
             print("  Using 8-bit AdamW (saves ~12GB optimizer memory)")
-        except ImportError:
-            print("  WARNING: bitsandbytes not installed, falling back to standard AdamW")
-            print("           Install with: pip install bitsandbytes")
+        except (ImportError, RuntimeError) as e:
+            print(f"  WARNING: bitsandbytes not available ({type(e).__name__}), falling back to standard AdamW")
+            print("           Install/fix with: pip install bitsandbytes")
             optimizer = torch.optim.AdamW(
                 model.parameters(),
                 lr           = args.lr,

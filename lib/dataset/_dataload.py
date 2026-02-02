@@ -36,23 +36,23 @@ class BinaryDatasetReader:
         return self._lengths
 
     def _compute_lengths_batched(self, batch_size=256):
-        """Compute lengths using batched tokenization"""
+        """Read pre-stored lengths from binary chunks, fallback to tokenization if missing"""
 
-        lengths   = []
-        all_texts = []
+        lengths = []
 
         for i in range(self._num_chunks):
             chunk = binary.read_chunk_at_index(self.binary_path, i)
-            all_texts.append(chunk.get_input_text())
 
-        if self.tokenizer is None:
-            lengths = [len(text) // 4 for text in all_texts]
-        else:
-            for i in range(0, len(all_texts), batch_size):
-                batch      = all_texts[i:i + batch_size]
-                encoded    = self.tokenizer(batch, add_special_tokens=False, padding=False, truncation=False)
-                batch_lens = [len(ids) for ids in encoded["input_ids"]]
-                lengths.extend(batch_lens)
+            if chunk.input_len is not None:
+                lengths.append(chunk.input_len)
+            else:
+                # Fallback: tokenize this chunk (should rarely happen with proper data prep)
+                if self.tokenizer is not None:
+                    text    = chunk.get_input_text()
+                    encoded = self.tokenizer(text, add_special_tokens=False)
+                    lengths.append(len(encoded["input_ids"]))
+                else:
+                    lengths.append(len(chunk.get_input_text()) // 4)
 
         return lengths
 
