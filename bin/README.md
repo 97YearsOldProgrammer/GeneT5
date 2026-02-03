@@ -30,6 +30,7 @@ python3 -u bin/init_model.py \
     --encoder_window_size 34560 \
     --decoder_block_size 16 \
     --decoder_window_size 1600 \
+    --num_latents 1024 \
     2>&1 | tee ../logs/init.log
 ```
 
@@ -41,21 +42,11 @@ python3 -u bin/init_model.py \
 
 To prepare fine-tuning data, using [data_baker](bake_data.py).  
 
-**The General Command Line**
 ```python3
-python3 bin/bake_data.py \
-  fasta   \
-  gff     \
-  out_dir \
-  --extract_tokens data/new_tokens.txt \
-  2>&1 | tee -a ../logs/baker/[name].txt 
+python -u bin/bake_data --raw_dir ../raw --output_dir ../baked --n_workers 5 --species_parallel 5 --tokenizer ../model/init --compact_workers 20 2>&1 | tee ../logs/bake.log 
 ```
 
-For sake of saving life, please use the [bake_data_wrapper](run_bake_data.py) instead for that general command line input. Here is some hyperparameter for how different data is being baked.   
-
-```python3
-python3 bin/run_bake_data.py H.archaea E.coli --limit 9000 --threshold 50000
-```
+**Config**
 
 | Taxa           | Limit    | Token Est. (@4.5bp) | Avg
 | :------------: | :------: | :-----------------: | :------------
@@ -64,6 +55,7 @@ python3 bin/run_bake_data.py H.archaea E.coli --limit 9000 --threshold 50000
 | Invertebrates  | 30000    | ~6.6k               | 25000bps = ~P90 (Drosophila genes ~2-10 kb)
 | Vertebrates    | 45000    | ~10k                | 30000bps = ~P75 (median 23 kb, many >30kb)
 | Plants         | 30000    | ~6.6k               | 25000bps = ~P85-90 
+
 
 
 ---
@@ -89,15 +81,6 @@ After adding token into the model, the encoder embedding dimension need to be re
 
 ```python3
 python3 bin/resize_model.py model_path tokenizer_path
-```
-
-
----
-
-### Bake Data
-
-```python3
-python -u bin/bake_data --raw_dir ../raw --output_dir ../baked --n_workers 6 --species_parallel 3 --tokenizer ../model/init 2>&1 | tee ../logs/bake.log 
 ```
 
 
@@ -145,5 +128,6 @@ python -u bin/finet \
   --early_stopping 2 \
   --save_steps 500 \
   --log_memory \
+  --empty_cache_steps 100 \
   2>&1 | tee ../logs/tune/1.log
 ```

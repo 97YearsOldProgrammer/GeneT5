@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as ckpt
 import math
 
 from lib.blocks._component import LayerNorm, FeedForward
@@ -167,30 +168,49 @@ class Decoder(nn.Module):
         
         self.final_norm = LayerNorm(embed_dim)
         self.dropout    = nn.Dropout(dropout)
-    
+
+        self._gradient_checkpointing = False
+
+    def gradient_checkpointing_enable(self):
+        self._gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self):
+        self._gradient_checkpointing = False
+
     def forward(
-        self, 
-        hidden_states, 
-        encoder_hidden_states, 
-        attention_mask         = None, 
+        self,
+        hidden_states,
+        encoder_hidden_states,
+        attention_mask         = None,
         encoder_attention_mask = None
     ):
         total_moe_loss = 0.0 if self.use_moe else None
-        
+
         for layer in self.layers:
-            hidden_states, _, moe_aux_loss = layer(
-                hidden_states,
-                encoder_hidden_states  = encoder_hidden_states,
-                attention_mask         = attention_mask,
-                encoder_attention_mask = encoder_attention_mask,
-            )
-            
+            if self._gradient_checkpointing and self.training:
+                hidden_states, _, moe_aux_loss = ckpt.checkpoint(
+                    layer,
+                    hidden_states,
+                    encoder_hidden_states,
+                    attention_mask,
+                    encoder_attention_mask,
+                    None,
+                    use_reentrant=False,
+                )
+            else:
+                hidden_states, _, moe_aux_loss = layer(
+                    hidden_states,
+                    encoder_hidden_states  = encoder_hidden_states,
+                    attention_mask         = attention_mask,
+                    encoder_attention_mask = encoder_attention_mask,
+                )
+
             if self.use_moe and moe_aux_loss is not None:
                 total_moe_loss = total_moe_loss + moe_aux_loss
-        
+
         hidden_states = self.final_norm(hidden_states)
         hidden_states = self.dropout(hidden_states)
-        
+
         return hidden_states, total_moe_loss
     
     def get_kv_cache_info(self, batch_size, seq_len, encoder_seq_len):

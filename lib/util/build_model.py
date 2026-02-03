@@ -7,6 +7,7 @@ from transformers import AutoModel, AutoTokenizer
 from pathlib      import Path
 
 from lib.blocks import Encoder, Decoder
+from lib.blocks._perceiver import PerceiverCompressor, PerceiverConfig
 
 
 #####################
@@ -37,6 +38,11 @@ INIT_DEFAULTS = {
     "router_std": 0.006,
 }
 
+PERCEIVER_DEFAULTS = {
+    "num_latents": 512,
+    "num_layers":  2,
+}
+
 
 def build_gt5(
     dnabert_model_name  = "zhihan1996/DNABERT-2-117M",
@@ -57,6 +63,9 @@ def build_gt5(
     decoder_use_moe     = DECODER_DEFAULTS["use_moe"],
     decoder_num_experts = DECODER_DEFAULTS["num_experts"],
     decoder_moe_top_k   = DECODER_DEFAULTS["moe_top_k"],
+    # Perceiver compression
+    num_latents         = PERCEIVER_DEFAULTS["num_latents"],
+    perceiver_layers    = PERCEIVER_DEFAULTS["num_layers"],
     # Vocab
     vocab_size          = None,
     tie_weights         = True,
@@ -70,14 +79,16 @@ def build_gt5(
 ):
     """
     Build GeneT5 from DNABERT-2 and save clean checkpoint.
-    
+
     Architecture:
         Encoder: BigBird sparse attention (from DNABERT-2)
+        Perceiver: Optional encoder compression (latent queries)
         Decoder: Sparse self-attention + GQA cross-attention + MoE FFN
-    
+
     Weight Transfer:
         Encoder Embedding       -> COPY from DNABERT-2
         Encoder Self-Attention  -> COPY from DNABERT-2
+        Perceiver Compressor    -> RANDOM INIT (N(0,0.02) for latents, Xavier for projections)
         Decoder Self-Attention  -> COPY from Encoder
         Cross-Attention         -> RANDOM INIT
         Decoder FFN / MoE       -> RANDOM INIT
@@ -133,6 +144,7 @@ def build_gt5(
     print(f"    Decoder:   layers={decoder_num_layers}, heads={decoder_num_heads}, kv_heads={decoder_num_kv_heads}, moe={decoder_use_moe}")
     print(f"    Encoder Sparse: block={encoder_block_size}, window={encoder_window_size}")
     print(f"    Decoder Sparse: block={decoder_block_size}, window={decoder_window_size}")
+    print(f"    Perceiver: latents={num_latents}, layers={perceiver_layers}")
     
     # Get BERT backbone
     bert = original_model.bert if hasattr(original_model, 'bert') else original_model
@@ -152,19 +164,18 @@ def build_gt5(
         nn.init.normal_(encoder_embed.weight, mean=0.0, std=init_embed_std)
         print(f"    ! Random init")
     
-    # Build Encoder
+    # Build Encoder (BigBird sparse attention)
     print(f"\n[3] Building Encoder")
     encoder = Encoder(
-        num_layers         = dna_config.num_hidden_layers,
-        embed_dim          = dna_config.hidden_size,
-        num_heads          = dna_config.num_attention_heads,
-        ff_dim             = dna_config.intermediate_size,
-        dropout            = dna_config.hidden_dropout_prob,
-        attn_dropout       = dna_config.attention_probs_dropout_prob,
-        use_alibi          = True,
-        use_bigbird_sparse = True,
-        block_size         = encoder_block_size,
-        window_size        = encoder_window_size,
+        num_layers   = dna_config.num_hidden_layers,
+        embed_dim    = dna_config.hidden_size,
+        num_heads    = dna_config.num_attention_heads,
+        ff_dim       = dna_config.intermediate_size,
+        dropout      = dna_config.hidden_dropout_prob,
+        attn_dropout = dna_config.attention_probs_dropout_prob,
+        use_alibi    = True,
+        block_size   = encoder_block_size,
+        window_size  = encoder_window_size,
     )
     
     # Transfer Encoder Weights
@@ -305,7 +316,21 @@ def build_gt5(
                 nn.init.normal_(layer.ff.wo.weight, mean=0.0, std=init_ffn_std)
         nn.init.ones_(layer.norm3.weight)
     nn.init.ones_(decoder.final_norm.weight)
-    
+
+    # Perceiver Compressor
+    print(f"\n[8.5] Building Perceiver Compressor")
+    perceiver_config = PerceiverConfig(
+        embed_dim    = dna_config.hidden_size,
+        num_latents  = num_latents,
+        num_heads    = dna_config.num_attention_heads,
+        num_kv_heads = decoder_num_kv_heads,
+        num_layers   = perceiver_layers,
+        dropout      = decoder_dropout,
+    )
+    compressor = PerceiverCompressor(perceiver_config)
+    comp_params = sum(p.numel() for p in compressor.parameters())
+    print(f"    ✓ Perceiver: {comp_params:,} params")
+
     # Embeddings and LM Head
     print(f"\n[9] Building Decoder Embeddings and LM Head")
     decoder_embed = nn.Embedding(vocab_size, dna_config.hidden_size)
@@ -344,6 +369,9 @@ def build_gt5(
         "encoder_window_size":  encoder_window_size,
         "decoder_block_size":   decoder_block_size,
         "decoder_window_size":  decoder_window_size,
+        # Perceiver config
+        "num_latents":          num_latents,
+        "perceiver_layers":     perceiver_layers,
     }
     
     with open(save_path / "config.json", "w") as f:
@@ -352,6 +380,7 @@ def build_gt5(
     checkpoint = {
         "encoder_embed": encoder_embed.state_dict(),
         "encoder":       encoder.state_dict(),
+        "compressor":    compressor.state_dict(),
         "decoder":       decoder.state_dict(),
         "decoder_embed": decoder_embed.state_dict(),
         "lm_head":       lm_head.state_dict()
@@ -364,6 +393,7 @@ def build_gt5(
     
     total_params  = sum(p.numel() for p in encoder_embed.parameters())
     total_params += sum(p.numel() for p in encoder.parameters())
+    total_params += sum(p.numel() for p in compressor.parameters())
     total_params += sum(p.numel() for p in decoder.parameters())
     total_params += sum(p.numel() for p in decoder_embed.parameters())
     total_params += sum(p.numel() for p in lm_head.parameters())

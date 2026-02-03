@@ -39,6 +39,7 @@ from lib.dataset.wrapper import (
 
     # Packed I/O (pre-packed sequences - ready to stream)
     PackedSample,
+    PackedWriter,
     pack_chunks_to_sample,
     write_packed,
     read_packed,

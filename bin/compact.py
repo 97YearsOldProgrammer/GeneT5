@@ -26,6 +26,8 @@ parser.add_argument('--seed', required=False, type=int, default=42,
     metavar='<int>', help='random seed [%(default)i]')
 parser.add_argument('--file_parallel', required=False, type=int, default=1,
     metavar='<int>', help='files to process in parallel [%(default)i]')
+parser.add_argument('--workers', required=False, type=int, default=1,
+    metavar='<int>', help='parallel workers for Phase 3 [%(default)i]')
 
 args       = parser.parse_args()
 hard_limit = args.hard_limit or int(args.target * 1.1)
@@ -93,6 +95,7 @@ print(f"  Target length: {args.target:,} tokens")
 print(f"  Hard limit:    {hard_limit:,} tokens")
 print(f"  Block size:    {args.block_size}")
 print(f"  Window size:   {args.window_size}")
+print(f"  Phase 3 workers: {args.workers}")
 
 
 ##############################
@@ -147,11 +150,11 @@ print(f"  Time: {util.format_time(phase2_time)}")
 ##############################
 
 
-print(f"\n{' Phase 3: Tokenize & Write ':=^70}")
+print(f"\n{' Phase 3: Tokenize & Write (Streaming) ':=^70}")
 
 phase3_start = time.time()
 
-# Build reverse mapping
+# Build reverse mapping: group_id -> [(file_idx, chunk_idx), ...]
 groups = {}
 for (file_idx, chunk_idx), group_id in group_assignments.items():
     if group_id not in groups:
@@ -162,29 +165,20 @@ for group_id in groups:
     groups[group_id].sort()
 
 num_groups = len(groups)
-print(f"  Groups to pack: {num_groups:,}\n")
+print(f"  Groups to pack: {num_groups:,}")
+print(f"  Workers: {args.workers}")
+print(f"  Memory mode: streaming\n")
 
-# Load all chunks
-print(f"  Loading chunks...")
 
-all_chunks = {}
-for file_idx, file_path in enumerate(file_paths):
-    chunks = ds.read_binary(file_path)
-    for chunk_idx, chunk in enumerate(chunks):
-        all_chunks[(file_idx, chunk_idx)] = chunk
-    print(f"    [{file_idx + 1}/{len(file_paths)}] {file_path.name}: {len(chunks):,}")
+def process_group(work_item):
+    """Worker function: load chunks and pack into sample"""
 
-print(f"  Total: {len(all_chunks):,} chunks\n")
+    group_id, members = work_item
 
-# Pack groups
-print(f"  Packing...")
-
-packed_samples = []
-group_ids      = sorted(groups.keys())
-
-for progress, group_id in enumerate(group_ids):
-    members      = groups[group_id]
-    group_chunks = [all_chunks[key] for key in members]
+    group_chunks = []
+    for file_idx, chunk_idx in members:
+        chunk = ds.read_chunk_at_index(file_paths[file_idx], chunk_idx)
+        group_chunks.append(chunk)
 
     packed_sample = ds.pack_chunks_to_sample(
         group_chunks,
@@ -192,28 +186,46 @@ for progress, group_id in enumerate(group_ids):
         block_size  = args.block_size,
         window_size = args.window_size,
     )
-    packed_samples.append(packed_sample)
 
-    if (progress + 1) % 10000 == 0:
-        pct = 100 * (progress + 1) / num_groups
-        print(f"    {progress + 1:,}/{num_groups:,} ({pct:.1f}%)", end='\r')
+    return packed_sample
+
+
+# Streaming: parallel workers + write in order as results come in
+output_path     = pathlib.Path(args.output)
+group_ids       = sorted(groups.keys())
+input_lengths   = []
+label_lengths   = []
+segment_counts  = []
+
+from concurrent.futures import ThreadPoolExecutor
+
+with ds.PackedWriter(output_path, num_groups) as writer:
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+
+        # Prepare all work items
+        work_items = [(gid, groups[gid]) for gid in group_ids]
+
+        # executor.map() returns results in order, streams as completed
+        for progress, packed_sample in enumerate(executor.map(process_group, work_items)):
+
+            input_lengths.append(packed_sample.total_input_len)
+            label_lengths.append(packed_sample.total_label_len)
+            segment_counts.append(packed_sample.num_segments)
+
+            writer.write_sample(packed_sample)
+
+            if (progress + 1) % 10000 == 0:
+                pct = 100 * (progress + 1) / num_groups
+                print(f"    {progress + 1:,}/{num_groups:,} ({pct:.1f}%)", end='\r')
 
 print(f"    {num_groups:,}/{num_groups:,} (100.0%)")
-
-del all_chunks
-
-# Write output
-print(f"\n  Writing...")
-
-output_path = pathlib.Path(args.output)
-ds.write_packed(packed_samples, output_path)
 
 phase3_time = time.time() - phase3_start
 file_size   = output_path.stat().st_size
 
 print(f"\n  Output:  {output_path}")
 print(f"  Size:    {ds.format_size(file_size)}")
-print(f"  Samples: {len(packed_samples):,}")
+print(f"  Samples: {num_groups:,}")
 print(f"  Time:    {util.format_time(phase3_time)}")
 
 
@@ -224,10 +236,7 @@ print(f"  Time:    {util.format_time(phase3_time)}")
 
 print(f"\n{' Packed Stats ':=^70}")
 
-input_lengths  = [s.total_input_len for s in packed_samples]
-label_lengths  = [s.total_label_len for s in packed_samples]
-segment_counts = [s.num_segments for s in packed_samples]
-
+# Stats collected during streaming (no need to reload)
 print(f"  Input tokens:  max {max(input_lengths):,}, avg {sum(input_lengths)/len(input_lengths):,.0f}")
 print(f"  Label tokens:  max {max(label_lengths):,}, avg {sum(label_lengths)/len(label_lengths):,.0f}")
 print(f"  Segments/sample: max {max(segment_counts)}, avg {sum(segment_counts)/len(segment_counts):.1f}")

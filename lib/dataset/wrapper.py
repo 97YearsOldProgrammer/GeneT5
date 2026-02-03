@@ -99,9 +99,10 @@ print_validation_stats = validation.print_validation_stats
 #####################
 
 
-PackedSample         = packed.PackedSample
+PackedSample          = packed.PackedSample
+PackedWriter          = packed.PackedWriter
 pack_chunks_to_sample = packed.pack_chunks_to_sample
-write_packed         = packed.write_packed
-read_packed          = packed.read_packed
-read_packed_at_index = packed.read_packed_at_index
-get_packed_info      = packed.get_packed_info
+write_packed          = packed.write_packed
+read_packed           = packed.read_packed
+read_packed_at_index  = packed.read_packed_at_index
+get_packed_info       = packed.get_packed_info

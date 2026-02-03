@@ -328,3 +328,68 @@ def get_packed_info(input_path):
         "total_size":  total_size,
         "file_path":   str(input_path),
     }
+
+
+####################################
+#####  Streaming Write (NEW)   #####
+####################################
+
+
+class PackedWriter:
+    """
+    Streaming writer for packed samples - writes directly to disk
+
+    Memory: O(offset_table) + O(1 sample) instead of O(all samples)
+    """
+
+    def __init__(self, output_path, num_samples):
+
+        self.output_path = pathlib.Path(output_path)
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self.num_samples      = num_samples
+        self.offsets          = []
+        self.samples_written  = 0
+        self.offset_table_pos = None
+
+        self.file = open(self.output_path, 'wb')
+
+        self.file.write(PACKED_MAGIC)
+        self.file.write(struct.pack('<B', PACKED_VERSION))
+        self.file.write(struct.pack('<I', num_samples))
+
+        self.offset_table_pos = self.file.tell()
+        self.file.write(b'\x00' * (num_samples * 12))
+
+    def write_sample(self, sample):
+        """Write a single packed sample"""
+
+        current_offset = self.file.tell()
+        sample_bytes   = sample.to_bytes()
+
+        self.file.write(sample_bytes)
+        self.offsets.append((current_offset, len(sample_bytes)))
+        self.samples_written += 1
+
+    def finalize(self):
+        """Write offset table and close file"""
+
+        if self.samples_written != self.num_samples:
+            raise ValueError(
+                f"Expected {self.num_samples} samples, wrote {self.samples_written}"
+            )
+
+        self.file.seek(self.offset_table_pos)
+        for offset, length in self.offsets:
+            self.file.write(struct.pack('<QI', offset, length))
+
+        self.file.close()
+        return self.output_path
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not self.file.closed:
+            self.finalize()
+        return False

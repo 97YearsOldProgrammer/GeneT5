@@ -20,10 +20,9 @@ DEFAULTS = {
     'lr':             1e-4,
     'epochs':         3,
     'weight_decay':   0.1,
-    'warmup_ratio':   0.1,
+    'warmup_ratio':   0.03,
     'grad_accum':     64,
     'max_grad_norm':  1.0,
-    'bucket_size':    256,
     'num_workers':    0,
 }
 
@@ -55,8 +54,6 @@ def main():
         metavar='<float>', help='warmup ratio [%(default).2f]')
     parser.add_argument('--max_grad_norm', required=False, type=float, default=DEFAULTS['max_grad_norm'],
         metavar='<float>', help='max gradient norm [%(default).1f]')
-    parser.add_argument('--bucket_size', required=False, type=int, default=DEFAULTS['bucket_size'],
-        metavar='<int>', help='bucket size for batching [%(default)i]')
     parser.add_argument('--seed', required=False, type=int, default=42,
         metavar='<int>', help='random seed [%(default)i]')
     parser.add_argument('--save_every', required=False, type=int, default=1,
@@ -120,14 +117,14 @@ def main():
     print(f"  Trainable: {stats['total_trainable']:,}")
     print(f"  Frozen:    {stats['total_frozen']:,}")
     
-    # load datasets
+    # load datasets (packed format)
     print(f"\nLoading datasets...")
 
-    train_dataset = ds.BinaryTrainDataset(args.train_bin, tokenizer, args.seed)
-    val_dataset   = ds.BinaryTrainDataset(args.val_bin, tokenizer, args.seed)
-    
-    print(f"  Train: {len(train_dataset)}")
-    print(f"  Val:   {len(val_dataset)}")
+    train_dataset = ds.PackedTrainDataset(args.train_bin, args.seed)
+    val_dataset   = ds.PackedTrainDataset(args.val_bin, args.seed)
+
+    print(f"  Train: {len(train_dataset):,}")
+    print(f"  Val:   {len(val_dataset):,}")
 
     if len(train_dataset) == 0:
         print(f"\nERROR: Training dataset is empty!")
@@ -136,33 +133,26 @@ def main():
 
     # setup dataloaders
     print(f"\nSetting up dataloaders...")
-    
-    collator = ds.DynamicPaddingCollator(tokenizer.pad_token_id, -100)
-    
-    train_sampler = ds.SmartBatchSampler(
-        train_dataset.lengths, args.batch_size, args.bucket_size,
-        drop_last=True, shuffle=True
-    )
-    
+
+    collator = ds.PackedCollator(tokenizer.pad_token_id, -100)
+
     train_loader = data_utils.DataLoader(
         train_dataset,
-        batch_sampler = train_sampler,
-        collate_fn    = collator,
-        num_workers   = args.num_workers,
-        pin_memory    = not args.no_pin_memory,
+        batch_size  = args.batch_size,
+        shuffle     = True,
+        collate_fn  = collator,
+        num_workers = args.num_workers,
+        pin_memory  = not args.no_pin_memory,
+        drop_last   = True,
     )
-    
-    val_sampler = ds.SmartBatchSampler(
-        val_dataset.lengths, args.batch_size, args.bucket_size,
-        drop_last=False, shuffle=False
-    )
-    
+
     val_loader = data_utils.DataLoader(
         val_dataset,
-        batch_sampler = val_sampler,
-        collate_fn    = collator,
-        num_workers   = args.num_workers,
-        pin_memory    = not args.no_pin_memory,
+        batch_size  = args.batch_size,
+        shuffle     = False,
+        collate_fn  = collator,
+        num_workers = args.num_workers,
+        pin_memory  = not args.no_pin_memory,
     )
     
     print(f"  Train batches: {len(train_loader)}")
@@ -268,23 +258,6 @@ def main():
     else:
         print(f"  Step checkpoints: disabled (use --save_steps N to enable)")
 
-    # Memory estimate
-    total_params = stats['total_trainable'] + stats['total_frozen']
-    param_mem_gb = total_params * 4 / 1e9  # float32
-    grad_mem_gb = stats['total_trainable'] * 4 / 1e9
-    optim_mem_gb = stats['total_trainable'] * 8 / 1e9  # Adam has 2 states per param
-    if args.optim_8bit:
-        optim_mem_gb /= 2
-    print(f"\n  Memory estimate (excluding activations):")
-    print(f"    Model:     {param_mem_gb:.1f} GB")
-    print(f"    Gradients: {grad_mem_gb:.1f} GB")
-    print(f"    Optimizer: {optim_mem_gb:.1f} GB")
-    print(f"    Subtotal:  {param_mem_gb + grad_mem_gb + optim_mem_gb:.1f} GB")
-
-    import psutil
-    mem = psutil.virtual_memory()
-    print(f"    Available: {mem.available/1e9:.1f} GB / {mem.total/1e9:.0f} GB total")
-
     patience_counter = 0
     global_step = 0  # Track optimizer steps across epochs
 
@@ -307,7 +280,7 @@ def main():
         epoch_start_time = __import__('time').time()
 
         for step, batch in enumerate(train_loader):
-            batch = {k: v.to(device) for k, v in batch.items()}
+            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
 
             # Prepare decoder inputs with proper attention mask
             decoder_input_ids = batch['labels'][:, :-1]
@@ -400,7 +373,7 @@ def main():
         
         with torch.no_grad():
             for batch in val_loader:
-                batch = {k: v.to(device) for k, v in batch.items()}
+                batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
 
                 # Prepare decoder inputs with proper attention mask
                 decoder_input_ids = batch['labels'][:, :-1]

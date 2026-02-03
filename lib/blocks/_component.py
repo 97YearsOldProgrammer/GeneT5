@@ -34,13 +34,13 @@ class Attention(nn.Module):
     
     def __init__(
         self,
-        embed_dim           : int,
-        num_heads           : int,
-        dropout             : float = 0.0,
-        is_decoder          : bool = False,
-        is_cross_attention  : bool = False,
-        use_alibi           : bool = False,
-        use_flash           : bool = True
+        embed_dim,
+        num_heads,
+        dropout            = 0.0,
+        is_decoder         = False,
+        is_cross_attention = False,
+        use_alibi          = False,
+        use_flash          = True
     ):
         super().__init__()
         
@@ -69,18 +69,8 @@ class Attention(nn.Module):
             self.position_bias_module = None
     
     def forward(self, hidden_states, key_value_states=None, attention_mask=None, position_bias=None):
-        """
-        Args:
-            hidden_states   : (B, L, D) query states
-            key_value_states: (B, L_kv, D) for cross-attention, None for self-attention
-            attention_mask  : (B, 1, L, L_kv) additive mask
-            position_bias   : precomputed position bias for reuse
-        
-        Returns:
-            output          : (B, L, D)
-            position_bias   : for reuse in subsequent layers
-        """
-        
+        """Compute multi-head attention with optional position bias"""
+
         B, L, D = hidden_states.shape
         
         # Query from hidden_states
@@ -227,8 +217,8 @@ class ALiBi(nn.Module):
     
     @staticmethod
     def _build_alibi_bias(seq_len, slopes):
-        """ Build ALiBi bias matrix: -m * |i - j| """
-        
+        """Build ALiBi bias matrix"""
+
         # Distance matrix |i - j|
         context_position    = torch.arange(seq_len)[:, None]
         memory_position     = torch.arange(seq_len)[None, :]

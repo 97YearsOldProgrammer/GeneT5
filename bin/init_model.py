@@ -61,6 +61,10 @@ parser.add_argument("--init_attn_std", type=float, default=None,
     help="Std for attention layers (defaults to --init_std).")
 parser.add_argument("--init_moe_router_std", type=float, default=0.006,
     help="Std for MoE router.")
+parser.add_argument("--num_latents", type=int, default=512,
+    help="Number of latent tokens for Perceiver compression.")
+parser.add_argument("--perceiver_layers", type=int, default=2,
+    help="Number of self-attention layers in Perceiver compressor.")
 
 args = parser.parse_args()
 
@@ -111,6 +115,9 @@ saved_path = build_gt5(
     init_ffn_std              = args.init_ffn_std,
     init_attn_std             = args.init_attn_std,
     init_moe_router_std       = args.init_moe_router_std,
+    # Perceiver
+    num_latents               = args.num_latents,
+    perceiver_layers          = args.perceiver_layers,
 )
         
 print(f"\nSUCCESS: Model initialized and saved to:")

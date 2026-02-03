@@ -5,16 +5,23 @@ import json
 
 from pathlib import Path
 from lib.blocks import Encoder, Decoder
+from lib.blocks._perceiver import PerceiverCompressor, PerceiverConfig
 
 
 class GeneT5(nn.Module):
     """
     GeneT5: DNA-to-Protein Encoder-Decoder
-    
-    Encoder: BigBird sparse attention
-    Decoder: Causal attention + cross-attention, optional MoE
+
+    Architecture:
+        Encoder: BigBird sparse attention for long DNA sequences
+        Perceiver: Learned latent compression (20K -> 512 tokens)
+        Decoder: Sparse self-attention + GQA cross-attention + MoE
+
+    Memory savings:
+        Cross-attention: O(D × N) -> O(D × L) where L << N
+        Example: 160K × 20K -> 160K × 512 = 39x reduction
     """
-    
+
     def __init__(
         self,
         embed_dim            = 768,
@@ -38,11 +45,15 @@ class GeneT5(nn.Module):
         # Decoder sparse attention
         decoder_block_size   = 64,
         decoder_window_size  = 256,
+        # Perceiver compression
+        num_latents          = 512,
+        perceiver_layers     = 2,
     ):
         super().__init__()
 
-        self.embed_dim  = embed_dim
-        self.vocab_size = vocab_size
+        self.embed_dim   = embed_dim
+        self.vocab_size  = vocab_size
+        self.num_latents = num_latents
 
         if decoder_num_kv_heads is None:
             decoder_num_kv_heads = max(1, decoder_num_heads // 4)
@@ -52,24 +63,35 @@ class GeneT5(nn.Module):
         self.encoder_window_size = encoder_window_size
         self.decoder_block_size  = decoder_block_size
         self.decoder_window_size = decoder_window_size
+        self.perceiver_layers    = perceiver_layers
 
         # Encoder embedding
         self.encoder_embed         = nn.Embedding(vocab_size, embed_dim)
         self.encoder_embed_dropout = nn.Dropout(decoder_dropout)
 
-        # Encoder
+        # Encoder (BigBird sparse attention)
         self.encoder = Encoder(
-            num_layers         = encoder_num_layers,
-            embed_dim          = embed_dim,
-            num_heads          = encoder_num_heads,
-            ff_dim             = encoder_ff_dim,
-            dropout            = decoder_dropout,
-            attn_dropout       = decoder_dropout,
-            use_alibi          = True,
-            use_bigbird_sparse = True,
-            block_size         = encoder_block_size,
-            window_size        = encoder_window_size,
+            num_layers   = encoder_num_layers,
+            embed_dim    = embed_dim,
+            num_heads    = encoder_num_heads,
+            ff_dim       = encoder_ff_dim,
+            dropout      = decoder_dropout,
+            attn_dropout = decoder_dropout,
+            use_alibi    = True,
+            block_size   = encoder_block_size,
+            window_size  = encoder_window_size,
         )
+
+        # Perceiver Compressor
+        perceiver_config = PerceiverConfig(
+            embed_dim    = embed_dim,
+            num_latents  = num_latents,
+            num_heads    = encoder_num_heads,
+            num_kv_heads = decoder_num_kv_heads,
+            num_layers   = perceiver_layers,
+            dropout      = decoder_dropout,
+        )
+        self.compressor = PerceiverCompressor(perceiver_config)
 
         # Decoder
         self.decoder = Decoder(
@@ -100,10 +122,16 @@ class GeneT5(nn.Module):
             self.lm_head.weight = self.decoder_embed.weight
     
     def encode(self, encoder_input_ids, encoder_attention_mask=None):
+        """Encode input and compress via Perceiver"""
+
         encoder_embeds = self.encoder_embed(encoder_input_ids)
         encoder_embeds = self.encoder_embed_dropout(encoder_embeds)
         encoder_hidden = self.encoder(encoder_embeds, attention_mask=encoder_attention_mask)
-        return encoder_hidden
+
+        # Compress to latents
+        latents = self.compressor(encoder_hidden, encoder_attention_mask)
+
+        return latents, encoder_hidden
     
     def forward(
         self,
@@ -113,40 +141,44 @@ class GeneT5(nn.Module):
         encoder_attention_mask = None,
         decoder_attention_mask = None,
         encoder_hidden_states  = None,
+        latent_states          = None,
         past_key_values        = None,
         use_cache              = False
     ):
-        # Encode (or use cached)
-        if encoder_hidden_states is None:
-            encoder_hidden_states = self.encode(encoder_input_ids, encoder_attention_mask)
+        # Encode and compress (or use cached latents)
+        if latent_states is None:
+            if encoder_hidden_states is not None:
+                latent_states = self.compressor(encoder_hidden_states, encoder_attention_mask)
+            else:
+                latent_states, encoder_hidden_states = self.encode(
+                    encoder_input_ids, encoder_attention_mask
+                )
 
         # Create decoder attention mask from padding if not provided
-        # This handles -100 padding values properly
         if decoder_attention_mask is None and decoder_input_ids is not None:
             decoder_attention_mask = (decoder_input_ids >= 0) & (decoder_input_ids < self.vocab_size)
             decoder_attention_mask = decoder_attention_mask.long()
 
         # Replace invalid indices with pad token (0) for embedding lookup
-        # The attention mask will prevent these from affecting computation
-        decoder_input_ids_safe = decoder_input_ids.clone()
-        decoder_input_ids_safe[decoder_input_ids_safe < 0] = 0
+        decoder_input_ids_safe                                    = decoder_input_ids.clone()
+        decoder_input_ids_safe[decoder_input_ids_safe < 0]        = 0
         decoder_input_ids_safe[decoder_input_ids_safe >= self.vocab_size] = 0
 
         # Embed decoder inputs
         decoder_embeds = self.decoder_embed(decoder_input_ids_safe)
         decoder_embeds = self.decoder_embed_dropout(decoder_embeds)
-        
-        # Decode
+
+        # Decode with cross-attention to latents
         decoder_output, moe_loss = self.decoder(
             hidden_states          = decoder_embeds,
-            encoder_hidden_states  = encoder_hidden_states,
+            encoder_hidden_states  = latent_states,
             attention_mask         = decoder_attention_mask,
-            encoder_attention_mask = encoder_attention_mask,
+            encoder_attention_mask = None,  # No mask for latents
         )
-        
+
         # Project to vocab
         logits = self.lm_head(decoder_output)
-        
+
         # Compute loss
         loss = None
         if labels is not None:
@@ -154,17 +186,18 @@ class GeneT5(nn.Module):
             loss     = loss_fct(logits.reshape(-1, self.vocab_size), labels.reshape(-1))
             if moe_loss is not None:
                 loss = loss + moe_loss
-        
+
         outputs = {
             "logits":         logits,
             "loss":           loss,
             "moe_loss":       moe_loss,
-            "encoder_hidden": encoder_hidden_states
+            "encoder_hidden": encoder_hidden_states,
+            "latent_states":  latent_states,
         }
-        
+
         if use_cache:
             outputs["past_key_values"] = None
-        
+
         return outputs
     
     @torch.no_grad()
@@ -181,36 +214,36 @@ class GeneT5(nn.Module):
         pad_token_id           = 0
     ):
         """Autoregressive generation"""
+
         self.eval()
         device = encoder_input_ids.device
         batch  = encoder_input_ids.size(0)
-        
-        # Encode once
-        encoder_hidden = self.encode(encoder_input_ids, encoder_attention_mask)
-        
+
+        # Encode and compress to latents
+        latents, _ = self.encode(encoder_input_ids, encoder_attention_mask)
+
         # Start with BOS
         generated = torch.full((batch, 1), bos_token_id, dtype=torch.long, device=device)
         finished  = torch.zeros(batch, dtype=torch.bool, device=device)
-        
+
         for _ in range(max_length):
             outputs = self.forward(
-                encoder_input_ids      = None,
-                decoder_input_ids      = generated,
-                encoder_hidden_states  = encoder_hidden,
-                encoder_attention_mask = encoder_attention_mask,
+                encoder_input_ids = None,
+                decoder_input_ids = generated,
+                latent_states     = latents,
             )
-            
+
             logits = outputs["logits"][:, -1, :]
-            
+
             # Temperature
             if temperature != 1.0:
                 logits = logits / temperature
-            
+
             # Top-K
             if top_k > 0:
                 indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
                 logits[indices_to_remove] = float('-inf')
-            
+
             # Top-P
             if top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
@@ -220,36 +253,40 @@ class GeneT5(nn.Module):
                 sorted_indices_to_remove[..., 0] = 0
                 indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
                 logits[indices_to_remove] = float('-inf')
-            
+
             # Sample
             probs      = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             next_token[finished] = pad_token_id
             generated = torch.cat([generated, next_token], dim=1)
-            
+
             # Check EOS
             finished = finished | (next_token.squeeze(-1) == eos_token_id)
             if finished.all():
                 break
-        
+
         return generated
     
     def get_param_stats(self):
+
         enc_emb_train = sum(p.numel() for p in self.encoder_embed.parameters() if p.requires_grad)
         enc_train     = sum(p.numel() for p in self.encoder.parameters() if p.requires_grad)
         enc_frozen    = sum(p.numel() for p in self.encoder.parameters() if not p.requires_grad)
         dec_train     = sum(p.numel() for p in self.decoder.parameters() if p.requires_grad)
         emb_train     = sum(p.numel() for p in self.decoder_embed.parameters() if p.requires_grad)
         head_train    = sum(p.numel() for p in self.lm_head.parameters() if p.requires_grad)
-        
+
+        comp_train = sum(p.numel() for p in self.compressor.parameters() if p.requires_grad)
+
         return {
             "encoder_embed_trainable": enc_emb_train,
             "encoder_trainable":       enc_train,
             "encoder_frozen":          enc_frozen,
+            "compressor_trainable":    comp_train,
             "decoder_trainable":       dec_train,
             "embed_trainable":         emb_train,
             "head_trainable":          head_train,
-            "total_trainable":         enc_emb_train + enc_train + dec_train + emb_train + head_train,
+            "total_trainable":         enc_emb_train + enc_train + comp_train + dec_train + emb_train + head_train,
             "total_frozen":            enc_frozen
         }
     
@@ -266,18 +303,24 @@ class GeneT5(nn.Module):
             param.requires_grad = True
     
     def save(self, save_path):
+
         path = Path(save_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({
+
+        ckpt = {
             "encoder_embed": self.encoder_embed.state_dict(),
             "encoder":       self.encoder.state_dict(),
+            "compressor":    self.compressor.state_dict(),
             "decoder":       self.decoder.state_dict(),
             "decoder_embed": self.decoder_embed.state_dict(),
             "lm_head":       self.lm_head.state_dict()
-        }, path)
+        }
+
+        torch.save(ckpt, path)
         print(f"Saved to {path}")
     
     def load(self, checkpoint_path, strict=False):
+
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         if "encoder_embed" in ckpt:
             self.encoder_embed.load_state_dict(ckpt["encoder_embed"], strict=strict)
@@ -285,16 +328,19 @@ class GeneT5(nn.Module):
         self.decoder.load_state_dict(ckpt["decoder"], strict=strict)
         self.decoder_embed.load_state_dict(ckpt["decoder_embed"], strict=strict)
         self.lm_head.load_state_dict(ckpt["lm_head"], strict=strict)
+        if "compressor" in ckpt:
+            self.compressor.load_state_dict(ckpt["compressor"], strict=strict)
         print(f"Loaded from {checkpoint_path}")
     
     @classmethod
     def from_pretrained(cls, checkpoint_dir, device="cpu", dtype=torch.float32):
         """Load model from checkpoint directory"""
+
         path = Path(checkpoint_dir)
-        
+
         with open(path / "config.json", "r") as f:
             config = json.load(f)
-        
+
         model = cls(
             embed_dim            = config["embed_dim"],
             encoder_num_layers   = config["encoder_num_layers"],
@@ -315,13 +361,17 @@ class GeneT5(nn.Module):
             encoder_window_size  = config.get("encoder_window_size", 256),
             decoder_block_size   = config.get("decoder_block_size", 64),
             decoder_window_size  = config.get("decoder_window_size", 256),
+            # Perceiver config
+            num_latents          = config.get("num_latents", 512),
+            perceiver_layers     = config.get("perceiver_layers", 2),
         )
-        
+
         model.load(path / "pytorch_model.bin")
         model = model.to(device=device, dtype=dtype)
-        
+
         print(f"Loaded GeneT5 from {path} (dtype={dtype})")
         stats = model.get_param_stats()
         print(f"  Total params: {stats['total_trainable'] + stats['total_frozen']:,}")
-        
+        print(f"  Perceiver: {model.num_latents} latents, {model.perceiver_layers} layers")
+
         return model

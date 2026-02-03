@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from collections import OrderedDict
+
 import torch                as th
 import torch.nn             as nn
 import torch.nn.functional  as F
@@ -286,7 +288,6 @@ class BlockIndexBuilder:
 
     def __init__(self, block_size, window_size, max_seq_len=8192):
 
-        from collections import OrderedDict
         self.block_size  = block_size
         self.window_size = window_size
         self.max_seq_len = max_seq_len
