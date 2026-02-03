@@ -37,3 +37,8 @@ from lib.util._time import (
     format_time,
     format_rate,
 )
+
+from lib.util._memwatch import (
+    MemoryWatcher,
+    create_memory_watcher,
+)

@@ -52,9 +52,9 @@ python -u bin/bake_data --raw_dir ../raw --output_dir ../baked --n_workers 5 --s
 | :------------: | :------: | :-----------------: | :------------
 | Prokaryotes    | 10000    | ~2.2k               | 9000bps  = ~P99+ (no introns, avg 924 bp)
 | Unicellular    | 15000    | ~3.3k               | 15000bps = ~P95+ (yeast genes avg ~1.5 kb)
-| Invertebrates  | 30000    | ~6.6k               | 25000bps = ~P90 (Drosophila genes ~2-10 kb)
-| Vertebrates    | 45000    | ~10k                | 30000bps = ~P75 (median 23 kb, many >30kb)
-| Plants         | 30000    | ~6.6k               | 25000bps = ~P85-90 
+| Invertebrates  | 25000    | ~5.5k               | 25000bps = ~P90 (Drosophila genes ~2-10 kb)
+| Vertebrates    | 30000    | ~6.6k               | 30000bps = ~P75 (median 23 kb, many >30kb)
+| Plants         | 25000    | ~5.5k               | 25000bps = ~P85-90 
 
 
 
@@ -87,32 +87,13 @@ python3 bin/resize_model.py model_path tokenizer_path
 ---
 
 
-### Compacting All Binary File
-
-After parse all datas, remember to run the compacting function.
-
-```python3
- python -u bin/compact.py \
-  ../baked/*/training.bin \ 
-  -o ../baked/33/train.bin \
-  --tokenizer ../model/init/ \
-  --compact_target 30000 \
-  --hard_limit 32768 \
-  --workers 10 \     
-  2>&1 | tee ../logs/compact.log
-```
-
-
----
-
-
 ### Tuning
 
 
 ```python3
 python -u bin/finet \
-  ../baked/training.bin \
-  ../baked/validation.bin \
+  ../baked/training.packed \
+  ../baked/validation.packed \
   ../model/trial1 \
   ../model/init \
   --epochs 4 \
@@ -122,12 +103,11 @@ python -u bin/finet \
   --weight_decay 0.01 \
   --warmup_ratio 0.03 \
   --max_grad_norm 1.0 \
-  --gradient_checkpointing \
-  --optim_8bit \
   --label_smoothing 0.1 \
   --early_stopping 2 \
   --save_steps 500 \
   --log_memory \
   --empty_cache_steps 100 \
+  --memwatch \
   2>&1 | tee ../logs/tune/1.log
 ```

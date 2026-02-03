@@ -13,6 +13,7 @@ import transformers as tf
 import lib.dataset as ds
 import lib.tokenizer as tk
 import lib.model as mdl
+import lib.util as util
 
 
 DEFAULTS = {
@@ -80,6 +81,8 @@ def main():
         help='disable pin_memory in dataloaders (can reduce CPU memory pressure)')
     parser.add_argument('--log_memory', action='store_true',
         help='log memory usage in progress reports')
+    parser.add_argument('--memwatch', action='store_true',
+        help='enable background memory monitoring to CSV (first 5min: 5s intervals, then 30s)')
 
     args = parser.parse_args()
     
@@ -179,6 +182,7 @@ def main():
                 lr           = args.lr,
                 betas        = (0.9, 0.95),
                 weight_decay = args.weight_decay,
+                foreach      = False,  # Reduce memory during optimizer.step()
             )
     else:
         optimizer = torch.optim.AdamW(
@@ -186,6 +190,7 @@ def main():
             lr           = args.lr,
             betas        = (0.9, 0.95),
             weight_decay = args.weight_decay,
+            foreach      = False,  # Reduce memory during optimizer.step()
         )
     
     total_steps  = len(train_loader) * args.epochs // args.grad_accum
@@ -261,6 +266,12 @@ def main():
     patience_counter = 0
     global_step = 0  # Track optimizer steps across epochs
 
+    # Start memory watcher if enabled
+    mem_watcher = None
+    if args.memwatch:
+        mem_watcher = util.create_memory_watcher(output_dir, prefix="memory")
+        mem_watcher.start()
+
     for epoch in range(start_epoch, args.epochs):
         print(f"\nEpoch {epoch + 1}/{args.epochs}")
         print('-' * 40)
@@ -304,13 +315,25 @@ def main():
                     loss = loss_fct(logits.reshape(-1, model.vocab_size), labels.reshape(-1))
                     if outputs.get('moe_loss') is not None:
                         loss = loss + outputs['moe_loss']
+                    del logits
                 else:
                     loss = outputs['loss']
 
                 loss = loss / args.grad_accum
-            
+
+            # Save loss value before backward (for logging)
+            loss_val = loss.item() * args.grad_accum
+
             loss.backward()
-            
+
+            # Break computation graph links and release tensors
+            # detach_() breaks graph in-place, more effective than just del
+            # Reference: https://gist.github.com/thomwolf/ac7a7da6b1888c2eeac8ac8b9b05d3d3
+            for v in outputs.values():
+                if torch.is_tensor(v) and v.grad_fn is not None:
+                    v.detach_()
+            del outputs, loss, batch, decoder_input_ids, labels, decoder_attention_mask
+
             if (step + 1) % args.grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
@@ -336,7 +359,7 @@ def main():
                 if args.empty_cache_steps and global_step % args.empty_cache_steps == 0:
                     torch.cuda.empty_cache()
 
-            total_train_loss += loss.item() * args.grad_accum
+            total_train_loss += loss_val
 
             # Progress logging every N%
             current_pct = (step + 1) * 100 // num_batches
@@ -436,6 +459,10 @@ def main():
             }
             torch.save(checkpoint, save_path)
     
+    # Stop memory watcher
+    if mem_watcher:
+        mem_watcher.stop()
+
     # save final
     print(f"\n{'=' * 60}")
     print('Saving final model...')

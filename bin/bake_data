@@ -31,9 +31,9 @@ parser.add_argument("--n_workers",  type=int, default=None,
     help="Workers per species for chunking [auto]")
 parser.add_argument("--tokenizer",  type=str, required=True,
     help="Tokenizer path (required)")
-parser.add_argument("--target",     type=int, default=20000,
+parser.add_argument("--target",     type=int, default=12000,
     help="Target tokens per packed sequence [%(default)s]")
-parser.add_argument("--hard_limit", type=int, default=22000,
+parser.add_argument("--hard_limit", type=int, default=13200,
     help="Hard limit for packing (default: target * 1.1)")
 parser.add_argument("--file_parallel", type=int, default=5,
     help="Files to process in parallel during compacting [%(default)s]")

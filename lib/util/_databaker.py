@@ -33,7 +33,7 @@ TAXA_CONFIG = {
         ],
     },
     "Invertebrates": {
-        "limit":   30000,
+        "limit":   25000,
         "species": [
             "C.elegan",
             "Fly",
@@ -45,7 +45,7 @@ TAXA_CONFIG = {
         ],
     },
     "Vertebrates": {
-        "limit":   45000,
+        "limit":   30000,
         "species": [
             "C.jacchus",
             "Chicken",
@@ -59,7 +59,7 @@ TAXA_CONFIG = {
         ],
     },
     "Plants": {
-        "limit":   30000,
+        "limit":   25000,
         "species": [
             "Earthmoss",
             "Maize",
