@@ -25,19 +25,21 @@ parser.add_argument("--taxa",       type=str, nargs='+', default=None,
     help="Process only specific taxa (default: all)")
 parser.add_argument("--species",    type=str, nargs='+', default=None,
     help="Process only specific species (default: all)")
-parser.add_argument("--species_parallel", type=int, default=2,
+parser.add_argument("--species_parallel", type=int, default=6,
     help="Number of species to process in parallel [%(default)s]")
 parser.add_argument("--n_workers",  type=int, default=None,
     help="Workers per species for chunking [auto]")
 parser.add_argument("--tokenizer",  type=str, required=True,
     help="Tokenizer path (required)")
-parser.add_argument("--target",     type=int, default=12000,
+parser.add_argument("--target",     type=int, default=8000,
     help="Target tokens per packed sequence [%(default)s]")
-parser.add_argument("--hard_limit", type=int, default=13200,
+parser.add_argument("--hard_limit", type=int, default=9100,
     help="Hard limit for packing (default: target * 1.1)")
+parser.add_argument("--max_target_len", type=int, default=32000,
+    help="Max cumulative target tokens per packed sample")
 parser.add_argument("--file_parallel", type=int, default=5,
     help="Files to process in parallel during compacting [%(default)s]")
-parser.add_argument("--compact_workers", type=int, default=8,
+parser.add_argument("--compact_workers", type=int, default=18,
     help="Parallel workers for compacting phase [%(default)s]")
 parser.add_argument("--num_complex", type=int, default=7,
     help="Number of complex genes for validation per species [%(default)s]")
@@ -47,6 +49,8 @@ parser.add_argument("--num_easy",    type=int, default=7,
     help="Number of easy genes for validation per species [%(default)s]")
 parser.add_argument("--keep_temp",  action="store_true",
     help="Keep temporary per-species files (for debugging)")
+parser.add_argument("--compress", type=str, default=None,
+    choices=['zlib', 'zstd'], help="Compress binary files with zlib or zstd")
 
 args = parser.parse_args()
 
@@ -80,6 +84,8 @@ print(f"  Output directory: {output_dir}")
 print(f"  Temp directory:   {temp_dir}")
 print(f"  Tokenizer:        {args.tokenizer}")
 print(f"  Target tokens:    {args.target:,}")
+if args.max_target_len:
+    print(f"  Max target len:   {args.max_target_len:,}")
 print(f"  Species parallel: {args.species_parallel}")
 print(f"  Workers/species:  {n_workers_per_species}")
 print(f"  Compact workers:  {args.compact_workers}")
@@ -104,7 +110,7 @@ for taxa, info in taxa_counts.items():
 
 work_items = [
     (sp, raw_dir, temp_dir, log_dir, limit, None, args.tokenizer,
-     n_workers_per_species, args.num_complex, args.num_normal, args.num_easy)
+     n_workers_per_species, args.num_complex, args.num_normal, args.num_easy, args.compress)
     for sp, limit, taxa in species_to_process
 ]
 
@@ -178,6 +184,8 @@ else:
 
     if args.hard_limit:
         compact_cmd += ["--hard_limit", str(args.hard_limit)]
+    if args.max_target_len:
+        compact_cmd += ["--max_target_len", str(args.max_target_len)]
 
     result = subprocess.run(compact_cmd, capture_output=True, text=True)
 
@@ -221,6 +229,8 @@ else:
 
     if args.hard_limit:
         val_compact_cmd += ["--hard_limit", str(args.hard_limit)]
+    if args.max_target_len:
+        val_compact_cmd += ["--max_target_len", str(args.max_target_len)]
 
     val_result = subprocess.run(val_compact_cmd, capture_output=True, text=True)
 

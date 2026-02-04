@@ -1,7 +1,62 @@
 import subprocess
 import pathlib
+import tempfile
+import shutil
+import os
 
 import lib.dataset as ds
+
+
+############################
+#####  Pre-Decompress  #####
+############################
+
+
+def decompress_to_temp(gz_path, temp_dir=None):
+    """
+    Decompress gzipped file to temp location for faster parsing
+
+    Uses pigz if available (parallel), falls back to gunzip
+    Returns path to decompressed file
+    """
+    gz_path = pathlib.Path(gz_path)
+
+    if not str(gz_path).endswith('.gz'):
+        return gz_path
+
+    if temp_dir is None:
+        temp_dir = pathlib.Path(tempfile.gettempdir())
+    else:
+        temp_dir = pathlib.Path(temp_dir)
+
+    # Output filename without .gz
+    out_name = gz_path.name[:-3]
+    out_path = temp_dir / out_name
+
+    # Try pigz first (parallel, much faster), then gzip
+    try:
+        # Check if pigz is available
+        result = subprocess.run(['which', 'pigz'], capture_output=True)
+        if result.returncode == 0:
+            subprocess.run(
+                ['pigz', '-d', '-k', '-c', str(gz_path)],
+                stdout=open(out_path, 'wb'),
+                check=True
+            )
+        else:
+            subprocess.run(
+                ['gunzip', '-c', str(gz_path)],
+                stdout=open(out_path, 'wb'),
+                check=True
+            )
+        return out_path
+    except Exception:
+        # Fallback to Python gzip
+        import gzip
+        with gzip.open(gz_path, 'rb') as f_in:
+            with open(out_path, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+        return out_path
 
 
 ####################
@@ -22,7 +77,7 @@ TAXA_CONFIG = {
         ],
     },
     "Unicellular": {
-        "limit":   15000,
+        "limit":   10000,
         "species": [
             "S.cerevisiae",
             "S.pombe",
@@ -33,7 +88,7 @@ TAXA_CONFIG = {
         ],
     },
     "Invertebrates": {
-        "limit":   25000,
+        "limit":   20000,
         "species": [
             "C.elegan",
             "Fly",
@@ -45,7 +100,7 @@ TAXA_CONFIG = {
         ],
     },
     "Vertebrates": {
-        "limit":   30000,
+        "limit":   20000,
         "species": [
             "C.jacchus",
             "Chicken",
@@ -59,7 +114,7 @@ TAXA_CONFIG = {
         ],
     },
     "Plants": {
-        "limit":   25000,
+        "limit":   20000,
         "species": [
             "Earthmoss",
             "Maize",
@@ -131,7 +186,7 @@ def find_genome_files(species_dir):
 #################################
 
 
-def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_dir, token_file=None, tokenizer_path=None, n_workers=1, num_complex=5, num_normal=5, num_easy=5):
+def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_dir, token_file=None, tokenizer_path=None, n_workers=1, num_complex=5, num_normal=5, num_easy=5, compress=None):
     """Run parse_data.py for a single species"""
 
     cmd = [
@@ -151,6 +206,9 @@ def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_di
 
     if tokenizer_path:
         cmd.extend(["--tokenizer", str(tokenizer_path)])
+
+    if compress:
+        cmd.extend(["--compress", compress])
     
     log_file = log_dir / f"{species_name}.log"
     
@@ -220,7 +278,12 @@ def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_di
 def process_species(args):
     """Worker function for parallel species processing"""
 
-    species_name, raw_dir, baked_dir, log_dir, limit, token_file, tokenizer_path, n_workers, num_complex, num_normal, num_easy = args
+    # Handle both old (11 args) and new (12 args) calling convention
+    if len(args) == 12:
+        species_name, raw_dir, baked_dir, log_dir, limit, token_file, tokenizer_path, n_workers, num_complex, num_normal, num_easy, compress = args
+    else:
+        species_name, raw_dir, baked_dir, log_dir, limit, token_file, tokenizer_path, n_workers, num_complex, num_normal, num_easy = args
+        compress = None
 
     species_raw_dir = pathlib.Path(raw_dir) / species_name
 
@@ -243,9 +306,32 @@ def process_species(args):
     output_dir = pathlib.Path(baked_dir) / species_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    return run_parse_data(
-        species_name, fasta_file, gff_file, output_dir, limit, log_dir, token_file, tokenizer_path, n_workers, num_complex, num_normal, num_easy
+    # Pre-decompress gzipped files for faster parsing
+    decompressed_files = []
+    try:
+        if str(fasta_file).endswith('.gz'):
+            fasta_file = decompress_to_temp(fasta_file, output_dir)
+            decompressed_files.append(fasta_file)
+        if str(gff_file).endswith('.gz'):
+            gff_file = decompress_to_temp(gff_file, output_dir)
+            decompressed_files.append(gff_file)
+    except Exception as e:
+        # Fall back to original gzipped files if decompression fails
+        pass
+
+    result = run_parse_data(
+        species_name, fasta_file, gff_file, output_dir, limit, log_dir, token_file, tokenizer_path, n_workers, num_complex, num_normal, num_easy, compress
     )
+
+    # Clean up decompressed files
+    for f in decompressed_files:
+        try:
+            if f.exists():
+                f.unlink()
+        except Exception:
+            pass
+
+    return result
 
 
 ####################################

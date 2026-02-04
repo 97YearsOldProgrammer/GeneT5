@@ -83,6 +83,8 @@ def main():
         help='log memory usage in progress reports')
     parser.add_argument('--memwatch', action='store_true',
         help='enable background memory monitoring to CSV (first 5min: 5s intervals, then 30s)')
+    parser.add_argument('--sort_by_length', action='store_true',
+        help='sort batches by label length descending (largest first for memory profiling)')
 
     args = parser.parse_args()
     
@@ -139,15 +141,47 @@ def main():
 
     collator = ds.PackedCollator(tokenizer.pad_token_id, -100)
 
-    train_loader = data_utils.DataLoader(
-        train_dataset,
-        batch_size  = args.batch_size,
-        shuffle     = True,
-        collate_fn  = collator,
-        num_workers = args.num_workers,
-        pin_memory  = not args.no_pin_memory,
-        drop_last   = True,
-    )
+    # Sort by label length if requested (largest first for memory profiling)
+    train_sampler = None
+    train_shuffle = True
+    if args.sort_by_length:
+        print(f"  Sorting batches by label length (largest first)...")
+        label_lengths = []
+        for i in range(len(train_dataset)):
+            sample = train_dataset[i]
+            label_lengths.append(len(sample['labels']))
+        sorted_indices = sorted(range(len(train_dataset)),
+                                key=lambda i: label_lengths[i],
+                                reverse=True)
+        train_sampler = data_utils.sampler.BatchSampler(
+            sorted_indices,
+            batch_size=args.batch_size,
+            drop_last=True
+        )
+        train_shuffle = False
+        max_lbl = max(label_lengths)
+        min_lbl = min(label_lengths)
+        print(f"  Label lengths: {min_lbl:,} - {max_lbl:,} tokens")
+        print(f"  First batch will have ~{max_lbl:,} token labels (peak memory)")
+
+    if train_sampler:
+        train_loader = data_utils.DataLoader(
+            train_dataset,
+            batch_sampler = train_sampler,
+            collate_fn    = collator,
+            num_workers   = args.num_workers,
+            pin_memory    = not args.no_pin_memory,
+        )
+    else:
+        train_loader = data_utils.DataLoader(
+            train_dataset,
+            batch_size  = args.batch_size,
+            shuffle     = train_shuffle,
+            collate_fn  = collator,
+            num_workers = args.num_workers,
+            pin_memory  = not args.no_pin_memory,
+            drop_last   = True,
+        )
 
     val_loader = data_utils.DataLoader(
         val_dataset,
@@ -294,11 +328,14 @@ def main():
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
 
             # Prepare decoder inputs with proper attention mask
-            decoder_input_ids = batch['labels'][:, :-1]
+            decoder_input_ids = batch['labels'][:, :-1].clone()
             labels = batch['labels'][:, 1:]
 
             # Create decoder attention mask (1 for valid tokens, 0 for padding)
             decoder_attention_mask = (decoder_input_ids != -100).long()
+
+            # Replace -100 with pad_token_id (can't pass -100 to embedding layer)
+            decoder_input_ids[decoder_input_ids == -100] = tokenizer.pad_token_id
 
             with torch.amp.autocast('cuda', dtype=dtype):
                 outputs = model(
@@ -399,9 +436,10 @@ def main():
                 batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
 
                 # Prepare decoder inputs with proper attention mask
-                decoder_input_ids = batch['labels'][:, :-1]
+                decoder_input_ids = batch['labels'][:, :-1].clone()
                 labels = batch['labels'][:, 1:]
                 decoder_attention_mask = (decoder_input_ids != -100).long()
+                decoder_input_ids[decoder_input_ids == -100] = tokenizer.pad_token_id
 
                 with torch.amp.autocast('cuda', dtype=dtype):
                     outputs = model(
@@ -414,6 +452,9 @@ def main():
 
                 total_val_loss += outputs['loss'].item()
                 num_batches    += 1
+
+                # Cleanup for long validation sequences
+                del outputs, batch, decoder_input_ids, labels, decoder_attention_mask
         
         val_loss = total_val_loss / max(num_batches, 1)
         

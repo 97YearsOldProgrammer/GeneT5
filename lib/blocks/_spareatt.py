@@ -24,8 +24,8 @@ class SparseAttentionConfig:
     num_heads:    int   = 12
     num_kv_heads: int   = None
     head_dim:     int   = None
-    block_size:   int   = 64
-    window_size:  int   = 256
+    block_size:   int   = 16       # 16 tokens per block
+    window_size:  int   = 1600     # 1600 tokens per sliding window
     dropout:      float = 0.0
     use_alibi:    bool  = True
     max_seq_len:  int   = 8192

@@ -82,7 +82,7 @@ class CrossAttention(nn.Module):
 
         if attention_mask is not None:
             mask = (attention_mask == 0).unsqueeze(1).unsqueeze(2)
-            scores = scores.masked_fill(mask, float('-inf'))
+            scores = scores.masked_fill(mask, -1e9)
 
         attn = F.softmax(scores, dim=-1)
         attn = self.dropout(attn)
@@ -149,7 +149,6 @@ class FeedForward(nn.Module):
         x = F.gelu(x)
         x = self.dropout(x)
         x = self.fc2(x)
-        x = self.dropout(x)
 
         return x
 

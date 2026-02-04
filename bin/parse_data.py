@@ -35,6 +35,8 @@ parser.add_argument('--n_workers', required=False, type=int, default=None,
     metavar='<int>', help='parallel workers [auto]')
 parser.add_argument('--tokenizer', required=False, type=str, default=None,
     metavar='<path>', help='tokenizer path for storing token lengths')
+parser.add_argument('--compress', required=False, type=str, default=None,
+    choices=['zlib', 'zstd'], help='compress output with zlib or zstd')
 
 args = parser.parse_args()
 
@@ -143,8 +145,10 @@ if args.tokenizer:
         target_enc = tokenizer(target_texts, add_special_tokens=False)
 
         for i, chunk in enumerate(batch_chunks):
-            chunk.input_len  = len(input_enc['input_ids'][i])
-            chunk.target_len = len(target_enc['input_ids'][i])
+            chunk.input_ids  = input_enc['input_ids'][i]
+            chunk.target_ids = target_enc['input_ids'][i]
+            chunk.input_len  = len(chunk.input_ids)
+            chunk.target_len = len(chunk.target_ids)
 
         pct = 100 * batch_end / total_chunks
         print(f"    Tokenized: {batch_end:,}/{total_chunks:,} ({pct:.1f}%)", end='\r')
@@ -159,7 +163,7 @@ print(f"\n{' Writing Outputs ':=^60}")
 
 # Write training
 train_path = output_dir / 'training.bin'
-ds.write_binary(all_chunks, train_path)
+ds.write_binary(all_chunks, train_path, compress=args.compress)
 train_size = train_path.stat().st_size
 print(f"  Training:   {train_path} ({ds.format_size(train_size)})")
 
@@ -207,12 +211,14 @@ if tokenizer and val_chunks:
     target_enc = tokenizer(target_texts, add_special_tokens=False)
 
     for i, chunk in enumerate(val_chunks):
-        chunk.input_len  = len(input_enc['input_ids'][i])
-        chunk.target_len = len(target_enc['input_ids'][i])
+        chunk.input_ids  = input_enc['input_ids'][i]
+        chunk.target_ids = target_enc['input_ids'][i]
+        chunk.input_len  = len(chunk.input_ids)
+        chunk.target_len = len(chunk.target_ids)
 
 # Write validation
 val_path = output_dir / 'validation.bin'
-ds.write_binary(val_chunks, val_path)
+ds.write_binary(val_chunks, val_path, compress=args.compress)
 val_size = val_path.stat().st_size
 print(f"  Validation: {val_path} ({ds.format_size(val_size)})")
 

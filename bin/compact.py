@@ -18,6 +18,10 @@ parser.add_argument('--target', required=True, type=int,
     metavar='<int>', help='target tokens per packed sequence')
 parser.add_argument('--hard_limit', required=False, type=int, default=None,
     metavar='<int>', help='hard limit (default: target * 1.1)')
+parser.add_argument('--max_target_len', required=False, type=int, default=None,
+    metavar='<int>', help='max cumulative target tokens per packed sample')
+parser.add_argument('--target_hard_limit', required=False, type=int, default=None,
+    metavar='<int>', help='target hard limit (default: max_target_len * 1.1)')
 parser.add_argument('--block_size', required=False, type=int, default=64,
     metavar='<int>', help='attention block size [%(default)i]')
 parser.add_argument('--window_size', required=False, type=int, default=256,
@@ -90,11 +94,15 @@ if "[SEP]" not in tokenizer.get_vocab():
 
 
 print(f"\n{' Configuration ':=^70}")
-print(f"  Input files:   {len(file_paths)}")
-print(f"  Target length: {args.target:,} tokens")
-print(f"  Hard limit:    {hard_limit:,} tokens")
-print(f"  Block size:    {args.block_size}")
-print(f"  Window size:   {args.window_size}")
+print(f"  Input files:     {len(file_paths)}")
+print(f"  Target length:   {args.target:,} tokens")
+print(f"  Hard limit:      {hard_limit:,} tokens")
+if args.max_target_len:
+    target_hard = args.target_hard_limit or int(args.max_target_len * 1.1)
+    print(f"  Max target len:  {args.max_target_len:,} tokens")
+    print(f"  Target hard lim: {target_hard:,} tokens")
+print(f"  Block size:      {args.block_size}")
+print(f"  Window size:     {args.window_size}")
 print(f"  Phase 3 workers: {args.workers}")
 
 
@@ -132,16 +140,24 @@ phase2_start = time.time()
 group_assignments, pack_stats = ds.pack_from_metadata(
     metadata,
     args.target,
-    hard_limit = hard_limit,
-    seed       = args.seed,
+    hard_limit        = hard_limit,
+    max_target_len    = args.max_target_len,
+    target_hard_limit = args.target_hard_limit,
+    seed              = args.seed,
 )
 
 phase2_time = time.time() - phase2_start
 
 print(f"\n  Results:")
-print(f"    Groups:      {pack_stats['total_groups']:,}")
-print(f"    Utilization: {pack_stats['avg_utilization']*100:.1f}% avg")
-print(f"    Singletons:  {pack_stats['singleton_count']:,}")
+print(f"    Groups:           {pack_stats['total_groups']:,}")
+print(f"    Input util:       {pack_stats['avg_utilization']*100:.1f}% avg")
+if 'avg_target_utilization' in pack_stats:
+    print(f"    Target util:      {pack_stats['avg_target_utilization']*100:.1f}% avg")
+print(f"    Singletons:       {pack_stats['singleton_count']:,}")
+if pack_stats['overflow_count'] > 0:
+    print(f"    Input overflow:   {pack_stats['overflow_count']:,}")
+if pack_stats['target_overflow_count'] > 0:
+    print(f"    Target overflow:  {pack_stats['target_overflow_count']:,}")
 print(f"  Time: {util.format_time(phase2_time)}")
 
 

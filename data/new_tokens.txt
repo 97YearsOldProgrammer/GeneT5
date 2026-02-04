@@ -1,4 +1,4 @@
-<bos>
+<<bos>
 <eos>
 origin_of_replication
 mobile_genetic_element

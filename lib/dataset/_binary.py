@@ -15,6 +15,11 @@ FORMAT_VERSION = 2  # v2: 64-bit offsets (QI) for files >4GB
 OFFSET_ENTRY_SIZE_V1 = 8   # II: 32-bit offset, 32-bit length
 OFFSET_ENTRY_SIZE_V2 = 12  # QI: 64-bit offset, 32-bit length
 
+# Compression types
+COMPRESS_NONE = 0
+COMPRESS_ZLIB = 1
+COMPRESS_ZSTD = 2
+
 
 #########################
 #####  BinaryChunk  #####
@@ -41,6 +46,8 @@ class BinaryChunk:
         compact_group = None,
         input_len     = None,
         target_len    = None,
+        input_ids     = None,
+        target_ids    = None,
     ):
 
         self.seqid         = seqid
@@ -58,6 +65,8 @@ class BinaryChunk:
         self.compact_group = compact_group
         self.input_len     = input_len
         self.target_len    = target_len
+        self.input_ids     = input_ids      # Pre-tokenized input IDs
+        self.target_ids    = target_ids     # Pre-tokenized target IDs
 
     def to_bytes(self):
         """Serialize chunk to bytes"""
@@ -82,24 +91,60 @@ class BinaryChunk:
         feat_json  = json.dumps(self.features).encode('utf-8')
         hints_json = json.dumps(self.hints).encode('utf-8')
 
-        meta_len  = len(meta_json)
-        seq_len   = len(seq_bytes)
-        feat_len  = len(feat_json)
-        hints_len = len(hints_json)
+        # Pack token IDs if present (for pre-tokenized chunks)
+        if self.input_ids is not None:
+            input_ids_bytes = struct.pack(f'<{len(self.input_ids)}i', *self.input_ids)
+        else:
+            input_ids_bytes = b''
 
-        header = struct.pack('<4I', meta_len, seq_len, feat_len, hints_len)
-        data   = header + meta_json + seq_bytes + feat_json + hints_json
+        if self.target_ids is not None:
+            target_ids_bytes = struct.pack(f'<{len(self.target_ids)}i', *self.target_ids)
+        else:
+            target_ids_bytes = b''
+
+        meta_len       = len(meta_json)
+        seq_len        = len(seq_bytes)
+        feat_len       = len(feat_json)
+        hints_len      = len(hints_json)
+        input_ids_len  = len(self.input_ids) if self.input_ids else 0
+        target_ids_len = len(self.target_ids) if self.target_ids else 0
+
+        # v2 format: 6 length fields
+        header = struct.pack('<6I', meta_len, seq_len, feat_len, hints_len, input_ids_len, target_ids_len)
+        data   = header + meta_json + seq_bytes + feat_json + hints_json + input_ids_bytes + target_ids_bytes
 
         return data
 
     @classmethod
     def from_bytes(cls, data):
-        """Deserialize chunk from bytes"""
+        """Deserialize chunk from bytes (v2 format with optional pre-tokenized IDs)"""
 
-        header_size                            = struct.calcsize('<4I')
-        meta_len, seq_len, feat_len, hints_len = struct.unpack('<4I', data[:header_size])
+        # Try v2 format first (6I header), fall back to v1 (4I header)
+        header_size_v2 = struct.calcsize('<6I')
+        header_size_v1 = struct.calcsize('<4I')
 
-        offset     = header_size
+        # Check if we have enough data for v2 header and if input_ids_len/target_ids_len are reasonable
+        if len(data) >= header_size_v2:
+            meta_len, seq_len, feat_len, hints_len, input_ids_len, target_ids_len = struct.unpack(
+                '<6I', data[:header_size_v2]
+            )
+
+            # Sanity check: if token counts are unreasonably large, it's v1 format
+            if input_ids_len > 1000000 or target_ids_len > 1000000:
+                # Fall back to v1 parsing
+                meta_len, seq_len, feat_len, hints_len = struct.unpack('<4I', data[:header_size_v1])
+                input_ids_len  = 0
+                target_ids_len = 0
+                offset         = header_size_v1
+            else:
+                offset = header_size_v2
+        else:
+            # v1 format
+            meta_len, seq_len, feat_len, hints_len = struct.unpack('<4I', data[:header_size_v1])
+            input_ids_len  = 0
+            target_ids_len = 0
+            offset         = header_size_v1
+
         meta_json  = data[offset:offset + meta_len].decode('utf-8')
         offset    += meta_len
 
@@ -110,6 +155,20 @@ class BinaryChunk:
         offset    += feat_len
 
         hints_json = data[offset:offset + hints_len].decode('utf-8')
+        offset    += hints_len
+
+        # Unpack pre-tokenized IDs if present
+        input_ids  = None
+        target_ids = None
+
+        if input_ids_len > 0:
+            input_ids_bytes = data[offset:offset + input_ids_len * 4]
+            input_ids       = list(struct.unpack(f'<{input_ids_len}i', input_ids_bytes))
+            offset         += input_ids_len * 4
+
+        if target_ids_len > 0:
+            target_ids_bytes = data[offset:offset + target_ids_len * 4]
+            target_ids       = list(struct.unpack(f'<{target_ids_len}i', target_ids_bytes))
 
         meta     = json.loads(meta_json)
         features = json.loads(feat_json)
@@ -131,6 +190,8 @@ class BinaryChunk:
             compact_group = meta.get("compact_group"),
             input_len     = meta.get("input_len"),
             target_len    = meta.get("target_len"),
+            input_ids     = input_ids,
+            target_ids    = target_ids,
         )
 
     def _build_gene_transcript_indices(self):
@@ -240,25 +301,46 @@ class BinaryChunk:
 #################
 
 
-def write_binary(chunks, output_path, show_progress=True):
+def write_binary(chunks, output_path, show_progress=True, compress=None):
     """
-    Write chunks to binary file (uncompressed for fast streaming)
+    Write chunks to binary file with optional compression
 
     Uses streaming write with seek-based offset table to minimize memory:
     - Memory: O(n) for offset array (~12MB per 1M chunks) + O(1) chunk buffer
     - Single pass through chunks, single serialization per chunk
-    - v3 format: 64-bit offsets, uncompressed
-    """
+    - v2 format: 64-bit offsets
 
+    Args:
+        compress: None (no compression), 'zlib', or 'zstd'
+    """
     output_path = pathlib.Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     num_chunks = len(chunks)
 
+    # Determine compression
+    if compress == 'zstd':
+        try:
+            import zstd
+            compress_byte = COMPRESS_ZSTD
+            compressor    = lambda data: zstd.compress(data, 3)
+        except ImportError:
+            print("  WARNING: zstd not available, falling back to zlib")
+            import zlib
+            compress_byte = COMPRESS_ZLIB
+            compressor    = lambda data: zlib.compress(data, 6)
+    elif compress == 'zlib':
+        import zlib
+        compress_byte = COMPRESS_ZLIB
+        compressor    = lambda data: zlib.compress(data, 6)
+    else:
+        compress_byte = COMPRESS_NONE
+        compressor    = None
+
     with open(output_path, 'wb') as f:
         f.write(MAGIC_HEADER)
         f.write(struct.pack('<B', FORMAT_VERSION))
-        f.write(struct.pack('<B', 0))
+        f.write(struct.pack('<B', compress_byte))
         f.write(struct.pack('<I', num_chunks))
 
         offset_table_pos = f.tell()
@@ -269,6 +351,9 @@ def write_binary(chunks, output_path, show_progress=True):
         for i, chunk in enumerate(chunks):
             current_offset = f.tell()
             chunk_bytes    = chunk.to_bytes()
+
+            if compressor:
+                chunk_bytes = compressor(chunk_bytes)
 
             f.write(chunk_bytes)
             offsets.append((current_offset, len(chunk_bytes)))
@@ -287,19 +372,35 @@ def write_binary(chunks, output_path, show_progress=True):
     return output_path
 
 
-def read_binary(input_path):
-    """Read all chunks from binary file (supports v1-v3 formats)"""
+def _get_decompressor(compress_type):
+    """Get decompression function for given compression type"""
 
-    import zlib
+    if compress_type == COMPRESS_ZSTD:
+        try:
+            import zstd
+            return zstd.decompress
+        except ImportError:
+            raise ImportError("zstd required to read this file. Install with: pip install zstd")
+    elif compress_type == COMPRESS_ZLIB:
+        import zlib
+        return zlib.decompress
+    else:
+        return None
+
+
+def read_binary(input_path):
+    """Read all chunks from binary file (supports v1-v2 formats, zlib/zstd)"""
 
     with open(input_path, 'rb') as f:
         magic = f.read(4)
         if magic != MAGIC_HEADER:
             raise ValueError(f"Invalid magic header: {magic}")
 
-        version    = struct.unpack('<B', f.read(1))[0]
-        compressed = struct.unpack('<B', f.read(1))[0]
-        num_chunks = struct.unpack('<I', f.read(4))[0]
+        version      = struct.unpack('<B', f.read(1))[0]
+        compress_type = struct.unpack('<B', f.read(1))[0]
+        num_chunks   = struct.unpack('<I', f.read(4))[0]
+
+        decompressor = _get_decompressor(compress_type)
 
         offsets = []
         if version >= 2:
@@ -316,8 +417,8 @@ def read_binary(input_path):
             f.seek(offset)
             data = f.read(length)
 
-            if compressed:
-                data = zlib.decompress(data)
+            if decompressor:
+                data = decompressor(data)
 
             chunk = BinaryChunk.from_bytes(data)
             chunks.append(chunk)
@@ -328,19 +429,19 @@ def read_binary(input_path):
 def read_chunk_at_index(input_path, index):
     """Read single chunk by index without loading entire file"""
 
-    import zlib
-
     with open(input_path, 'rb') as f:
         magic = f.read(4)
         if magic != MAGIC_HEADER:
             raise ValueError(f"Invalid magic header: {magic}")
 
-        version    = struct.unpack('<B', f.read(1))[0]
-        compressed = struct.unpack('<B', f.read(1))[0]
-        num_chunks = struct.unpack('<I', f.read(4))[0]
+        version       = struct.unpack('<B', f.read(1))[0]
+        compress_type = struct.unpack('<B', f.read(1))[0]
+        num_chunks    = struct.unpack('<I', f.read(4))[0]
 
         if index >= num_chunks:
             raise IndexError(f"Index {index} out of range (total: {num_chunks})")
+
+        decompressor = _get_decompressor(compress_type)
 
         if version >= 2:
             f.seek(10 + index * 12)
@@ -352,10 +453,50 @@ def read_chunk_at_index(input_path, index):
         f.seek(offset)
         data = f.read(length)
 
-        if compressed:
-            data = zlib.decompress(data)
+        if decompressor:
+            data = decompressor(data)
 
         return BinaryChunk.from_bytes(data)
+
+
+def iter_binary(input_path):
+    """
+    Iterate chunks from binary file without loading all into memory
+
+    Yields (chunk_idx, chunk) tuples. More efficient than read_binary for
+    sequential processing, and more efficient than repeated read_chunk_at_index.
+    """
+    with open(input_path, 'rb') as f:
+        magic = f.read(4)
+        if magic != MAGIC_HEADER:
+            raise ValueError(f"Invalid magic header: {magic}")
+
+        version       = struct.unpack('<B', f.read(1))[0]
+        compress_type = struct.unpack('<B', f.read(1))[0]
+        num_chunks    = struct.unpack('<I', f.read(4))[0]
+
+        decompressor = _get_decompressor(compress_type)
+
+        # Read offset table
+        offsets = []
+        if version >= 2:
+            for _ in range(num_chunks):
+                offset, length = struct.unpack('<QI', f.read(12))
+                offsets.append((offset, length))
+        else:
+            for _ in range(num_chunks):
+                offset, length = struct.unpack('<II', f.read(8))
+                offsets.append((offset, length))
+
+        # Yield chunks sequentially
+        for chunk_idx, (offset, length) in enumerate(offsets):
+            f.seek(offset)
+            data = f.read(length)
+
+            if decompressor:
+                data = decompressor(data)
+
+            yield chunk_idx, BinaryChunk.from_bytes(data)
 
 
 def get_binary_info(input_path):

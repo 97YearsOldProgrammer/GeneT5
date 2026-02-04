@@ -67,8 +67,8 @@ def parse_gff_attributes(attr_string):
     return attrs
 
 
-def parse_gff(gff_path):
-    """Parse GFF3 file (handles gzipped files)"""
+def parse_gff(gff_path, buffer_size=1024*1024):
+    """Parse GFF3 file with buffered reading (handles gzipped files)"""
 
     features = []
 
@@ -76,42 +76,70 @@ def parse_gff(gff_path):
     mode = 'rt' if str(gff_path).endswith('.gz') else 'r'
 
     with open_func(gff_path, mode) as f:
-        for line in f:
-            line = line.strip()
+        remainder = ""
 
-            # Skip empty lines and comments
-            if not line or line.startswith('#'):
+        while True:
+            chunk = f.read(buffer_size)
+            if not chunk:
+                # Process any remaining data
+                if remainder.strip():
+                    _parse_gff_lines(remainder, features)
+                break
+
+            # Combine with remainder from previous chunk
+            data = remainder + chunk
+
+            # Find last newline to avoid splitting mid-line
+            last_nl = data.rfind('\n')
+            if last_nl == -1:
+                remainder = data
                 continue
 
-            parts = line.split('\t')
-            if len(parts) < 9:
-                continue
+            # Process complete lines
+            lines_data = data[:last_nl]
+            remainder  = data[last_nl + 1:]
 
-            seqid  = parts[0]
-            source = parts[1]
-            ftype  = parts[2]
-            start  = int(parts[3])
-            end    = int(parts[4])
-            score  = parts[5]
-            strand = parts[6]
-            phase  = parts[7]
-            attrs  = parse_gff_attributes(parts[8])
-
-            feature = {
-                "seqid":      seqid,
-                "source":     source,
-                "type":       ftype,
-                "start":      start,
-                "end":        end,
-                "score":      score,
-                "strand":     strand,
-                "phase":      phase,
-                "attributes": attrs,
-            }
-
-            features.append(feature)
+            _parse_gff_lines(lines_data, features)
 
     return features
+
+
+def _parse_gff_lines(data, features):
+    """Parse multiple GFF lines from a string buffer"""
+
+    for line in data.split('\n'):
+        line = line.strip()
+
+        if not line or line.startswith('#'):
+            continue
+
+        parts = line.split('\t')
+        if len(parts) < 9:
+            continue
+
+        seqid  = parts[0]
+        source = parts[1]
+        ftype  = parts[2]
+        start  = int(parts[3])
+        end    = int(parts[4])
+        score  = parts[5]
+        strand = parts[6]
+        phase  = parts[7]
+        attrs  = parse_gff_attributes(parts[8])
+
+        feature = {
+            "seqid":      seqid,
+            "source":     source,
+            "type":       ftype,
+            "start":      start,
+            "end":        end,
+            "score":      score,
+            "strand":     strand,
+            "phase":      phase,
+            "attributes": attrs,
+        }
+
+        features.append(feature)
 
 
 ########################

@@ -3,24 +3,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import json
 
-from pathlib import Path
-from lib.blocks import Encoder, Decoder
-from lib.blocks._perceiver import PerceiverCompressor, PerceiverConfig
+from pathlib                import Path
+from lib.blocks             import Encoder, Decoder
+from lib.blocks._perceiver  import PerceiverCompressor, PerceiverConfig
 
 
 class GeneT5(nn.Module):
-    """
-    GeneT5: DNA-to-Protein Encoder-Decoder
-
-    Architecture:
-        Encoder: BigBird sparse attention for long DNA sequences
-        Perceiver: Learned latent compression (20K -> 512 tokens)
-        Decoder: Sparse self-attention + GQA cross-attention + MoE
-
-    Memory savings:
-        Cross-attention: O(D × N) -> O(D × L) where L << N
-        Example: 160K × 20K -> 160K × 512 = 39x reduction
-    """
 
     def __init__(
         self,
@@ -40,11 +28,11 @@ class GeneT5(nn.Module):
         vocab_size           = 4096,
         tie_weights          = True,
         # Encoder sparse attention
-        encoder_block_size   = 64,
-        encoder_window_size  = 256,
+        encoder_block_size   = 16,
+        encoder_window_size  = 1600,
         # Decoder sparse attention
-        decoder_block_size   = 64,
-        decoder_window_size  = 256,
+        decoder_block_size   = 16,
+        decoder_window_size  = 1600,
         # Perceiver compression
         num_latents          = 512,
         perceiver_layers     = 2,

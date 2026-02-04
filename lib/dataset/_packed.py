@@ -137,17 +137,28 @@ def pack_chunks_to_sample(
     Pack multiple chunks into a single PackedSample
 
     Applies isolation padding between segments to prevent attention leakage.
+    Uses pre-tokenized IDs when available to skip redundant tokenization.
     """
 
     pad_token_id = tokenizer.pad_token_id
     sep_token_id = tokenizer.convert_tokens_to_ids("[SEP]")
 
-    # Tokenize all chunks
-    input_texts  = [c.get_input_text() for c in chunks]
-    target_texts = [c.get_target_text() for c in chunks]
+    # Check if chunks have pre-tokenized IDs
+    has_pretokenized = all(c.input_ids is not None and c.target_ids is not None for c in chunks)
 
-    input_enc  = tokenizer(input_texts, add_special_tokens=False)
-    target_enc = tokenizer(target_texts, add_special_tokens=False)
+    if has_pretokenized:
+        # Use pre-tokenized IDs directly (fast path)
+        input_ids_list  = [c.input_ids for c in chunks]
+        target_ids_list = [c.target_ids for c in chunks]
+    else:
+        # Fall back to tokenization (legacy path)
+        input_texts  = [c.get_input_text() for c in chunks]
+        target_texts = [c.get_target_text() for c in chunks]
+
+        input_enc       = tokenizer(input_texts, add_special_tokens=False)
+        target_enc      = tokenizer(target_texts, add_special_tokens=False)
+        input_ids_list  = input_enc["input_ids"]
+        target_ids_list = target_enc["input_ids"]
 
     # Pack inputs with isolation
     packed_input   = []
@@ -157,8 +168,8 @@ def pack_chunks_to_sample(
     segment_ends   = []
 
     for i in range(len(chunks)):
-        inp_ids = input_enc["input_ids"][i]
-        lbl_ids = target_enc["input_ids"][i]
+        inp_ids = input_ids_list[i]
+        lbl_ids = target_ids_list[i]
 
         # Record segment start
         segment_starts.append(len(packed_input))

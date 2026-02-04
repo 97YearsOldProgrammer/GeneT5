@@ -490,6 +490,7 @@ def augment_with_hints(chunks, hint_ratio=0.5, seed=42, n_workers=None, batch_si
     num_to_augment = int(len(chunks) * hint_ratio)
     indices        = random.sample(range(len(chunks)), min(num_to_augment, len(chunks)))
     selected       = [chunks[i] for i in indices]
+    del indices  # Free memory
 
     batches = []
     for i in range(0, len(selected), batch_size):
@@ -497,12 +498,12 @@ def augment_with_hints(chunks, hint_ratio=0.5, seed=42, n_workers=None, batch_si
         seed_offset = seed + i
         batches.append((batch, seed_offset))
 
-    all_augmented = []
+    del selected  # Free memory
 
     if len(batches) <= 2 or n_workers == 1:
         for args in batches:
             augmented = _augment_chunk_batch(args)
-            all_augmented.extend(augmented)
+            chunks.extend(augmented)  # Extend in place, no copy
     else:
         with ProcessPoolExecutor(max_workers=n_workers) as executor:
             futures = [executor.submit(_augment_chunk_batch, args) for args in batches]
@@ -510,8 +511,8 @@ def augment_with_hints(chunks, hint_ratio=0.5, seed=42, n_workers=None, batch_si
             for future in as_completed(futures):
                 try:
                     augmented = future.result()
-                    all_augmented.extend(augmented)
+                    chunks.extend(augmented)  # Extend in place
                 except Exception as e:
                     print(f"  WARNING: Augmentation batch failed: {e}")
 
-    return chunks + all_augmented
+    return chunks
