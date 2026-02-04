@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import sys
+import os
 import argparse
 import tempfile
 import shutil
@@ -39,7 +40,7 @@ parser.add_argument("--hard_limit", type=int, default=5005,
     help="Hard limit for packing (default: target * 1.1)")
 parser.add_argument("--max_target_len", type=int, default=16000,
     help="Max cumulative target tokens per packed sample")
-parser.add_argument("--file_parallel", type=int, default=5,
+parser.add_argument("--file_parallel", type=int, default=18,
     help="Files to process in parallel during compacting [%(default)s]")
 parser.add_argument("--compact_workers", type=int, default=18,
     help="Parallel workers for compacting phase [%(default)s]")
@@ -189,18 +190,14 @@ else:
     if args.max_target_len:
         compact_cmd += ["--max_target_len", str(args.max_target_len)]
 
-    result = subprocess.run(compact_cmd, capture_output=True, text=True)
+    # Stream compact.py output directly to screen (unbuffered)
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    result = subprocess.run(compact_cmd, env=env)
 
     if result.returncode == 0:
-        print(f"  ✓ Training compacting complete")
-        output_size = output_path.stat().st_size if output_path.exists() else 0
-        print(f"    Output: {output_path}")
-        print(f"    Size:   {output_size / 1024 / 1024:.2f} MB")
+        print(f"\n  ✓ Training compacting complete")
     else:
-        print(f"  ✗ Training compacting failed")
-        if result.stderr:
-            for line in result.stderr.strip().split('\n')[-10:]:
-                print(f"    {line}")
+        print(f"\n  ✗ Training compacting failed (exit code {result.returncode})")
 
 
 ##############################
@@ -234,18 +231,14 @@ else:
     if args.max_target_len:
         val_compact_cmd += ["--max_target_len", str(args.max_target_len)]
 
-    val_result = subprocess.run(val_compact_cmd, capture_output=True, text=True)
+    # Stream compact.py output directly to screen (unbuffered)
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    val_result = subprocess.run(val_compact_cmd, env=env)
 
     if val_result.returncode == 0:
-        print(f"  ✓ Validation compacting complete")
-        val_size = val_output_path.stat().st_size if val_output_path.exists() else 0
-        print(f"    Output: {val_output_path}")
-        print(f"    Size:   {val_size / 1024 / 1024:.2f} MB")
+        print(f"\n  ✓ Validation compacting complete")
     else:
-        print(f"  ✗ Validation compacting failed")
-        if val_result.stderr:
-            for line in val_result.stderr.strip().split('\n')[-10:]:
-                print(f"    {line}")
+        print(f"\n  ✗ Validation compacting failed (exit code {val_result.returncode})")
 
 
 ##############################

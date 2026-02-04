@@ -43,7 +43,7 @@ python3 -u bin/init_model.py \
 To prepare fine-tuning data, using [data_baker](bake_data.py).  
 
 ```python3
-python -u bin/bake_data --raw_dir ../raw --output_dir ../baked/9.1k32k --n_workers 5 --species_parallel 3 --tokenizer ../model/init 2>&1 --window_size 10000 | tee ../logs/baker/9.1k32k/bake.log 
+python -u bin/bake_data --raw_dir ../raw --output_dir ../baked/5k4.5k --n_workers 5 --species_parallel 3 --tokenizer ../model/init 2>&1 --window_size 10000 | tee ../logs/baker/5k4.5k/bake.log 
 ```
 
 **Config**
@@ -99,7 +99,8 @@ python -u bin/finet \
   --epochs 4 \
   --lr 1e-4 \
   --token_budget 63700 \
-  --grad_accum 128 \
+  --max_batch_size 8 \
+  --grad_accum 64 \
   --weight_decay 0.01 \
   --warmup_ratio 0.03 \
   --max_grad_norm 1.0 \
@@ -109,6 +110,5 @@ python -u bin/finet \
   --log_memory \
   --empty_cache_steps 100 \
   --memwatch \
-  --sort_by_length \
   2>&1 | tee ../logs/tune/1.log
 ```

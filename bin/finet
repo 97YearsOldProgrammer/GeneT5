@@ -10,10 +10,10 @@ import torch
 import torch.utils.data as data_utils
 import transformers as tf
 
-import lib.dataset as ds
-import lib.tokenizer as tk
-import lib.model as mdl
-import lib.util as util
+import lib.dataset      as ds
+import lib.tokenizer    as tk
+import lib.model        as mdl
+import lib.util         as util
 
 
 DEFAULTS = {
@@ -73,8 +73,6 @@ def main():
         metavar='<int>', help='save checkpoint every N optimizer steps (default: end of epoch only)')
     parser.add_argument('--optim_8bit', action='store_true',
         help='use 8-bit Adam optimizer (requires bitsandbytes, saves ~50%% optimizer memory)')
-    parser.add_argument('--optim_cpu_offload', action='store_true',
-        help='offload optimizer states to CPU (slower but saves GPU/RAM)')
     parser.add_argument('--empty_cache_steps', required=False, type=int, default=None,
         metavar='<int>', help='call torch.cuda.empty_cache() every N steps to reduce fragmentation')
     parser.add_argument('--no_pin_memory', action='store_true',
