@@ -85,6 +85,12 @@ def main():
         help='enable background memory monitoring to CSV (first 5min: 5s intervals, then 30s)')
     parser.add_argument('--sort_by_length', action='store_true',
         help='sort batches by label length descending (largest first for memory profiling)')
+    parser.add_argument('--token_budget', type=int, default=None,
+        help='use token budget batching instead of fixed batch size (recommended: 128000)')
+    parser.add_argument('--max_batch_size', type=int, default=32,
+        help='max batch size when using token budget [%(default)s]')
+    parser.add_argument('--min_batch_size', type=int, default=1,
+        help='min batch size when using token budget [%(default)s]')
 
     args = parser.parse_args()
     
@@ -141,15 +147,42 @@ def main():
 
     collator = ds.PackedCollator(tokenizer.pad_token_id, -100)
 
-    # Sort by label length if requested (largest first for memory profiling)
+    # Collect label lengths for smart batching
     train_sampler = None
     train_shuffle = True
-    if args.sort_by_length:
-        print(f"  Sorting batches by label length (largest first)...")
+    label_lengths = None
+
+    if args.token_budget or args.sort_by_length:
+        print(f"  Collecting label lengths...")
         label_lengths = []
         for i in range(len(train_dataset)):
             sample = train_dataset[i]
             label_lengths.append(len(sample['labels']))
+        max_lbl = max(label_lengths)
+        min_lbl = min(label_lengths)
+        print(f"  Label lengths: {min_lbl:,} - {max_lbl:,} tokens")
+
+    # Token budget batching (recommended)
+    if args.token_budget:
+        print(f"  Using token budget batching (budget={args.token_budget:,} tokens)...")
+        train_sampler = ds.TokenBudgetSampler(
+            label_lengths,
+            max_tokens     = args.token_budget,
+            max_batch_size = args.max_batch_size,
+            min_batch_size = args.min_batch_size,
+            shuffle        = True,
+            drop_last      = False,
+            seed           = args.seed,
+        )
+        train_shuffle = False
+        stats = train_sampler.get_batch_stats()
+        print(f"  Batch sizes: {stats['min_batch_size']} - {stats['max_batch_size']} (avg {stats['avg_batch_size']:.1f})")
+        print(f"  Tokens/batch: {stats['min_tokens']:,} - {stats['max_tokens']:,} (avg {stats['avg_tokens']:,.0f})")
+        print(f"  Total batches: {stats['num_batches']:,}")
+
+    # Sort by label length (legacy, for memory profiling)
+    elif args.sort_by_length:
+        print(f"  Sorting batches by label length (largest first)...")
         sorted_indices = sorted(range(len(train_dataset)),
                                 key=lambda i: label_lengths[i],
                                 reverse=True)
@@ -159,9 +192,6 @@ def main():
             drop_last=True
         )
         train_shuffle = False
-        max_lbl = max(label_lengths)
-        min_lbl = min(label_lengths)
-        print(f"  Label lengths: {min_lbl:,} - {max_lbl:,} tokens")
         print(f"  First batch will have ~{max_lbl:,} token labels (peak memory)")
 
     if train_sampler:

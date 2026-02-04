@@ -436,6 +436,108 @@ class SmartBatchSampler:
         return (len(self.lengths) + self.batch_size - 1) // self.batch_size
 
 
+class TokenBudgetSampler:
+    """
+    Batch sampler with token budget instead of fixed batch size
+
+    Memory stays constant: large sequences get smaller batches, small sequences get larger batches.
+    Budget is max_len_in_batch × num_samples (accounts for padding).
+    """
+
+    def __init__(self, label_lengths, max_tokens=128000, max_batch_size=32, min_batch_size=1,
+                 shuffle=True, drop_last=False, seed=42):
+
+        self.label_lengths  = label_lengths
+        self.max_tokens     = max_tokens
+        self.max_batch_size = max_batch_size
+        self.min_batch_size = min_batch_size
+        self.shuffle        = shuffle
+        self.drop_last      = drop_last
+        self.seed           = seed
+        self.epoch          = 0
+
+        # Sort indices by label length (descending for largest-first)
+        self.sorted_indices = sorted(range(len(label_lengths)),
+                                     key=lambda i: label_lengths[i],
+                                     reverse=True)
+
+        # Pre-compute batches
+        self._batches = self._build_batches()
+
+    def _build_batches(self):
+        """Build batches respecting token budget"""
+
+        batches = []
+        batch   = []
+        max_len = 0
+
+        for idx in self.sorted_indices:
+            seq_len = self.label_lengths[idx]
+
+            # Calculate new padded total if we add this sample
+            new_max    = max(max_len, seq_len)
+            new_tokens = new_max * (len(batch) + 1)
+
+            # Check if adding would exceed budget or max batch size
+            would_exceed_budget = new_tokens > self.max_tokens and len(batch) >= self.min_batch_size
+            would_exceed_size   = len(batch) >= self.max_batch_size
+
+            if (would_exceed_budget or would_exceed_size) and batch:
+                batches.append(batch)
+                batch   = []
+                max_len = 0
+
+            batch.append(idx)
+            max_len = max(max_len, seq_len)
+
+        # Don't forget last batch
+        if batch:
+            if len(batch) >= self.min_batch_size or not self.drop_last:
+                batches.append(batch)
+
+        return batches
+
+    def set_epoch(self, epoch):
+        """Set epoch for shuffling reproducibility"""
+
+        self.epoch = epoch
+
+    def __iter__(self):
+
+        batches = self._batches.copy()
+
+        if self.shuffle:
+            rng = random.Random(self.seed + self.epoch)
+            rng.shuffle(batches)
+
+        for batch in batches:
+            yield batch
+
+    def __len__(self):
+
+        return len(self._batches)
+
+    def get_batch_stats(self):
+        """Return statistics about batch sizes"""
+
+        sizes = [len(b) for b in self._batches]
+        tokens_per_batch = []
+
+        for batch in self._batches:
+            max_len = max(self.label_lengths[i] for i in batch)
+            tokens_per_batch.append(max_len * len(batch))
+
+        return {
+            "num_batches":      len(self._batches),
+            "min_batch_size":   min(sizes),
+            "max_batch_size":   max(sizes),
+            "avg_batch_size":   sum(sizes) / len(sizes),
+            "min_tokens":       min(tokens_per_batch),
+            "max_tokens":       max(tokens_per_batch),
+            "avg_tokens":       sum(tokens_per_batch) / len(tokens_per_batch),
+        }
+
+
 class CompactGroupSampler:
     """Sampler that keeps compact_group members together in same batch"""
 

@@ -25,21 +25,23 @@ parser.add_argument("--taxa",       type=str, nargs='+', default=None,
     help="Process only specific taxa (default: all)")
 parser.add_argument("--species",    type=str, nargs='+', default=None,
     help="Process only specific species (default: all)")
-parser.add_argument("--species_parallel", type=int, default=6,
+parser.add_argument("--window_size", type=int, default=10000,
+    help="Window size in base pairs [%(default)s]")
+parser.add_argument("--species_parallel", type=int, default=3,
     help="Number of species to process in parallel [%(default)s]")
 parser.add_argument("--n_workers",  type=int, default=None,
     help="Workers per species for chunking [auto]")
 parser.add_argument("--tokenizer",  type=str, required=True,
     help="Tokenizer path (required)")
-parser.add_argument("--target",     type=int, default=8000,
+parser.add_argument("--target",     type=int, default=4550,
     help="Target tokens per packed sequence [%(default)s]")
-parser.add_argument("--hard_limit", type=int, default=9100,
+parser.add_argument("--hard_limit", type=int, default=5005,
     help="Hard limit for packing (default: target * 1.1)")
-parser.add_argument("--max_target_len", type=int, default=32000,
+parser.add_argument("--max_target_len", type=int, default=16000,
     help="Max cumulative target tokens per packed sample")
 parser.add_argument("--file_parallel", type=int, default=5,
     help="Files to process in parallel during compacting [%(default)s]")
-parser.add_argument("--compact_workers", type=int, default=18,
+parser.add_argument("--compact_workers", type=int, default=15,
     help="Parallel workers for compacting phase [%(default)s]")
 parser.add_argument("--num_complex", type=int, default=7,
     help="Number of complex genes for validation per species [%(default)s]")
@@ -55,7 +57,7 @@ parser.add_argument("--compress", type=str, default=None,
 args = parser.parse_args()
 
 n_workers_per_species = args.n_workers or max(1, multiprocessing.cpu_count() - 1)
-species_to_process    = util.build_species_list(args.species, args.taxa)
+species_to_process    = util.build_species_list(args.species, args.taxa, args.window_size)
 
 if not species_to_process:
     print("No species to process!")
@@ -81,26 +83,26 @@ print(f"{'GeneT5 Data Baker':^60}")
 print(f"{'='*60}")
 print(f"  Raw directory:    {raw_dir}")
 print(f"  Output directory: {output_dir}")
-print(f"  Temp directory:   {temp_dir}")
 print(f"  Tokenizer:        {args.tokenizer}")
+print(f"")
+print(f"  Window size:      {args.window_size:,} bp")
 print(f"  Target tokens:    {args.target:,}")
 if args.max_target_len:
     print(f"  Max target len:   {args.max_target_len:,}")
+print(f"")
+print(f"  Species:          {len(species_to_process)}")
 print(f"  Species parallel: {args.species_parallel}")
 print(f"  Workers/species:  {n_workers_per_species}")
 print(f"  Compact workers:  {args.compact_workers}")
-print(f"  Species:          {len(species_to_process)}")
 
 print(f"\n{' Taxa Summary ':=^60}")
 
 taxa_counts = {}
 for sp, limit, taxa in species_to_process:
-    if taxa not in taxa_counts:
-        taxa_counts[taxa] = {"count": 0, "limit": limit}
-    taxa_counts[taxa]["count"] += 1
+    taxa_counts[taxa] = taxa_counts.get(taxa, 0) + 1
 
-for taxa, info in taxa_counts.items():
-    print(f"  {taxa:15s}: {info['count']:2d} species @ {info['limit']:,} bp")
+for taxa, count in taxa_counts.items():
+    print(f"  {taxa:15s}: {count:2d} species")
 
 
 ##############################

@@ -80,6 +80,7 @@ save_validation_set        = validation.save_validation_set
 BinaryTrainDataset      = dataload.BinaryTrainDataset
 DynamicPaddingCollator  = dataload.DynamicPaddingCollator
 SmartBatchSampler       = dataload.SmartBatchSampler
+TokenBudgetSampler      = dataload.TokenBudgetSampler
 PackedTrainDataset      = dataload.PackedTrainDataset
 PackedCollator          = dataload.PackedCollator
 

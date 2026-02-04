@@ -43,7 +43,7 @@ python3 -u bin/init_model.py \
 To prepare fine-tuning data, using [data_baker](bake_data.py).  
 
 ```python3
-python -u bin/bake_data --raw_dir ../raw --output_dir ../baked --n_workers 4 --species_parallel 5 --tokenizer ../model/init 2>&1 | tee ../logs/bake.log 
+python -u bin/bake_data --raw_dir ../raw --output_dir ../baked/9.1k32k --n_workers 5 --species_parallel 3 --tokenizer ../model/init 2>&1 --window_size 10000 | tee ../logs/baker/9.1k32k/bake.log 
 ```
 
 **Config**
@@ -51,10 +51,10 @@ python -u bin/bake_data --raw_dir ../raw --output_dir ../baked --n_workers 4 --s
 | Taxa           | Limit    | Token Est. (@4.5bp) | Avg
 | :------------: | :------: | :-----------------: | :------------
 | Prokaryotes    | 10000    | ~2.2k               | 9000bps  = ~P99+ (no introns, avg 924 bp)
-| Unicellular    | 10000    | ~3.3k               | 15000bps = ~P95+ (yeast genes avg ~1.5 kb)
-| Invertebrates  | 20000    | ~5.5k               | 25000bps = ~P90 (Drosophila genes ~2-10 kb)
-| Vertebrates    | 20000    | ~6.6k               | 30000bps = ~P75 (median 23 kb, many >30kb)
-| Plants         | 20000    | ~5.5k               | 25000bps = ~P85-90 
+| Unicellular    | 15000    | ~3.3k               | 15000bps = ~P95+ (yeast genes avg ~1.5 kb)
+| Invertebrates  | 15000    | ~5.5k               | 25000bps = ~P90 (Drosophila genes ~2-10 kb)
+| Vertebrates    | 15000    | ~6.6k               | 30000bps = ~P75 (median 23 kb, many >30kb)
+| Plants         | 15000    | ~5.5k               | 25000bps = ~P85-90 
 
 
 
@@ -92,8 +92,8 @@ python3 bin/resize_model.py model_path tokenizer_path
 
 ```python3
 python -u bin/finet \
-  ../baked/30k9.1k/training.packed \
-  ../baked/30k9.1k/validation.packed \
+  ../baked/9.1k32k/training.packed \
+  ../baked/9.1k32k/validation.packed \
   ../model/feb.3 \
   ../model/init \
   --epochs 4 \
@@ -109,7 +109,6 @@ python -u bin/finet \
   --log_memory \
   --empty_cache_steps 100 \
   --memwatch \
-  --gradient_checkpointing \
   --sort_by_length \
   2>&1 | tee ../logs/tune/1.log
 ```

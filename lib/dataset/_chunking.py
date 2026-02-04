@@ -157,6 +157,8 @@ def build_feature_list(chr_gene_index):
                 "type":          feat["type"].lower(),
                 "strand":        feat["strand"],
                 "phase":         feat.get("phase", "."),
+                "cds_start":     feat.get("cds_start"),
+                "cds_end":       feat.get("cds_end"),
                 "gene_id":       gene_id,
                 "transcript_id": transcript_id,
                 "biotype":       biotype,
@@ -255,6 +257,13 @@ def _chunk_chromosome_genecentric(args):
                     "transcript_id": feat["transcript_id"],
                     "biotype":       feat["biotype"],
                 }
+
+                # Adjust CDS coordinates if present
+                if feat.get("cds_start") is not None:
+                    adj_feat["cds_start"] = feat["cds_start"] - window_start
+                if feat.get("cds_end") is not None:
+                    adj_feat["cds_end"] = feat["cds_end"] - window_start
+
                 chunk_features.append(adj_feat)
                 gene_ids.add(feat["gene_id"])
 

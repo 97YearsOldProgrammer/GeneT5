@@ -250,7 +250,7 @@ class BinaryChunk:
         return input_text
 
     def get_target_text(self):
-        """Format chunk as target text for tokenization"""
+        """Format chunk as target text for tokenization (compressed format)"""
 
         gene_indices, transcript_indices = self._build_gene_transcript_indices()
 
@@ -258,7 +258,12 @@ class BinaryChunk:
         sorted_features = sorted(self.features, key=lambda x: x.get("start", 0))
 
         for f in sorted_features:
-            ftype   = f.get("type", "exon").lower()
+            ftype = f.get("type", "exon").lower()
+
+            # Skip CDS features - info merged into exon
+            if ftype == "cds":
+                continue
+
             fstart  = f.get("start", 0)
             fend    = f.get("end", 0)
             fstrand = f.get("strand", "+")
@@ -272,9 +277,18 @@ class BinaryChunk:
                 gene_id, transcript_id, gene_indices, transcript_indices
             )
 
-            # Format: type start \t end strand phase biotype gene_idx
-            # biotype before gene_idx to avoid phase+gene_idx tokenizer confusion
-            target_text += f"\n{ftype}{fstart}\t{fend}{fstrand}{fphase}{biotype}{gene_idx_str}"
+            # Build UTR coordinate suffix if present
+            cds_coord = ""
+            cds_start = f.get("cds_start")
+            cds_end   = f.get("cds_end")
+
+            if cds_start is not None and cds_start > fstart:
+                cds_coord = f"\t{cds_start}"
+            elif cds_end is not None and cds_end < fend:
+                cds_coord = f"\t{cds_end}"
+
+            # Format: start \t end strand phase biotype gene_idx [cds_coord]
+            target_text += f"\n{fstart}\t{fend}{fstrand}{fphase}{biotype}{gene_idx_str}{cds_coord}"
 
         target_text += "\n<EOS>"
 

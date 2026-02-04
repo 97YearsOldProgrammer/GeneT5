@@ -1,5 +1,5 @@
 from lib.util._databaker import (
-    TAXA_CONFIG,
+    TAXA_SPECIES,
     SPECIES_LOOKUP,
     build_species_lookup,
     find_genome_files,

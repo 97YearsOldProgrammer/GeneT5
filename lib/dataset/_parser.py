@@ -231,7 +231,70 @@ def build_gene_index(features):
         elif parent in gene_index:
             gene_index[parent]["features"].append(feat)
 
+    # Fourth pass: merge CDS info into exons
+    _merge_cds_into_exons(gene_index)
+
     return gene_index
+
+
+def _merge_cds_into_exons(gene_index):
+    """Merge CDS phase and boundaries into matching exon features"""
+
+    for gene_id, gene_data in gene_index.items():
+        for transcript_id, transcript_data in gene_data.get("transcripts", {}).items():
+            features = transcript_data.get("features", [])
+
+            exons     = [f for f in features if f["type"].lower() == "exon"]
+            cdses     = [f for f in features if f["type"].lower() == "cds"]
+            utr5_list = [f for f in features if f["type"].lower() == "five_prime_utr"]
+            utr3_list = [f for f in features if f["type"].lower() == "three_prime_utr"]
+
+            if not cdses and not utr5_list and not utr3_list:
+                continue
+
+            for exon in exons:
+                e_start = exon["start"]
+                e_end   = exon["end"]
+
+                # First check for explicit UTR features
+                for utr5 in utr5_list:
+                    u_start = utr5["start"]
+                    u_end   = utr5["end"]
+
+                    # UTR overlaps this exon - CDS starts after UTR
+                    if u_start >= e_start and u_end <= e_end:
+                        exon["cds_start"] = u_end + 1
+                        break
+
+                for utr3 in utr3_list:
+                    u_start = utr3["start"]
+                    u_end   = utr3["end"]
+
+                    # UTR overlaps this exon - CDS ends before UTR
+                    if u_start >= e_start and u_end <= e_end:
+                        exon["cds_end"] = u_start - 1
+                        break
+
+                # Then check CDS for phase and boundaries
+                for cds in cdses:
+                    c_start = cds["start"]
+                    c_end   = cds["end"]
+
+                    # Check if CDS overlaps this exon
+                    if c_start > e_end or c_end < e_start:
+                        continue
+
+                    # CDS overlaps exon - copy phase
+                    exon["phase"] = cds.get("phase", ".")
+
+                    # Only set cds_start/cds_end if not already set by explicit UTR
+                    if "cds_start" not in exon and c_start > e_start:
+                        exon["cds_start"] = c_start
+
+                    if "cds_end" not in exon and c_end < e_end:
+                        exon["cds_end"] = c_end
+
+                    break
 
 
 ###########################

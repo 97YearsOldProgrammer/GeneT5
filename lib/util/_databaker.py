@@ -64,76 +64,60 @@ def decompress_to_temp(gz_path, temp_dir=None):
 ####################
 
 
-TAXA_CONFIG = {
-    "Prokaryotes": {
-        "limit":   10000,
-        "species": [
-            "E.coli",
-            "B.subtilis",
-            "C.crescentus",
-            "PCC6803",
-            "H.archaea",
-            "V.fischeri",
-        ],
-    },
-    "Unicellular": {
-        "limit":   10000,
-        "species": [
-            "S.cerevisiae",
-            "S.pombe",
-            "C.reinhardtii",
-            "N.crassa",
-            "D.discoideum",
-            "T.thermophila",
-        ],
-    },
-    "Invertebrates": {
-        "limit":   20000,
-        "species": [
-            "C.elegan",
-            "Fly",
-            "S.anemone",
-            "S.urchin",
-            "H.vulgaris",
-            "Bee",
-            "Silkworm",
-        ],
-    },
-    "Vertebrates": {
-        "limit":   20000,
-        "species": [
-            "C.jacchus",
-            "Chicken",
-            "C.porcellus",
-            "Frog",
-            "Human",
-            "Medaka",
-            "Mouse",
-            "Rat",
-            "Zebrafish",
-        ],
-    },
-    "Plants": {
-        "limit":   20000,
-        "species": [
-            "Earthmoss",
-            "Maize",
-            "M.truncatula",
-            "Rice",
-            "T.cress",
-        ],
-    },
+TAXA_SPECIES = {
+    "Prokaryotes": [
+        "E.coli",
+        "B.subtilis",
+        "C.crescentus",
+        "PCC6803",
+        "H.archaea",
+        "V.fischeri",
+    ],
+    "Unicellular": [
+        "S.cerevisiae",
+        "S.pombe",
+        "C.reinhardtii",
+        "N.crassa",
+        "D.discoideum",
+        "T.thermophila",
+    ],
+    "Invertebrates": [
+        "C.elegan",
+        "Fly",
+        "S.anemone",
+        "S.urchin",
+        "H.vulgaris",
+        "Bee",
+        "Silkworm",
+    ],
+    "Vertebrates": [
+        "C.jacchus",
+        "Chicken",
+        "C.porcellus",
+        "Frog",
+        "Human",
+        "Medaka",
+        "Mouse",
+        "Rat",
+        "Zebrafish",
+    ],
+    "Plants": [
+        "Earthmoss",
+        "Maize",
+        "M.truncatula",
+        "Rice",
+        "T.cress",
+    ],
 }
 
 
 def build_species_lookup():
-    """Build species -> (taxa, limit) lookup"""
-    
+    """Build species -> taxa lookup"""
+
     lookup = {}
-    for taxa, config in TAXA_CONFIG.items():
-        limit = config["limit"]
-        for species in config["species"]:
-            lookup[species] = (taxa, limit)
+    for taxa, species_list in TAXA_SPECIES.items():
+        for species in species_list:
+            lookup[species] = taxa
     return lookup
 
 
@@ -590,31 +574,30 @@ def write_bake_summary(log_path, run_config, species_results, species_stats, tok
 #######################
 
 
-def build_species_list(species=None, taxa=None):
+def build_species_list(species=None, taxa=None, window_size=10000):
     """Build list of species to process"""
-    
+
     species_to_process = []
-    
+
     if species:
         for sp in species:
             if sp in SPECIES_LOOKUP:
-                taxa_name, limit = SPECIES_LOOKUP[sp]
-                species_to_process.append((sp, limit, taxa_name))
+                taxa_name = SPECIES_LOOKUP[sp]
+                species_to_process.append((sp, window_size, taxa_name))
             else:
                 print(f"  WARNING: Unknown species '{sp}', skipping")
-    
+
     elif taxa:
         for taxa_name in taxa:
-            if taxa_name in TAXA_CONFIG:
-                config = TAXA_CONFIG[taxa_name]
-                for sp in config["species"]:
-                    species_to_process.append((sp, config["limit"], taxa_name))
+            if taxa_name in TAXA_SPECIES:
+                for sp in TAXA_SPECIES[taxa_name]:
+                    species_to_process.append((sp, window_size, taxa_name))
             else:
                 print(f"  WARNING: Unknown taxa '{taxa_name}', skipping")
-    
+
     else:
-        for taxa_name, config in TAXA_CONFIG.items():
-            for sp in config["species"]:
-                species_to_process.append((sp, config["limit"], taxa_name))
-    
+        for taxa_name, species_list in TAXA_SPECIES.items():
+            for sp in species_list:
+                species_to_process.append((sp, window_size, taxa_name))
+
     return species_to_process

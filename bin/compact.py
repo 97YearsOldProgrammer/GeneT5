@@ -186,6 +186,27 @@ print(f"  Workers: {args.workers}")
 print(f"  Memory mode: streaming\n")
 
 
+_worker_tokenizer = None
+_worker_file_paths = None
+_worker_block_size = None
+_worker_window_size = None
+
+
+def _init_worker(tokenizer_path, paths, block_size, window_size):
+    """Initialize worker process with tokenizer"""
+
+    global _worker_tokenizer, _worker_file_paths, _worker_block_size, _worker_window_size
+    from transformers import AutoTokenizer
+
+    _worker_tokenizer  = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+    _worker_file_paths = paths
+    _worker_block_size = block_size
+    _worker_window_size = window_size
+
+    if "[SEP]" not in _worker_tokenizer.get_vocab():
+        _worker_tokenizer.add_tokens(["[SEP]"])
+
+
 def process_group(work_item):
     """Worker function: load chunks and pack into sample"""
 
@@ -193,14 +214,14 @@ def process_group(work_item):
 
     group_chunks = []
     for file_idx, chunk_idx in members:
-        chunk = ds.read_chunk_at_index(file_paths[file_idx], chunk_idx)
+        chunk = ds.read_chunk_at_index(_worker_file_paths[file_idx], chunk_idx)
         group_chunks.append(chunk)
 
     packed_sample = ds.pack_chunks_to_sample(
         group_chunks,
-        tokenizer,
-        block_size  = args.block_size,
-        window_size = args.window_size,
+        _worker_tokenizer,
+        block_size  = _worker_block_size,
+        window_size = _worker_window_size,
     )
 
     return packed_sample
@@ -213,16 +234,23 @@ input_lengths   = []
 label_lengths   = []
 segment_counts  = []
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
+
+# Convert to list of strings for pickling
+file_paths_str = [str(p) for p in file_paths]
 
 with ds.PackedWriter(output_path, num_groups) as writer:
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+    with ProcessPoolExecutor(
+        max_workers = args.workers,
+        initializer = _init_worker,
+        initargs    = (args.tokenizer, file_paths_str, args.block_size, args.window_size),
+    ) as executor:
 
         # Prepare all work items
         work_items = [(gid, groups[gid]) for gid in group_ids]
 
         # executor.map() returns results in order, streams as completed
-        for progress, packed_sample in enumerate(executor.map(process_group, work_items)):
+        for progress, packed_sample in enumerate(executor.map(process_group, work_items, chunksize=100)):
 
             input_lengths.append(packed_sample.total_input_len)
             label_lengths.append(packed_sample.total_label_len)

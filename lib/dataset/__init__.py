@@ -50,6 +50,7 @@ from lib.dataset.wrapper import (
     BinaryTrainDataset,
     DynamicPaddingCollator,
     SmartBatchSampler,
+    TokenBudgetSampler,
 
     # Dataload (pre-packed - recommended)
     PackedTrainDataset,
