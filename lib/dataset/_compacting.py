@@ -167,20 +167,18 @@ def pack_from_metadata(
     hard_limit        = hard_limit or int(target_length * 1.1)
     target_hard_limit = target_hard_limit or (int(max_target_len * 1.1) if max_target_len else None)
 
-    # Separate by augmentation status (single pass for efficiency)
-    raw_metas = []
-    aug_metas = []
-    for m in metadata_list:
-        if m.is_augmented:
-            aug_metas.append(m)
-        else:
-            raw_metas.append(m)
-
-    print(f"    Raw: {len(raw_metas):,}, Augmented: {len(aug_metas):,}")
+    # Token length distribution stats
+    lengths     = [m.token_length for m in metadata_list]
+    thresholds  = [1000, 2000, 3000, 4000, 5000]
+    print(f"    Total chunks: {len(metadata_list):,}")
+    print(f"    Token lengths: min={min(lengths):,}, max={max(lengths):,}, avg={sum(lengths)//len(lengths):,}")
+    for t in thresholds:
+        count = sum(1 for l in lengths if l <= t)
+        pct   = 100 * count / len(lengths)
+        print(f"      ≤{t:,}: {count:,} ({pct:.1f}%)")
 
     # Group assignments: (file_idx, chunk_idx) -> group_id
     group_assignments = {}
-    current_group_id  = 0
 
     stats = {
         "total_groups":          0,
@@ -191,77 +189,52 @@ def pack_from_metadata(
         "target_utilizations":   [],
     }
 
-    for metas, category in [(raw_metas, "raw"), (aug_metas, "augmented")]:
-        if not metas:
-            continue
+    # Pack all chunks together (no separation by augmentation)
+    metas = metadata_list
+    print(f"\n  Packing {len(metas):,} chunks...")
 
-        print(f"\n  Packing {len(metas):,} {category} chunks...")
+    # Sort by effective length descending (FFD)
+    sorted_metas = sorted(metas, key=lambda m: -m.eff_length)
 
-        # Sort by effective length descending (FFD)
-        sorted_metas = sorted(metas, key=lambda m: -m.eff_length)
+    bins              = []    # List of lists of (file_idx, chunk_idx)
+    bin_totals        = []    # Effective length totals
+    bin_target_totals = []    # Target length totals
 
-        bins              = []    # List of lists of (file_idx, chunk_idx)
-        bin_totals        = []    # Effective length totals
-        bin_target_totals = []    # Target length totals
+    target_heap   = []    # For single-constraint mode
+    overflow_heap = []
 
-        target_heap   = []    # For single-constraint mode
-        overflow_heap = []
+    total    = len(sorted_metas)
+    use_dual = max_target_len is not None
 
-        total    = len(sorted_metas)
-        use_dual = max_target_len is not None
+    # For dual-constraint: use numpy for vectorized bin search
+    if use_dual:
+        import numpy as np
+        # Estimate bin count: avg ~3 chunks per bin, add 50% margin
+        estimated_bins = max(total // 2, 10000)
+        np_input_total = np.zeros(estimated_bins, dtype=np.int32)
+        np_tgt_total   = np.zeros(np_input_total.shape, dtype=np.int32)
+        np_open        = np.ones(np_input_total.shape, dtype=np.bool_)
+        n_bins         = 0
 
-        # For dual-constraint: use numpy for vectorized bin search
-        if use_dual:
-            import numpy as np
-            # Estimate bin count: avg ~3 chunks per bin, add 50% margin
-            estimated_bins = max(total // 2, 10000)
-            np_input_total = np.zeros(estimated_bins, dtype=np.int32)
-            np_tgt_total   = np.zeros(np_input_total.shape, dtype=np.int32)
-            np_open        = np.ones(np_input_total.shape, dtype=np.bool_)
-            n_bins         = 0
+    for progress_idx, meta in enumerate(sorted_metas):
+        if progress_idx % 50000 == 0:
+            pct = 100 * progress_idx / total
+            n_b = n_bins if use_dual else len(bins)
+            print(f"    Packing: {progress_idx:,}/{total:,} ({pct:.1f}%) - {n_b:,} bins", end='\r')
 
-        for progress_idx, meta in enumerate(sorted_metas):
-            if progress_idx % 50000 == 0:
-                pct = 100 * progress_idx / total
-                n_b = n_bins if use_dual else len(bins)
-                print(f"    Packing: {progress_idx:,}/{total:,} ({pct:.1f}%) - {n_b:,} bins", end='\r')
+        eff_len   = meta.eff_length
+        tgt_len   = meta.target_len
+        chunk_key = (meta.file_idx, meta.chunk_idx)
 
-            eff_len   = meta.eff_length
-            tgt_len   = meta.target_len
-            chunk_key = (meta.file_idx, meta.chunk_idx)
-
-            # Oversized input - standalone bin
-            if eff_len > hard_limit:
-                bin_idx = len(bins)
-                bins.append([chunk_key])
-                bin_totals.append(eff_len)
-                bin_target_totals.append(tgt_len)
-                group_assignments[chunk_key] = current_group_id + bin_idx
-                stats["overflow_count"] += 1
-                if use_dual:
-                    if n_bins >= len(np_input_total):
-                        new_size       = len(np_input_total) * 2
-                        new_input      = np.zeros(new_size, dtype=np.int32)
-                        new_tgt        = np.zeros(new_size, dtype=np.int32)
-                        new_open       = np.ones(new_size, dtype=np.bool_)
-                        new_input[:n_bins] = np_input_total[:n_bins]
-                        new_tgt[:n_bins]   = np_tgt_total[:n_bins]
-                        new_open[:n_bins]  = np_open[:n_bins]
-                        np_input_total, np_tgt_total, np_open = new_input, new_tgt, new_open
-                    np_input_total[n_bins] = eff_len
-                    np_tgt_total[n_bins]   = tgt_len
-                    np_open[n_bins]        = False
-                    n_bins += 1
-                continue
-
-            # Oversized target - standalone bin
-            if use_dual and tgt_len > target_hard_limit:
-                bin_idx = len(bins)
-                bins.append([chunk_key])
-                bin_totals.append(eff_len)
-                bin_target_totals.append(tgt_len)
-                group_assignments[chunk_key] = current_group_id + bin_idx
-                stats["target_overflow_count"] += 1
+        # Oversized input - standalone bin
+        if eff_len > hard_limit:
+            bin_idx = len(bins)
+            bins.append([chunk_key])
+            bin_totals.append(eff_len)
+            bin_target_totals.append(tgt_len)
+            group_assignments[chunk_key] = bin_idx
+            stats["overflow_count"] += 1
+            if use_dual:
                 if n_bins >= len(np_input_total):
                     new_size       = len(np_input_total) * 2
                     new_input      = np.zeros(new_size, dtype=np.int32)
@@ -275,125 +248,146 @@ def pack_from_metadata(
                 np_tgt_total[n_bins]   = tgt_len
                 np_open[n_bins]        = False
                 n_bins += 1
-                continue
+            continue
 
-            placed = False
+        # Oversized target - standalone bin
+        if use_dual and tgt_len > target_hard_limit:
+            bin_idx = len(bins)
+            bins.append([chunk_key])
+            bin_totals.append(eff_len)
+            bin_target_totals.append(tgt_len)
+            group_assignments[chunk_key] = bin_idx
+            stats["target_overflow_count"] += 1
+            if n_bins >= len(np_input_total):
+                new_size       = len(np_input_total) * 2
+                new_input      = np.zeros(new_size, dtype=np.int32)
+                new_tgt        = np.zeros(new_size, dtype=np.int32)
+                new_open       = np.ones(new_size, dtype=np.bool_)
+                new_input[:n_bins] = np_input_total[:n_bins]
+                new_tgt[:n_bins]   = np_tgt_total[:n_bins]
+                new_open[:n_bins]  = np_open[:n_bins]
+                np_input_total, np_tgt_total, np_open = new_input, new_tgt, new_open
+            np_input_total[n_bins] = eff_len
+            np_tgt_total[n_bins]   = tgt_len
+            np_open[n_bins]        = False
+            n_bins += 1
+            continue
 
-            if not use_dual:
-                # Single constraint: use original heap algorithm
-                while target_heap and not placed:
-                    neg_remaining, bin_idx = heapq.heappop(target_heap)
-                    remaining = target_length - bin_totals[bin_idx]
+        placed = False
 
-                    if remaining >= eff_len:
-                        bins[bin_idx].append(chunk_key)
-                        bin_totals[bin_idx]        += eff_len
-                        bin_target_totals[bin_idx] += tgt_len
-                        group_assignments[chunk_key] = current_group_id + bin_idx
+        if not use_dual:
+            # Single constraint: use original heap algorithm
+            while target_heap and not placed:
+                neg_remaining, bin_idx = heapq.heappop(target_heap)
+                remaining = target_length - bin_totals[bin_idx]
 
-                        new_remaining = target_length - bin_totals[bin_idx]
-                        if new_remaining > 0:
-                            heapq.heappush(target_heap, (-new_remaining, bin_idx))
-                        else:
-                            hard_remaining = hard_limit - bin_totals[bin_idx]
-                            if hard_remaining > 0:
-                                heapq.heappush(overflow_heap, (-hard_remaining, bin_idx))
-                        placed = True
+                if remaining >= eff_len:
+                    bins[bin_idx].append(chunk_key)
+                    bin_totals[bin_idx]        += eff_len
+                    bin_target_totals[bin_idx] += tgt_len
+                    group_assignments[chunk_key] = bin_idx
+
+                    new_remaining = target_length - bin_totals[bin_idx]
+                    if new_remaining > 0:
+                        heapq.heappush(target_heap, (-new_remaining, bin_idx))
                     else:
                         hard_remaining = hard_limit - bin_totals[bin_idx]
                         if hard_remaining > 0:
                             heapq.heappush(overflow_heap, (-hard_remaining, bin_idx))
-
-                while overflow_heap and not placed:
-                    neg_remaining, bin_idx = heapq.heappop(overflow_heap)
-                    remaining = hard_limit - bin_totals[bin_idx]
-
-                    if remaining >= eff_len:
-                        bins[bin_idx].append(chunk_key)
-                        bin_totals[bin_idx]        += eff_len
-                        bin_target_totals[bin_idx] += tgt_len
-                        group_assignments[chunk_key] = current_group_id + bin_idx
-
-                        new_remaining = hard_limit - bin_totals[bin_idx]
-                        if new_remaining > 0:
-                            heapq.heappush(overflow_heap, (-new_remaining, bin_idx))
-                        placed = True
-
-            else:
-                # Dual constraint: vectorized numpy search
-                if n_bins > 0:
-                    # Find bins where both constraints fit (vectorized)
-                    input_fits  = (hard_limit - np_input_total[:n_bins]) >= eff_len
-                    target_fits = (target_hard_limit - np_tgt_total[:n_bins]) >= tgt_len
-                    candidates  = np.where(np_open[:n_bins] & input_fits & target_fits)[0]
-
-                    if len(candidates) > 0:
-                        # Best-fit: pick bin with least remaining input space
-                        best_idx = candidates[np.argmax(np_input_total[candidates])]
-                        bin_idx  = int(best_idx)
-
-                        bins[bin_idx].append(chunk_key)
-                        bin_totals[bin_idx]        += eff_len
-                        bin_target_totals[bin_idx] += tgt_len
-                        np_input_total[bin_idx]    += eff_len
-                        np_tgt_total[bin_idx]      += tgt_len
-                        group_assignments[chunk_key] = current_group_id + bin_idx
-
-                        # Mark closed if nearly full
-                        if (hard_limit - np_input_total[bin_idx] < 500 or
-                            target_hard_limit - np_tgt_total[bin_idx] < 500):
-                            np_open[bin_idx] = False
-
-                        placed = True
-
-            # Create new bin
-            if not placed:
-                bin_idx = len(bins)
-                bins.append([chunk_key])
-                bin_totals.append(eff_len)
-                bin_target_totals.append(tgt_len)
-                group_assignments[chunk_key] = current_group_id + bin_idx
-
-                if not use_dual:
-                    remaining = target_length - eff_len
-                    if remaining > 0:
-                        heapq.heappush(target_heap, (-remaining, bin_idx))
-                    else:
-                        hard_remaining = hard_limit - eff_len
-                        if hard_remaining > 0:
-                            heapq.heappush(overflow_heap, (-hard_remaining, bin_idx))
+                    placed = True
                 else:
-                    if n_bins >= len(np_input_total):
-                        new_size       = len(np_input_total) * 2
-                        new_input      = np.zeros(new_size, dtype=np.int32)
-                        new_tgt        = np.zeros(new_size, dtype=np.int32)
-                        new_open       = np.ones(new_size, dtype=np.bool_)
-                        new_input[:n_bins] = np_input_total[:n_bins]
-                        new_tgt[:n_bins]   = np_tgt_total[:n_bins]
-                        new_open[:n_bins]  = np_open[:n_bins]
-                        np_input_total, np_tgt_total, np_open = new_input, new_tgt, new_open
-                    np_input_total[n_bins] = eff_len
-                    np_tgt_total[n_bins]   = tgt_len
-                    np_open[n_bins]        = True
-                    n_bins += 1
+                    hard_remaining = hard_limit - bin_totals[bin_idx]
+                    if hard_remaining > 0:
+                        heapq.heappush(overflow_heap, (-hard_remaining, bin_idx))
 
-        print(f"    Packing: {total:,}/{total:,} (100.0%) - {len(bins):,} bins")
+            while overflow_heap and not placed:
+                neg_remaining, bin_idx = heapq.heappop(overflow_heap)
+                remaining = hard_limit - bin_totals[bin_idx]
 
-        # Update stats
-        for bin_idx, bin_keys in enumerate(bins):
-            total_len   = bin_totals[bin_idx]
-            utilization = total_len / target_length if target_length > 0 else 0
-            stats["utilizations"].append(utilization)
-            stats["total_groups"] += 1
-            if len(bin_keys) == 1:
-                stats["singleton_count"] += 1
+                if remaining >= eff_len:
+                    bins[bin_idx].append(chunk_key)
+                    bin_totals[bin_idx]        += eff_len
+                    bin_target_totals[bin_idx] += tgt_len
+                    group_assignments[chunk_key] = bin_idx
 
-            if max_target_len is not None:
-                tgt_total = bin_target_totals[bin_idx]
-                tgt_util  = tgt_total / max_target_len if max_target_len > 0 else 0
-                stats["target_utilizations"].append(tgt_util)
+                    new_remaining = hard_limit - bin_totals[bin_idx]
+                    if new_remaining > 0:
+                        heapq.heappush(overflow_heap, (-new_remaining, bin_idx))
+                    placed = True
 
-        current_group_id += len(bins)
+        else:
+            # Dual constraint: vectorized numpy search
+            if n_bins > 0:
+                # Find bins where both constraints fit (vectorized)
+                input_fits  = (hard_limit - np_input_total[:n_bins]) >= eff_len
+                target_fits = (target_hard_limit - np_tgt_total[:n_bins]) >= tgt_len
+                candidates  = np.where(np_open[:n_bins] & input_fits & target_fits)[0]
+
+                if len(candidates) > 0:
+                    # Best-fit: pick bin with least remaining input space
+                    best_idx = candidates[np.argmax(np_input_total[candidates])]
+                    bin_idx  = int(best_idx)
+
+                    bins[bin_idx].append(chunk_key)
+                    bin_totals[bin_idx]        += eff_len
+                    bin_target_totals[bin_idx] += tgt_len
+                    np_input_total[bin_idx]    += eff_len
+                    np_tgt_total[bin_idx]      += tgt_len
+                    group_assignments[chunk_key] = bin_idx
+
+                    # Mark closed if nearly full
+                    if (hard_limit - np_input_total[bin_idx] < 500 or
+                        target_hard_limit - np_tgt_total[bin_idx] < 500):
+                        np_open[bin_idx] = False
+
+                    placed = True
+
+        # Create new bin
+        if not placed:
+            bin_idx = len(bins)
+            bins.append([chunk_key])
+            bin_totals.append(eff_len)
+            bin_target_totals.append(tgt_len)
+            group_assignments[chunk_key] = bin_idx
+
+            if not use_dual:
+                remaining = target_length - eff_len
+                if remaining > 0:
+                    heapq.heappush(target_heap, (-remaining, bin_idx))
+                else:
+                    hard_remaining = hard_limit - eff_len
+                    if hard_remaining > 0:
+                        heapq.heappush(overflow_heap, (-hard_remaining, bin_idx))
+            else:
+                if n_bins >= len(np_input_total):
+                    new_size       = len(np_input_total) * 2
+                    new_input      = np.zeros(new_size, dtype=np.int32)
+                    new_tgt        = np.zeros(new_size, dtype=np.int32)
+                    new_open       = np.ones(new_size, dtype=np.bool_)
+                    new_input[:n_bins] = np_input_total[:n_bins]
+                    new_tgt[:n_bins]   = np_tgt_total[:n_bins]
+                    new_open[:n_bins]  = np_open[:n_bins]
+                    np_input_total, np_tgt_total, np_open = new_input, new_tgt, new_open
+                np_input_total[n_bins] = eff_len
+                np_tgt_total[n_bins]   = tgt_len
+                np_open[n_bins]        = True
+                n_bins += 1
+
+    print(f"    Packing: {total:,}/{total:,} (100.0%) - {len(bins):,} bins")
+
+    # Update stats
+    for bin_idx, bin_keys in enumerate(bins):
+        total_len   = bin_totals[bin_idx]
+        utilization = total_len / target_length if target_length > 0 else 0
+        stats["utilizations"].append(utilization)
+        stats["total_groups"] += 1
+        if len(bin_keys) == 1:
+            stats["singleton_count"] += 1
+
+        if max_target_len is not None:
+            tgt_total = bin_target_totals[bin_idx]
+            tgt_util  = tgt_total / max_target_len if max_target_len > 0 else 0
+            stats["target_utilizations"].append(tgt_util)
 
     # Compute summary stats
     if stats["utilizations"]:

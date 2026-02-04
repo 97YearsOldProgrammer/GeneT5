@@ -41,7 +41,7 @@ parser.add_argument("--max_target_len", type=int, default=16000,
     help="Max cumulative target tokens per packed sample")
 parser.add_argument("--file_parallel", type=int, default=5,
     help="Files to process in parallel during compacting [%(default)s]")
-parser.add_argument("--compact_workers", type=int, default=15,
+parser.add_argument("--compact_workers", type=int, default=18,
     help="Parallel workers for compacting phase [%(default)s]")
 parser.add_argument("--num_complex", type=int, default=7,
     help="Number of complex genes for validation per species [%(default)s]")

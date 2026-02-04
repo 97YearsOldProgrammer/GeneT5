@@ -92,13 +92,13 @@ python3 bin/resize_model.py model_path tokenizer_path
 
 ```python3
 python -u bin/finet \
-  ../baked/9.1k32k/training.packed \
-  ../baked/9.1k32k/validation.packed \
+  ../baked/5k4.5k/training.packed \
+  ../baked/5k4.5k/validation.packed \
   ../model/feb.3 \
   ../model/init \
   --epochs 4 \
   --lr 1e-4 \
-  --batch_size 4 \
+  --token_budget 63700 \
   --grad_accum 128 \
   --weight_decay 0.01 \
   --warmup_ratio 0.03 \

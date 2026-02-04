@@ -28,9 +28,9 @@ parser.add_argument('--window_size', required=False, type=int, default=256,
     metavar='<int>', help='attention window size [%(default)i]')
 parser.add_argument('--seed', required=False, type=int, default=42,
     metavar='<int>', help='random seed [%(default)i]')
-parser.add_argument('--file_parallel', required=False, type=int, default=1,
+parser.add_argument('--file_parallel', required=False, type=int, default=18,
     metavar='<int>', help='files to process in parallel [%(default)i]')
-parser.add_argument('--workers', required=False, type=int, default=1,
+parser.add_argument('--workers', required=False, type=int, default=18,
     metavar='<int>', help='parallel workers for Phase 3 [%(default)i]')
 
 args       = parser.parse_args()
@@ -234,10 +234,13 @@ input_lengths   = []
 label_lengths   = []
 segment_counts  = []
 
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 
 # Convert to list of strings for pickling
 file_paths_str = [str(p) for p in file_paths]
+
+# Bounded submission: limit pending futures to control memory
+max_pending = args.workers * 50
 
 with ds.PackedWriter(output_path, num_groups) as writer:
     with ProcessPoolExecutor(
@@ -246,21 +249,41 @@ with ds.PackedWriter(output_path, num_groups) as writer:
         initargs    = (args.tokenizer, file_paths_str, args.block_size, args.window_size),
     ) as executor:
 
-        # Prepare all work items
         work_items = [(gid, groups[gid]) for gid in group_ids]
+        pending    = set()
+        work_iter  = iter(enumerate(work_items))
+        progress   = 0
 
-        # executor.map() returns results in order, streams as completed
-        for progress, packed_sample in enumerate(executor.map(process_group, work_items, chunksize=100)):
+        # Initial fill
+        for _ in range(min(max_pending, num_groups)):
+            idx, item = next(work_iter)
+            pending.add(executor.submit(process_group, item))
 
-            input_lengths.append(packed_sample.total_input_len)
-            label_lengths.append(packed_sample.total_label_len)
-            segment_counts.append(packed_sample.num_segments)
+        # Process as completed, refill to keep max_pending active
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
 
-            writer.write_sample(packed_sample)
+            for future in done:
+                packed_sample = future.result()
 
-            if (progress + 1) % 10000 == 0:
-                pct = 100 * (progress + 1) / num_groups
-                print(f"    {progress + 1:,}/{num_groups:,} ({pct:.1f}%)", end='\r')
+                input_lengths.append(packed_sample.total_input_len)
+                label_lengths.append(packed_sample.total_label_len)
+                segment_counts.append(packed_sample.num_segments)
+
+                writer.write_sample(packed_sample)
+                progress += 1
+
+                if progress % 10000 == 0:
+                    pct = 100 * progress / num_groups
+                    print(f"    {progress:,}/{num_groups:,} ({pct:.1f}%)", end='\r')
+
+            # Refill pending
+            for _ in range(len(done)):
+                try:
+                    idx, item = next(work_iter)
+                    pending.add(executor.submit(process_group, item))
+                except StopIteration:
+                    break
 
 print(f"    {num_groups:,}/{num_groups:,} (100.0%)")
 
