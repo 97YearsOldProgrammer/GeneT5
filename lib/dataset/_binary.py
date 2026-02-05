@@ -277,18 +277,21 @@ class BinaryChunk:
                 gene_id, transcript_id, gene_indices, transcript_indices
             )
 
-            # Build UTR coordinate suffix if present
-            cds_coord = ""
+            # Build trailing separator
+            # - All lines end with \t (separates gene_idx from next line's start)
+            # - Terminal exons (with UTR) have \t{cds_coord}\n (explicit newline marker)
             cds_start = f.get("cds_start")
             cds_end   = f.get("cds_end")
 
             if cds_start is not None and cds_start > fstart:
-                cds_coord = f"\t{cds_start}"
+                trailing = f"\t{cds_start}\n"
             elif cds_end is not None and cds_end < fend:
-                cds_coord = f"\t{cds_end}"
+                trailing = f"\t{cds_end}\n"
+            else:
+                trailing = "\t"
 
-            # Format: start \t end strand phase biotype gene_idx [cds_coord]
-            target_text += f"\n{fstart}\t{fend}{fstrand}{fphase}{biotype}{gene_idx_str}{cds_coord}"
+            # Format: start \t end strand phase biotype gene_idx \t [cds_coord \n]
+            target_text += f"\n{fstart}\t{fend}{fstrand}{fphase}{biotype}{gene_idx_str}{trailing}"
 
         target_text += "\n<EOS>"
 

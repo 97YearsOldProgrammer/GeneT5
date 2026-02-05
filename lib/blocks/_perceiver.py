@@ -3,12 +3,13 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-import torch                as th
-import torch.nn             as nn
-import torch.nn.functional  as F
+import torch                       as th
+import torch.nn                    as nn
+import torch.nn.functional         as F
+import torch.utils.checkpoint      as ckpt
 
 import triton
-import triton.language      as tl
+import triton.language             as tl
 
 
 ####################
@@ -18,14 +19,15 @@ import triton.language      as tl
 
 @dataclass
 class PerceiverConfig:
-    embed_dim:       int   = 768
-    num_latents:     int   = 512
-    num_heads:       int   = 12
-    num_kv_heads:    int   = None
-    num_layers:      int   = 2
-    ff_dim:          int   = None
-    dropout:         float = 0.0
-    latent_init_std: float = 0.02
+    embed_dim:               int   = 768
+    num_latents:             int   = 512
+    num_heads:               int   = 12
+    num_kv_heads:            int   = None
+    num_layers:              int   = 2
+    ff_dim:                  int   = None
+    dropout:                 float = 0.0
+    latent_init_std:         float = 0.02
+    gradient_checkpointing:  bool  = False
 
     def __post_init__(self):
 
@@ -395,8 +397,26 @@ class CrossAttention(nn.Module):
 
         return out
 
+    def _expand_kv_for_gqa(self, k, v):
+        """Expand KV heads for GQA using view/expand (no memory allocation)"""
+
+        if self.heads_per_group == 1:
+            return k, v
+
+        B, H_kv, L, D = k.shape
+
+        # Reshape to [B, num_kv_heads, 1, L, D] then expand to [B, num_kv_heads, heads_per_group, L, D]
+        # Finally reshape to [B, num_heads, L, D]
+        k = k.unsqueeze(2).expand(B, H_kv, self.heads_per_group, L, D)
+        k = k.reshape(B, self.num_heads, L, D)
+
+        v = v.unsqueeze(2).expand(B, H_kv, self.heads_per_group, L, D)
+        v = v.reshape(B, self.num_heads, L, D)
+
+        return k, v
+
     def _forward_pytorch(self, q, k, v, attention_mask):
-        """PyTorch fallback"""
+        """PyTorch fallback with Flash Attention via SDPA"""
 
         B, L_q, H, D = q.shape
 
@@ -404,20 +424,27 @@ class CrossAttention(nn.Module):
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
 
-        if self.heads_per_group > 1:
-            k = k.repeat_interleave(self.heads_per_group, dim=1)
-            v = v.repeat_interleave(self.heads_per_group, dim=1)
+        # Efficient GQA expansion using view/expand (no memory allocation)
+        k, v = self._expand_kv_for_gqa(k, v)
 
-        scores = th.matmul(q, k.transpose(-2, -1)) * self.scale
-
+        # Prepare attention mask for SDPA (additive mask)
+        attn_mask = None
         if attention_mask is not None:
-            mask = (attention_mask == 0).unsqueeze(1).unsqueeze(2)
-            scores = scores.masked_fill(mask, -1e9)
+            # attention_mask: [B, L_kv] with 1=valid, 0=pad
+            # SDPA additive mask: 0=attend, -inf=ignore
+            attn_mask = th.zeros_like(attention_mask, dtype=q.dtype)
+            attn_mask = attn_mask.masked_fill(attention_mask == 0, float('-inf'))
+            attn_mask = attn_mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, L_kv]
 
-        attn = F.softmax(scores, dim=-1)
-        attn = self.dropout(attn)
+        # Use SDPA for Flash Attention support (memory efficient)
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask    = attn_mask,
+            dropout_p    = self.dropout.p if self.training else 0.0,
+            is_causal    = False,
+            scale        = self.scale,
+        )
 
-        out = th.matmul(attn, v)
         out = out.permute(0, 2, 1, 3).reshape(B, L_q, self.num_heads * self.head_dim)
 
         return out
@@ -503,7 +530,7 @@ class SelfAttention(nn.Module):
         return out
 
     def _forward_pytorch(self, q, k, v):
-        """PyTorch fallback"""
+        """PyTorch fallback with Flash Attention via SDPA"""
 
         B, L, H, D = q.shape
 
@@ -511,11 +538,15 @@ class SelfAttention(nn.Module):
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
 
-        scores = th.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn   = F.softmax(scores, dim=-1)
-        attn   = self.dropout(attn)
+        # Use SDPA for Flash Attention support (memory efficient)
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask = None,
+            dropout_p = self.dropout.p if self.training else 0.0,
+            is_causal = False,
+            scale     = self.scale,
+        )
 
-        out = th.matmul(attn, v)
         out = out.permute(0, 2, 1, 3).reshape(B, L, self.embed_dim)
 
         return out
@@ -598,18 +629,20 @@ class PerceiverCompressor(nn.Module):
     where L << N. Decoder cross-attention then operates on L tokens instead of N.
 
     Uses Triton kernels for memory-efficient inference (no materialized attention matrix).
-    Falls back to PyTorch during training for gradient computation.
+    Falls back to PyTorch with SDPA (Flash Attention) during training.
+    Supports gradient checkpointing to reduce peak memory during backward pass.
     """
 
     def __init__(self, config):
 
         super().__init__()
 
-        self.config       = config
-        self.embed_dim    = config.embed_dim
-        self.num_latents  = config.num_latents
-        self.num_heads    = config.num_heads
-        self.num_kv_heads = config.num_kv_heads
+        self.config                 = config
+        self.embed_dim              = config.embed_dim
+        self.num_latents            = config.num_latents
+        self.num_heads              = config.num_heads
+        self.num_kv_heads           = config.num_kv_heads
+        self.gradient_checkpointing = config.gradient_checkpointing
 
         # Learned latent queries
         self.latents = nn.Parameter(th.empty(config.num_latents, config.embed_dim))
@@ -652,6 +685,17 @@ class PerceiverCompressor(nn.Module):
                 if 'weight' in name and param.dim() >= 2:
                     nn.init.xavier_uniform_(param)
 
+    def set_gradient_checkpointing(self, enable):
+        """Enable or disable gradient checkpointing"""
+
+        self.gradient_checkpointing = enable
+
+    def _checkpoint_forward(self, layer, x):
+        """Wrapper for gradient checkpointing compatibility"""
+
+        # use_reentrant=False is required for torch.compile compatibility
+        return ckpt.checkpoint(layer, x, use_reentrant=False)
+
     def forward(self, encoder_hidden, encoder_mask=None):
         """
         Compress encoder output to latent representation
@@ -666,17 +710,22 @@ class PerceiverCompressor(nn.Module):
 
         B = encoder_hidden.shape[0]
 
-        # Expand latents for batch
-        latents = self.latents.unsqueeze(0).expand(B, -1, -1)
+        # Expand latents for batch (contiguous for torch.compile)
+        latents = self.latents.unsqueeze(0).expand(B, -1, -1).contiguous()
 
         # Cross-attention: latents query encoder
         normed    = self.cross_norm(latents)
         cross_out = self.cross_attn(normed, encoder_hidden, encoder_mask)
         latents   = latents + cross_out
 
-        # Self-attention refinement layers
+        # Self-attention refinement layers with optional gradient checkpointing
+        use_ckpt = self.gradient_checkpointing and self.training
+
         for layer in self.layers:
-            latents = layer(latents)
+            if use_ckpt:
+                latents = self._checkpoint_forward(layer, latents)
+            else:
+                latents = layer(latents)
 
         latents = self.final_norm(latents)
 
@@ -710,25 +759,27 @@ class PerceiverCompressor(nn.Module):
 
 def create_perceiver_compressor(
     embed_dim,
-    num_latents     = 512,
-    num_heads       = 12,
-    num_kv_heads    = None,
-    num_layers      = 2,
-    ff_dim          = None,
-    dropout         = 0.0,
-    latent_init_std = 0.02,
+    num_latents            = 512,
+    num_heads              = 12,
+    num_kv_heads           = None,
+    num_layers             = 2,
+    ff_dim                 = None,
+    dropout                = 0.0,
+    latent_init_std        = 0.02,
+    gradient_checkpointing = False,
 ):
     """Create PerceiverCompressor with given configuration"""
 
     config = PerceiverConfig(
-        embed_dim       = embed_dim,
-        num_latents     = num_latents,
-        num_heads       = num_heads,
-        num_kv_heads    = num_kv_heads,
-        num_layers      = num_layers,
-        ff_dim          = ff_dim,
-        dropout         = dropout,
-        latent_init_std = latent_init_std,
+        embed_dim              = embed_dim,
+        num_latents            = num_latents,
+        num_heads              = num_heads,
+        num_kv_heads           = num_kv_heads,
+        num_layers             = num_layers,
+        ff_dim                 = ff_dim,
+        dropout                = dropout,
+        latent_init_std        = latent_init_std,
+        gradient_checkpointing = gradient_checkpointing,
     )
 
     return PerceiverCompressor(config)

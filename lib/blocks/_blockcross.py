@@ -283,41 +283,41 @@ class BlockCrossAttention(nn.Module):
 
         self._triton_supported = _check_triton_support()
 
-    def _pool_to_blocks(self, x):
-        """Pool sequence into blocks by averaging"""
+    def _pool_to_blocks(self, x, pad_len):
+        """Pool sequence into blocks by averaging
 
-        B, L, D = x.shape
-        block_size = self.block_size
+        Args:
+            x:       [B, L_padded, D] input tensor (already padded)
+            pad_len: padding length for tracking
 
-        # Pad if necessary
-        pad_len = (block_size - L % block_size) % block_size
-        if pad_len > 0:
-            x = F.pad(x, (0, 0, 0, pad_len))
-            L_padded = L + pad_len
-        else:
-            L_padded = L
+        Returns:
+            pooled: [B, num_blocks, D]
+        """
 
-        # Reshape and pool: [B, num_blocks, block_size, D] → [B, num_blocks, D]
-        num_blocks = L_padded // block_size
-        x_blocks   = x.view(B, num_blocks, block_size, D)
-        pooled     = x_blocks.mean(dim=2)
+        B, L_padded, D = x.shape
+        num_blocks     = L_padded // self.block_size
 
-        return pooled, L, pad_len
+        # Reshape and pool: [B, num_blocks, block_size, D] -> mean -> [B, num_blocks, D]
+        # Contiguous view for efficient memory access
+        x_blocks = x.view(B, num_blocks, self.block_size, D)
+        pooled   = x_blocks.mean(dim=2)
 
-    def _unpool_from_blocks(self, pooled, original_len, pad_len):
-        """Broadcast block representations back to token level"""
+        return pooled
+
+    def _unpool_from_blocks(self, pooled, original_len):
+        """Broadcast block representations back to token level
+
+        Uses repeat_interleave which is more compile-friendly than expand+reshape
+        """
 
         B, num_blocks, D = pooled.shape
 
-        # Expand: [B, num_blocks, D] → [B, num_blocks, block_size, D]
-        expanded = pooled.unsqueeze(2).expand(-1, -1, self.block_size, -1)
+        # Efficient broadcast: [B, num_blocks, D] -> [B, num_blocks * block_size, D]
+        # repeat_interleave is well-optimized and compile-friendly
+        unpooled = pooled.repeat_interleave(self.block_size, dim=1)
 
-        # Reshape: [B, L_padded, D]
-        unpooled = expanded.reshape(B, num_blocks * self.block_size, D)
-
-        # Remove padding
-        if pad_len > 0:
-            unpooled = unpooled[:, :original_len, :]
+        # Slice to original length (compile-friendly static slicing when possible)
+        unpooled = unpooled[:, :original_len, :]
 
         return unpooled
 
@@ -369,33 +369,48 @@ class BlockCrossAttention(nn.Module):
         return out
 
     def _forward_pytorch(self, q, k, v, attention_mask, num_blocks, L_enc):
-        """PyTorch fallback path"""
+        """PyTorch training path using F.scaled_dot_product_attention"""
 
         B = q.shape[0]
 
+        # Reshape for SDPA: [B, num_heads, seq_len, head_dim]
         q = q.permute(0, 2, 1, 3)  # [B, num_heads, num_blocks, head_dim]
         k = k.permute(0, 2, 1, 3)  # [B, num_kv_heads, L_enc, head_dim]
         v = v.permute(0, 2, 1, 3)
 
-        # Expand KV for grouped query attention
+        # GQA via expand (no memory copy, just view with stride tricks)
+        # Reshape to [B, num_kv_heads, 1, L_enc, head_dim] then expand
         if self.heads_per_group > 1:
-            k = k.repeat_interleave(self.heads_per_group, dim=1)
-            v = v.repeat_interleave(self.heads_per_group, dim=1)
+            k = k.unsqueeze(2).expand(B, self.num_kv_heads, self.heads_per_group, L_enc, self.head_dim)
+            v = v.unsqueeze(2).expand(B, self.num_kv_heads, self.heads_per_group, L_enc, self.head_dim)
+            # Reshape to [B, num_heads, L_enc, head_dim]
+            k = k.reshape(B, self.num_heads, L_enc, self.head_dim)
+            v = v.reshape(B, self.num_heads, L_enc, self.head_dim)
 
-        # Attention scores: [B, num_heads, num_blocks, L_enc]
-        scores = th.matmul(q, k.transpose(-2, -1)) * self.softmax_scale
-
-        # Apply attention mask if provided
+        # Build attention mask for SDPA
+        # SDPA expects: [B, 1, num_blocks, L_enc] or [B, num_heads, num_blocks, L_enc]
+        # Values: 0 = attend, -inf = mask out
+        attn_mask = None
         if attention_mask is not None:
-            mask = (attention_mask == 0).unsqueeze(1).unsqueeze(2)
-            scores = scores.masked_fill(mask, -1e9)
+            # attention_mask: [B, L_enc] with 1=valid, 0=pad
+            # Convert to: [B, 1, 1, L_enc] with 0.0=valid, -inf=pad
+            attn_mask = th.where(
+                attention_mask.unsqueeze(1).unsqueeze(2) == 0,
+                th.tensor(float('-inf'), device=q.device, dtype=q.dtype),
+                th.tensor(0.0, device=q.device, dtype=q.dtype)
+            )
 
-        # Softmax and dropout
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-
-        # Attention output: [B, num_heads, num_blocks, head_dim]
-        attn_out = th.matmul(attn_weights, v)
+        # Use scaled_dot_product_attention (flash attention when available)
+        # Handles softmax, scaling, and dropout internally
+        # Memory efficient: doesn't materialize full attention matrix
+        dropout_p = self.config.dropout if self.training else 0.0
+        attn_out  = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask   = attn_mask,
+            dropout_p   = dropout_p,
+            is_causal   = False,
+            scale       = self.softmax_scale,
+        )
 
         # Reshape: [B, num_blocks, num_heads * head_dim]
         attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, num_blocks, self.num_heads * self.head_dim)
@@ -415,12 +430,23 @@ class BlockCrossAttention(nn.Module):
             output: [B, decoder_len, D] cross-attention output
         """
 
-        B, L_dec, _ = hidden_states.shape
+        B, L_dec, D = hidden_states.shape
         L_enc       = encoder_hidden_states.shape[1]
 
+        # Compute padding for block alignment
+        pad_len = (self.block_size - L_dec % self.block_size) % self.block_size
+
+        # Pad decoder if necessary (fused with pooling)
+        if pad_len > 0:
+            hidden_padded = F.pad(hidden_states, (0, 0, 0, pad_len))
+        else:
+            hidden_padded = hidden_states
+
+        L_padded   = L_dec + pad_len
+        num_blocks = L_padded // self.block_size
+
         # Pool decoder to blocks
-        pooled_dec, original_len, pad_len = self._pool_to_blocks(hidden_states)
-        num_blocks = pooled_dec.shape[1]
+        pooled_dec = self._pool_to_blocks(hidden_padded, pad_len)
 
         # Project queries from pooled decoder blocks
         q = self.q(pooled_dec).view(B, num_blocks, self.num_heads, self.head_dim)
@@ -446,7 +472,7 @@ class BlockCrossAttention(nn.Module):
         attn_out = self.o(attn_out)
 
         # Unpool back to token level
-        output = self._unpool_from_blocks(attn_out, original_len, pad_len)
+        output = self._unpool_from_blocks(attn_out, L_dec)
 
         output = self.dropout(output)
 
@@ -458,6 +484,7 @@ class BlockCrossAttention(nn.Module):
         block_count    = (decoder_len + self.block_size - 1) // self.block_size
         dense_scores   = decoder_len * encoder_len * self.num_heads
         sparse_scores  = block_count * encoder_len * self.num_heads
+        reduction      = dense_scores / max(sparse_scores, 1)
 
         # Triton kernel doesn't materialize scores at all
         triton_scores = 0  # Online softmax, no materialization
@@ -466,6 +493,7 @@ class BlockCrossAttention(nn.Module):
             "dense_scores":       dense_scores,
             "block_scores":       sparse_scores,
             "triton_scores":      triton_scores,
-            "reduction_vs_dense": dense_scores / max(sparse_scores, 1),
+            "reduction_vs_dense": reduction,
+            "reduction_factor":   reduction,
             "block_count":        block_count,
         }
