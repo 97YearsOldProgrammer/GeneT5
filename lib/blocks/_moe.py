@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -210,7 +211,11 @@ class MoE(nn.Module):
         self.expert_weights = FusedExpertWeights(config.num_experts, config.embed_dim, config.ff_dim)
         self.dropout        = nn.Dropout(config.dropout)
 
-        self._triton_supported = _check_triton_support()
+        self._triton_supported     = _check_triton_support()
+        self._grouped_mm_available = (
+            hasattr(torch, '_grouped_mm')
+            and os.environ.get("GENET5_GROUPED_MM", "0") == "1"
+        )
 
     def _prepare_expert_batches(self, top_k_indices, top_k_probs, num_tokens, device):
         """Prepare sorted token batches for fused expert computation"""
@@ -320,8 +325,38 @@ class MoE(nn.Module):
 
         return output
 
+    def _forward_grouped(self, x_flat, top_k_indices, top_k_probs):
+        """Grouped GEMM forward — 3 kernel launches instead of 3×num_experts"""
+
+        num_tokens, embed_dim = x_flat.shape
+        device                = x_flat.device
+
+        sorted_experts, sorted_tokens, sorted_weights, expert_offsets, expert_counts = \
+            self._prepare_expert_batches(top_k_indices, top_k_probs, num_tokens, device)
+
+        output = torch.zeros_like(x_flat)
+
+        if sorted_tokens.shape[0] == 0:
+            return output
+
+        sorted_input = x_flat[sorted_tokens]
+        offs         = expert_offsets[1:].to(torch.int32)
+
+        gate_w = self.expert_weights.gate_weights
+        up_w   = self.expert_weights.up_weights
+        down_w = self.expert_weights.down_weights
+
+        gate_out = torch._grouped_mm(sorted_input, gate_w, offs=offs)
+        up_out   = torch._grouped_mm(sorted_input, up_w, offs=offs)
+        hidden   = LigerSiLUMulFunction.apply(gate_out, up_out)
+        out      = torch._grouped_mm(hidden, down_w, offs=offs)
+
+        output.index_add_(0, sorted_tokens, (out * sorted_weights.unsqueeze(-1)).to(output.dtype))
+
+        return output
+
     def _forward_pytorch(self, x_flat, top_k_indices, top_k_probs):
-        """Optimized loop-based PyTorch fallback"""
+        """Loop-based PyTorch fallback"""
 
         num_tokens, embed_dim = x_flat.shape
         device                = x_flat.device
@@ -352,7 +387,7 @@ class MoE(nn.Module):
             hidden   = LigerSiLUMulFunction.apply(gate_out, up_out)
             out      = hidden @ down_w[expert_id]
 
-            output.index_add_(0, token_ids, out * weights)
+            output.index_add_(0, token_ids, (out * weights).to(output.dtype))
 
         return output
 
@@ -381,6 +416,8 @@ class MoE(nn.Module):
                 torch.cuda.synchronize()
                 self._triton_supported = False
                 output = self._forward_pytorch(x_flat, top_k_indices, top_k_probs)
+        elif self._grouped_mm_available and x_flat.is_cuda:
+            output = self._forward_grouped(x_flat, top_k_indices, top_k_probs)
         else:
             output = self._forward_pytorch(x_flat, top_k_indices, top_k_probs)
 

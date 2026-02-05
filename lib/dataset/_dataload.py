@@ -1,3 +1,5 @@
+import os
+import struct
 import random
 import math
 
@@ -611,7 +613,7 @@ class PackedTrainDataset:
     Dataset for pre-packed training data
 
     Streams pre-packed samples directly - no runtime packing overhead.
-    Each sample contains multiple segments already concatenated with isolation padding.
+    Offset table cached in __init__, file handle opened lazily per-worker.
     """
 
     def __init__(self, packed_path, seed=42):
@@ -619,9 +621,37 @@ class PackedTrainDataset:
         self.packed_path = packed_path
         self.seed        = seed
         self.epoch       = 0
+        self._file       = None
+        self._file_pid   = None
 
-        self._info   = packed.get_packed_info(packed_path)
-        self._length = self._info["num_samples"]
+        # Read header + cache full offset table once
+        with open(packed_path, 'rb') as f:
+            magic = f.read(4)
+            if magic != packed.PACKED_MAGIC:
+                raise ValueError(f"Invalid magic header: {magic}")
+
+            _version    = struct.unpack('<B', f.read(1))[0]
+            num_samples = struct.unpack('<I', f.read(4))[0]
+
+            raw = f.read(num_samples * 12)
+
+        self._length  = num_samples
+        self._offsets = []
+        for i in range(num_samples):
+            off  = i * 12
+            vals = struct.unpack('<QI', raw[off:off + 12])
+            self._offsets.append(vals)
+
+    def _get_file(self):
+        """Lazy file handle — opens once per process (fork-safe for num_workers>0)"""
+
+        pid = os.getpid()
+        if self._file is None or self._file.closed or self._file_pid != pid:
+            if self._file is not None and not self._file.closed:
+                self._file.close()
+            self._file     = open(self.packed_path, 'rb')
+            self._file_pid = pid
+        return self._file
 
     def set_epoch(self, epoch):
 
@@ -633,7 +663,11 @@ class PackedTrainDataset:
 
     def __getitem__(self, idx):
 
-        sample = packed.read_packed_at_index(self.packed_path, idx)
+        offset, length = self._offsets[idx]
+        f              = self._get_file()
+        f.seek(offset)
+        data           = f.read(length)
+        sample         = packed.PackedSample.from_bytes(data)
 
         return {
             "input_ids":       sample.input_ids,
@@ -644,6 +678,19 @@ class PackedTrainDataset:
             "num_segments":    sample.num_segments,
         }
 
+    def __getstate__(self):
+        """Drop file handle for pickling (spawn-based num_workers)"""
+
+        state              = self.__dict__.copy()
+        state['_file']     = None
+        state['_file_pid'] = None
+        return state
+
+    def __del__(self):
+
+        if self._file is not None and not self._file.closed:
+            self._file.close()
+
 
 class PackedCollator:
     """
@@ -652,15 +699,21 @@ class PackedCollator:
     Just pads to max length in batch - no complex packing logic needed.
     """
 
-    def __init__(self, pad_token_id, label_pad=-100):
+    def __init__(self, pad_token_id, label_pad=-100, align=32):
 
         self.pad_token_id = pad_token_id
         self.label_pad    = label_pad
+        self.align        = align
 
     def __call__(self, batch):
 
+        align         = self.align
         max_input_len = max(len(b["input_ids"]) for b in batch)
         max_label_len = max(len(b["labels"]) for b in batch)
+
+        if align > 1:
+            max_input_len = (max_input_len + align - 1) // align * align
+            max_label_len = (max_label_len + align - 1) // align * align
 
         input_ids      = []
         attention_mask = []

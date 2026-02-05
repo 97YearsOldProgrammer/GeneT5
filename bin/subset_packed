@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+
+import random
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+import lib.dataset as ds
+
+
+SRC_DIR  = pathlib.Path('../baked/5k4.5k')
+DST_DIR  = pathlib.Path('../baked/5%5k4.5k')
+FRACTION = 0.05
+SEED     = 42
+
+
+def subset_file(src_path, dst_path, fraction, seed):
+    """Randomly select a fraction of samples and write to new packed file"""
+
+    info        = ds.get_packed_info(src_path)
+    num_samples = info['num_samples']
+    num_subset  = max(1, int(num_samples * fraction))
+
+    print(f"  {src_path.name}: {num_samples:,} -> {num_subset:,} samples ({fraction*100:.0f}%)")
+
+    rng     = random.Random(seed)
+    indices = sorted(rng.sample(range(num_samples), num_subset))
+
+    with ds.PackedWriter(dst_path, num_subset) as writer:
+        for i, idx in enumerate(indices):
+            sample = ds.read_packed_at_index(src_path, idx)
+            writer.write_sample(sample)
+
+            if (i + 1) % 5000 == 0:
+                pct = 100 * (i + 1) / num_subset
+                print(f"    {i+1:,}/{num_subset:,} ({pct:.0f}%)", end='\r')
+
+    if num_subset > 5000:
+        print(f"    {num_subset:,}/{num_subset:,} (100%)")
+
+
+def main():
+    print(f"Subsetting packed data ({FRACTION*100:.0f}%)")
+    print(f"  Source: {SRC_DIR}")
+    print(f"  Output: {DST_DIR}")
+
+    DST_DIR.mkdir(parents=True, exist_ok=True)
+
+    for name in ['training.packed', 'validation.packed']:
+        src = SRC_DIR / name
+        dst = DST_DIR / name
+
+        if not src.exists():
+            print(f"  SKIP: {src} not found")
+            continue
+
+        subset_file(src, dst, FRACTION, SEED)
+
+    # Verify
+    print(f"\nVerification:")
+    for name in ['training.packed', 'validation.packed']:
+        dst = DST_DIR / name
+        if dst.exists():
+            info = ds.get_packed_info(dst)
+            print(f"  {name}: {info['num_samples']:,} samples, {info['total_size']/1e6:.1f} MB")
+
+    print("Done")
+
+
+if __name__ == '__main__':
+    main()

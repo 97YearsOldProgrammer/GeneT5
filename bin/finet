@@ -10,6 +10,8 @@ import torch
 import torch.utils.data as data_utils
 import transformers as tf
 
+from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
+
 import lib.dataset      as ds
 import lib.tokenizer    as tk
 import lib.model        as mdl
@@ -24,7 +26,7 @@ DEFAULTS = {
     'warmup_ratio':   0.03,
     'grad_accum':     64,
     'max_grad_norm':  1.0,
-    'num_workers':    0,
+    'num_workers':    2,
 }
 
 
@@ -77,8 +79,6 @@ def main():
         metavar='<int>', help='call torch.cuda.empty_cache() every N steps to reduce fragmentation')
     parser.add_argument('--no_pin_memory', action='store_true',
         help='disable pin_memory in dataloaders (can reduce CPU memory pressure)')
-    parser.add_argument('--log_memory', action='store_true',
-        help='log memory usage in progress reports')
     parser.add_argument('--memwatch', action='store_true',
         help='enable background memory monitoring to CSV (first 5min: 5s intervals, then 30s)')
     parser.add_argument('--sort_by_length', action='store_true',
@@ -89,6 +89,8 @@ def main():
         help='max batch size when using token budget [%(default)s]')
     parser.add_argument('--min_batch_size', type=int, default=1,
         help='min batch size when using token budget [%(default)s]')
+    parser.add_argument('--mxfp8', action='store_true',
+        help='apply MXFP8 quantization to dense Linear layers (Blackwell only)')
 
     args = parser.parse_args()
     
@@ -119,13 +121,34 @@ def main():
     
     # load model
     print(f"\nLoading model...")
-    model = mdl.GeneT5.from_pretrained(pathlib.Path(args.model_path), device='cpu', dtype=torch.float32)
+    model = mdl.GeneT5.from_pretrained(pathlib.Path(args.model_path), device='cpu', dtype=torch.bfloat16)
     model = model.to(device)
     
     stats = model.get_param_stats()
     print(f"  Trainable: {stats['total_trainable']:,}")
     print(f"  Frozen:    {stats['total_frozen']:,}")
-    
+
+    # apply MXFP8 quantization to dense Linear layers
+    if args.mxfp8:
+        from torchao.prototype.mx_formats import MXLinearConfig
+        from torchao.quantization import quantize_
+
+        mx_config = MXLinearConfig.from_recipe_name("mxfp8_cublas")
+
+        def mxfp8_filter(mod, fqn):
+            if not isinstance(mod, torch.nn.Linear):
+                return False
+            if mod.in_features % 32 != 0 or mod.out_features % 32 != 0:
+                return False
+            # Block cross-attention pools to variable block counts (not always %32)
+            if 'cross_attn.q' in fqn or 'cross_attn.o' in fqn:
+                return False
+            return True
+
+        quantize_(model, mx_config, filter_fn=mxfp8_filter)
+        n_mx = sum(1 for _, m in model.named_modules() if type(m).__name__ == 'MXLinear')
+        print(f"  MXFP8: converted {n_mx} Linear layers to MXLinear")
+
     # load datasets (packed format)
     print(f"\nLoading datasets...")
 
@@ -192,32 +215,37 @@ def main():
         train_shuffle = False
         print(f"  First batch will have ~{max_lbl:,} token labels (peak memory)")
 
+    persistent = args.num_workers > 0
+
     if train_sampler:
         train_loader = data_utils.DataLoader(
             train_dataset,
-            batch_sampler = train_sampler,
-            collate_fn    = collator,
-            num_workers   = args.num_workers,
-            pin_memory    = not args.no_pin_memory,
+            batch_sampler      = train_sampler,
+            collate_fn         = collator,
+            num_workers        = args.num_workers,
+            pin_memory         = not args.no_pin_memory,
+            persistent_workers = persistent,
         )
     else:
         train_loader = data_utils.DataLoader(
             train_dataset,
-            batch_size  = args.batch_size,
-            shuffle     = train_shuffle,
-            collate_fn  = collator,
-            num_workers = args.num_workers,
-            pin_memory  = not args.no_pin_memory,
-            drop_last   = True,
+            batch_size         = args.batch_size,
+            shuffle            = train_shuffle,
+            collate_fn         = collator,
+            num_workers        = args.num_workers,
+            pin_memory         = not args.no_pin_memory,
+            drop_last          = True,
+            persistent_workers = persistent,
         )
 
     val_loader = data_utils.DataLoader(
         val_dataset,
-        batch_size  = args.batch_size,
-        shuffle     = False,
-        collate_fn  = collator,
-        num_workers = args.num_workers,
-        pin_memory  = not args.no_pin_memory,
+        batch_size         = args.batch_size,
+        shuffle            = False,
+        collate_fn         = collator,
+        num_workers        = args.num_workers,
+        pin_memory         = not args.no_pin_memory,
+        persistent_workers = persistent,
     )
     
     print(f"  Train batches: {len(train_loader)}")
@@ -244,7 +272,7 @@ def main():
                 lr           = args.lr,
                 betas        = (0.9, 0.95),
                 weight_decay = args.weight_decay,
-                foreach      = False,  # Reduce memory during optimizer.step()
+                foreach      = True,
             )
     else:
         optimizer = torch.optim.AdamW(
@@ -252,7 +280,7 @@ def main():
             lr           = args.lr,
             betas        = (0.9, 0.95),
             weight_decay = args.weight_decay,
-            foreach      = False,  # Reduce memory during optimizer.step()
+            foreach      = True,
         )
     
     total_steps  = len(train_loader) * args.epochs // args.grad_accum
@@ -301,9 +329,9 @@ def main():
 
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
-    # Setup label smoothing loss if enabled
+    # Setup label smoothing loss if enabled (use Liger fused kernel for memory efficiency)
     if args.label_smoothing > 0:
-        loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=args.label_smoothing)
+        loss_fct = LigerCrossEntropyLoss(ignore_index=-100, label_smoothing=args.label_smoothing)
         print(f"  Label smoothing: {args.label_smoothing}")
     else:
         loss_fct = None
@@ -344,7 +372,7 @@ def main():
         model.train()
         total_train_loss = 0
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         # Progress tracking
         num_batches = len(train_loader)
@@ -403,7 +431,7 @@ def main():
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
                 scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
                 # Step-based checkpoint saving
@@ -436,15 +464,13 @@ def main():
                 eta_epoch = (num_batches - samples_done) / samples_per_sec if samples_per_sec > 0 else 0
                 avg_loss_so_far = total_train_loss / (step + 1)
 
-                mem_str = ""
-                if args.log_memory:
-                    import psutil
-                    mem = psutil.virtual_memory()
-                    mem_str = f" | RAM: {mem.used/1e9:.1f}/{mem.total/1e9:.0f}GB ({mem.percent:.0f}%)"
-                    if torch.cuda.is_available():
-                        gpu_mem = torch.cuda.memory_allocated() / 1e9
-                        gpu_max = torch.cuda.max_memory_allocated() / 1e9
-                        mem_str += f" | GPU: {gpu_mem:.1f}GB (peak: {gpu_max:.1f}GB)"
+                import psutil
+                mem     = psutil.virtual_memory()
+                mem_str = f" | RAM: {mem.used/1e9:.1f}/{mem.total/1e9:.0f}GB"
+                if torch.cuda.is_available():
+                    gpu_mem = torch.cuda.memory_allocated() / 1e9
+                    gpu_max = torch.cuda.max_memory_allocated() / 1e9
+                    mem_str += f" | GPU: {gpu_mem:.1f}/{gpu_max:.1f}GB"
 
                 print(f"  [{last_logged_pct:3d}%] batch {step+1}/{num_batches} | "
                       f"loss: {avg_loss_so_far:.4f} | "

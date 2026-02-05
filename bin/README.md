@@ -19,17 +19,16 @@ python3 -u bin/init_model.py \
     --decoder_ff_dim 3072 \
     --decoder_dropout 0.1 \
     --use_moe \
-    --num_experts 32 \
+    --num_experts 16 \
     --moe_top_k 2 \
     --init_std 0.02 \
     --init_embed_std 0.02 \
     --init_ffn_std 0.02 \
     --init_attn_std 0.02 \
     --init_moe_router_std 0.006 \
-    --encoder_block_size 256 \
-    --encoder_window_size 34560 \
+    --encoder_window_size 512 \
     --decoder_block_size 16 \
-    --decoder_window_size 1600 \
+    --decoder_window_size 32 \
     --num_latents 1024 \
     2>&1 | tee ../logs/init.log
 ```
@@ -94,11 +93,11 @@ python3 bin/resize_model.py model_path tokenizer_path
 python -u bin/finet \
   ../baked/5k4.5k/training.packed \
   ../baked/5k4.5k/validation.packed \
-  ../model/feb.3 \
+  ../model/feb5 \
   ../model/init \
   --epochs 4 \
   --lr 1e-4 \
-  --token_budget 63700 \
+  --token_budget 45500\
   --max_batch_size 8 \
   --grad_accum 64 \
   --weight_decay 0.01 \
@@ -107,8 +106,6 @@ python -u bin/finet \
   --label_smoothing 0.1 \
   --early_stopping 2 \
   --save_steps 500 \
-  --log_memory \
   --empty_cache_steps 100 \
-  --memwatch \
   2>&1 | tee ../logs/tune/1.log
 ```
