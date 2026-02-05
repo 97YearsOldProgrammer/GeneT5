@@ -9,6 +9,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from liger_kernel.ops.swiglu import LigerSiLUMulFunction
+
 
 ####################
 #####  Config  #####
@@ -345,9 +347,9 @@ class MoE(nn.Module):
 
             expert_input = x_flat[token_ids]
 
-            gate_out = F.silu(expert_input @ gate_w[expert_id])
+            gate_out = expert_input @ gate_w[expert_id]
             up_out   = expert_input @ up_w[expert_id]
-            hidden   = gate_out * up_out
+            hidden   = LigerSiLUMulFunction.apply(gate_out, up_out)
             out      = hidden @ down_w[expert_id]
 
             output.index_add_(0, token_ids, out * weights)

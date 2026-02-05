@@ -16,8 +16,8 @@ args = parser.parse_args()
 
 
 SPECIAL_TOKENS = [
-    "<bos>",            # Begin of Sentence
-    "<eos>",            # End   of Sentence
+    "<bos>",
+    "<eos>",
 ]
 
 # Type Tokens
@@ -44,8 +44,8 @@ TYPE_TOKENS = [
 
 # Task Specific Tokens
 TASK_TOKENS = [
-    "[ATT]",            # Annotation
-    "[HIT]",            # Hints
+    "[ATT]",
+    "[HIT]",
 ]
 
 # Strand tokens
@@ -53,9 +53,9 @@ STRAND_TOKENS = ["+", "-"]
 
 # Text Specific Tokens
 TEXT_TOKENS = [
-    "\t",
-    "\n",
-    ".",        # From Phase of Gff
+    r"[\t]",
+    r"[\n]",
+    ".",
 ]
 
 # Build token list

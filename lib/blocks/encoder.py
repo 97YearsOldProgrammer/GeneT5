@@ -23,16 +23,13 @@ class EncoderBlock(nn.Module):
         dropout      = 0.0,
         attn_dropout = 0.0,
         use_alibi    = True,
-        block_size   = 64,
-        window_size  = 256,
+        window_size  = 512,
     ):
         super().__init__()
 
-        # Always use BigBird sparse attention for long sequences
         sparse_config = SparseAttentionConfig(
             embed_dim   = embed_dim,
             num_heads   = num_heads,
-            block_size  = block_size,
             window_size = window_size,
             dropout     = attn_dropout,
             use_alibi   = use_alibi
@@ -71,8 +68,7 @@ class Encoder(nn.Module):
         dropout      = 0.0,
         attn_dropout = 0.0,
         use_alibi    = True,
-        block_size   = 64,
-        window_size  = 256,
+        window_size  = 512,
     ):
         super().__init__()
 
@@ -86,7 +82,6 @@ class Encoder(nn.Module):
                 dropout      = dropout,
                 attn_dropout = attn_dropout,
                 use_alibi    = use_alibi,
-                block_size   = block_size,
                 window_size  = window_size,
             )
             for _ in range(num_layers)

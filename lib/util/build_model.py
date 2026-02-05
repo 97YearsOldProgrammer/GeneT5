@@ -3,7 +3,7 @@ import torch.nn as nn
 import json
 import gc
 
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer, AutoConfig
 from pathlib      import Path
 
 from lib.blocks import Encoder, Decoder
@@ -16,8 +16,7 @@ from lib.blocks._perceiver import PerceiverCompressor, PerceiverConfig
 
 
 ENCODER_DEFAULTS = {
-    "block_size":  64,
-    "window_size": 256,
+    "window_size": 512,
 }
 
 DECODER_DEFAULTS = {
@@ -47,8 +46,7 @@ PERCEIVER_DEFAULTS = {
 def build_gt5(
     dnabert_model_name  = "zhihan1996/DNABERT-2-117M",
     save_dir            = "./checkpoints/genet5_init",
-    # Encoder sparse attention
-    encoder_block_size  = ENCODER_DEFAULTS["block_size"],
+    # Encoder sliding window
     encoder_window_size = ENCODER_DEFAULTS["window_size"],
     # Decoder sparse attention
     decoder_block_size  = DECODER_DEFAULTS["block_size"],
@@ -126,9 +124,12 @@ def build_gt5(
     if vocab_size is None:
         vocab_size = len(tokenizer)
     print(f"      vocab_size: {vocab_size}")
-    
-    original_model = AutoModel.from_pretrained(dnabert_model_name, trust_remote_code=True)
-    dna_config     = original_model.config
+
+    # Load config first and set pad_token_id (required by DNABERT-2 custom code)
+    dna_config              = AutoConfig.from_pretrained(dnabert_model_name, trust_remote_code=True)
+    dna_config.pad_token_id = tokenizer.pad_token_id
+
+    original_model = AutoModel.from_pretrained(dnabert_model_name, config=dna_config, trust_remote_code=True)
     
     # Decoder defaults to encoder
     if decoder_num_layers is None:
@@ -142,7 +143,7 @@ def build_gt5(
     
     print(f"\n    DNABERT-2: hidden={dna_config.hidden_size}, layers={dna_config.num_hidden_layers}, heads={dna_config.num_attention_heads}")
     print(f"    Decoder:   layers={decoder_num_layers}, heads={decoder_num_heads}, kv_heads={decoder_num_kv_heads}, moe={decoder_use_moe}")
-    print(f"    Encoder Sparse: block={encoder_block_size}, window={encoder_window_size}")
+    print(f"    Encoder: window={encoder_window_size}")
     print(f"    Decoder Sparse: block={decoder_block_size}, window={decoder_window_size}")
     print(f"    Perceiver: latents={num_latents}, layers={perceiver_layers}")
     
@@ -164,7 +165,7 @@ def build_gt5(
         nn.init.normal_(encoder_embed.weight, mean=0.0, std=init_embed_std)
         print(f"    ! Random init")
     
-    # Build Encoder (BigBird sparse attention)
+    # Build Encoder (sliding window attention via FlexAttention)
     print(f"\n[3] Building Encoder")
     encoder = Encoder(
         num_layers   = dna_config.num_hidden_layers,
@@ -174,7 +175,6 @@ def build_gt5(
         dropout      = dna_config.hidden_dropout_prob,
         attn_dropout = dna_config.attention_probs_dropout_prob,
         use_alibi    = True,
-        block_size   = encoder_block_size,
         window_size  = encoder_window_size,
     )
     
@@ -365,7 +365,6 @@ def build_gt5(
         "decoder_moe_top_k":    decoder_moe_top_k,
         "vocab_size":           vocab_size,
         "tie_weights":          tie_weights,
-        "encoder_block_size":   encoder_block_size,
         "encoder_window_size":  encoder_window_size,
         "decoder_block_size":   decoder_block_size,
         "decoder_window_size":  decoder_window_size,

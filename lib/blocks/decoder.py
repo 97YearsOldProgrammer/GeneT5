@@ -31,8 +31,8 @@ class DecoderBlock(nn.Module):
         moe_load_balance = 0.01,
         moe_router_z     = 0.001,
         num_kv_heads     = None,
-        block_size       = 16,       # 16 tokens per block (shared by self-attn and cross-attn)
-        window_size      = 1600,     # 1600 tokens per sliding window (self-attn only)
+        block_size       = 256,      # for cross-attention only
+        window_size      = 32,       # for self-attention sliding window
     ):
         super().__init__()
 
@@ -45,7 +45,6 @@ class DecoderBlock(nn.Module):
         sparse_config = SparseAttentionConfig(
             embed_dim   = embed_dim,
             num_heads   = num_heads,
-            block_size  = block_size,
             window_size = window_size,
             dropout     = attn_dropout,
             use_alibi   = use_alibi,
@@ -134,8 +133,8 @@ class Decoder(nn.Module):
         moe_load_balance = 0.01,
         moe_router_z     = 0.001,
         num_kv_heads     = None,
-        block_size       = 16,       # 16 tokens per block
-        window_size      = 1600,     # 1600 tokens per sliding window
+        block_size       = 256,      # for cross-attention only
+        window_size      = 32,       # for self-attention sliding window
     ):
         super().__init__()
 

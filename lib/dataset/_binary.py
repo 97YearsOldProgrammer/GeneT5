@@ -239,13 +239,13 @@ class BinaryChunk:
         input_text = self.sequence
 
         if self.has_hints and self.hints:
-            input_text += "\n[HIT]"
+            input_text += r"[\n][HIT]"
             for h in sorted(self.hints, key=lambda x: x.get("start", 0)):
                 htype   = h.get("type", "exon").lower()
                 hstart  = h.get("start", 0)
                 hend    = h.get("end", 0)
                 hstrand = h.get("strand", "+")
-                input_text += f"\n{htype}{hstart}\t{hend}{hstrand}"
+                input_text += rf"[\n]{htype}{hstart}[\t]{hend}{hstrand}"
 
         return input_text
 
@@ -254,7 +254,7 @@ class BinaryChunk:
 
         gene_indices, transcript_indices = self._build_gene_transcript_indices()
 
-        target_text     = "<BOS>"
+        target_text     = "<bos>"
         sorted_features = sorted(self.features, key=lambda x: x.get("start", 0))
 
         for f in sorted_features:
@@ -277,23 +277,23 @@ class BinaryChunk:
                 gene_id, transcript_id, gene_indices, transcript_indices
             )
 
-            # Build trailing separator
-            # - All lines end with \t (separates gene_idx from next line's start)
-            # - Terminal exons (with UTR) have \t{cds_coord}\n (explicit newline marker)
+            # Build trailing - UTR lines have [\t]{cds_coord}
+            # 5'UTR: cds_start (where CDS begins)
+            # 3'UTR: cds_end (where CDS ends)
             cds_start = f.get("cds_start")
             cds_end   = f.get("cds_end")
 
             if cds_start is not None and cds_start > fstart:
-                trailing = f"\t{cds_start}\n"
+                trailing = rf"[\t]{cds_start}"
             elif cds_end is not None and cds_end < fend:
-                trailing = f"\t{cds_end}\n"
+                trailing = rf"[\t]{cds_end}"
             else:
-                trailing = "\t"
+                trailing = ""
 
-            # Format: start \t end strand phase biotype gene_idx \t [cds_coord \n]
-            target_text += f"\n{fstart}\t{fend}{fstrand}{fphase}{biotype}{gene_idx_str}{trailing}"
+            # Format: {start}[\t]{end}{strand}{phase}{biotype}{gene_idx}[[\t]{cds_coord}][\n]
+            target_text += rf"{fstart}[\t]{fend}{fstrand}{fphase}{biotype}{gene_idx_str}{trailing}[\n]"
 
-        target_text += "\n<EOS>"
+        target_text += "<eos>"
 
         return target_text
 

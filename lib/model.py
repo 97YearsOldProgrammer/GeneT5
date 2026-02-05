@@ -7,6 +7,8 @@ from pathlib                import Path
 from lib.blocks             import Encoder, Decoder
 from lib.blocks._perceiver  import PerceiverCompressor, PerceiverConfig
 
+from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
+
 
 class GeneT5(nn.Module):
 
@@ -28,11 +30,10 @@ class GeneT5(nn.Module):
         vocab_size           = 4096,
         tie_weights          = True,
         # Encoder sparse attention
-        encoder_block_size   = 16,
-        encoder_window_size  = 1600,
-        # Decoder sparse attention
-        decoder_block_size   = 16,
-        decoder_window_size  = 1600,
+        encoder_window_size  = 512,
+        # Decoder sparse attention (block_size for cross-attn pooling)
+        decoder_block_size   = 256,
+        decoder_window_size  = 32,
         # Perceiver compression
         num_latents          = 512,
         perceiver_layers     = 2,
@@ -47,7 +48,6 @@ class GeneT5(nn.Module):
             decoder_num_kv_heads = max(1, decoder_num_heads // 4)
 
         # Store sparse attention configs
-        self.encoder_block_size  = encoder_block_size
         self.encoder_window_size = encoder_window_size
         self.decoder_block_size  = decoder_block_size
         self.decoder_window_size = decoder_window_size
@@ -57,7 +57,7 @@ class GeneT5(nn.Module):
         self.encoder_embed         = nn.Embedding(vocab_size, embed_dim)
         self.encoder_embed_dropout = nn.Dropout(decoder_dropout)
 
-        # Encoder (BigBird sparse attention)
+        # Encoder (flash_attn sliding window)
         self.encoder = Encoder(
             num_layers   = encoder_num_layers,
             embed_dim    = embed_dim,
@@ -66,7 +66,6 @@ class GeneT5(nn.Module):
             dropout      = decoder_dropout,
             attn_dropout = decoder_dropout,
             use_alibi    = True,
-            block_size   = encoder_block_size,
             window_size  = encoder_window_size,
         )
 
@@ -167,10 +166,10 @@ class GeneT5(nn.Module):
         # Project to vocab
         logits = self.lm_head(decoder_output)
 
-        # Compute loss
+        # Compute loss (Liger fused kernel: 2x faster)
         loss = None
         if labels is not None:
-            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+            loss_fct = LigerCrossEntropyLoss(ignore_index=-100)
             loss     = loss_fct(logits.reshape(-1, self.vocab_size), labels.reshape(-1))
             if moe_loss is not None:
                 loss = loss + moe_loss
@@ -345,10 +344,9 @@ class GeneT5(nn.Module):
             decoder_num_kv_heads = config.get("decoder_num_kv_heads"),
             vocab_size           = config["vocab_size"],
             tie_weights          = config["tie_weights"],
-            encoder_block_size   = config.get("encoder_block_size", 64),
-            encoder_window_size  = config.get("encoder_window_size", 256),
-            decoder_block_size   = config.get("decoder_block_size", 64),
-            decoder_window_size  = config.get("decoder_window_size", 256),
+            encoder_window_size  = config.get("encoder_window_size", 512),
+            decoder_block_size   = config.get("decoder_block_size", 16),
+            decoder_window_size  = config.get("decoder_window_size", 32),
             # Perceiver config
             num_latents          = config.get("num_latents", 512),
             perceiver_layers     = config.get("perceiver_layers", 2),

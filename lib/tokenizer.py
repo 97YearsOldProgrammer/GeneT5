@@ -217,8 +217,10 @@ class GeneTokenizer:
     @property
     def eos_token_id(self):
         """Return end-of-sequence token ID."""
+
         if self._tokenizer is not None:
             return self._tokenizer.eos_token_id
+        # Prefer lowercase (canonical), then uppercase fallbacks
         for token in ("<eos>", "<EOS>", "[EOS]", "</s>"):
             if token in self._vocab:
                 return self._vocab[token]
@@ -227,8 +229,10 @@ class GeneTokenizer:
     @property
     def bos_token_id(self):
         """Return beginning-of-sequence token ID."""
+
         if self._tokenizer is not None:
             return self._tokenizer.bos_token_id
+        # Prefer lowercase (canonical), then uppercase fallbacks
         for token in ("<bos>", "<BOS>", "[BOS]", "<s>"):
             if token in self._vocab:
                 return self._vocab[token]

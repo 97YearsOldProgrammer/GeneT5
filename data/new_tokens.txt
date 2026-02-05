@@ -1,4 +1,4 @@
-<<bos>
+<bos>
 <eos>
 origin_of_replication
 mobile_genetic_element
@@ -30,9 +30,8 @@ transposable_element
 [HIT]
 +
 -
-	
-
-
+[\t]
+[\n]
 .
 0
 1

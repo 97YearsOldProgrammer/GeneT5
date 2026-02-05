@@ -272,13 +272,13 @@ class GeneT5Inference:
     
     def _clean_output(self, raw_output):
         """Clean raw model output for parsing"""
-        
+
         output = raw_output.strip()
-        output = output.replace("<bos>", "<BOS>")
-        output = output.replace("<eos>", "<EOS>")
-        output = output.replace("[BOS]", "<BOS>")
-        output = output.replace("[EOS]", "<EOS>")
-        
+        output = output.replace("<BOS>", "<bos>")
+        output = output.replace("<EOS>", "<eos>")
+        output = output.replace("[BOS]", "<bos>")
+        output = output.replace("[EOS]", "<eos>")
+
         return output
     
     def predict_single(self, sequence, seqid="seq", output_path=None, source="GeneT5",
@@ -316,8 +316,8 @@ class GeneT5Inference:
 
 class SimpleTokenizer:
     """Simple tokenizer for DNA/protein sequences as fallback"""
-    
-    def __init__(self, vocab, pad_token="<PAD>", bos_token="<BOS>", eos_token="<EOS>", unk_token="<UNK>"):
+
+    def __init__(self, vocab, pad_token="<PAD>", bos_token="<bos>", eos_token="<eos>", unk_token="<UNK>"):
         """Initialize tokenizer with vocabulary"""
         
         self.vocab        = vocab

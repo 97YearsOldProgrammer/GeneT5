@@ -55,12 +55,28 @@ class ParsedFeature:
 
 
 class ModelOutputParser:
-    """Parser for GeneT5 model output format"""
-    
+    """Parser for GeneT5 model output format (compressed: no type prefix)"""
+
+    # Compressed format: {start}[\t]{end}{strand}{phase}{biotype}{gene_idx}[[\t]{cds_coord}]
+    # Non-UTR: 100[\t]200+.protein_coding1
+    # UTR:     100[\t]200+0protein_coding1[\t]150
     FEATURE_PATTERN = re.compile(
+        r'^(?P<start>\d+)'
+        r'\[\\t\]'
+        r'(?P<end>\d+)'
+        r'(?P<strand>[+\-])'
+        r'(?P<phase>[.\d])'
+        r'(?P<biotype>[a-zA-Z_]+)'
+        r'(?P<gene_idx>\d+)'
+        r'(?:\.(?P<transcript_idx>\d+))?'
+        r'(?:\[\\t\](?P<cds_coord>\d+))?$'
+    )
+
+    # Legacy format with type prefix (for backwards compatibility)
+    FEATURE_PATTERN_LEGACY = re.compile(
         r'^(?P<type>[a-zA-Z_]+)'
         r'(?P<start>\d+)'
-        r'\t'
+        r'(?:\[\\t\]|\t|\s+)'
         r'(?P<end>\d+)'
         r'(?P<strand>[+\-])'
         r'(?P<phase>[.\d])'
@@ -68,87 +84,102 @@ class ModelOutputParser:
         r'(?P<gene_idx>\d+)'
         r'(?:\.(?P<transcript_idx>\d+))?$'
     )
-    
-    FEATURE_PATTERN_SPACE = re.compile(
-        r'^(?P<type>[a-zA-Z_]+)'
-        r'(?P<start>\d+)'
-        r'\s+'
-        r'(?P<end>\d+)'
-        r'(?P<strand>[+\-])'
-        r'(?P<phase>[.\d])'
-        r'(?P<biotype>[a-zA-Z_]+)'
-        r'(?P<gene_idx>\d+)'
-        r'(?:\.(?P<transcript_idx>\d+))?$'
-    )
-    
-    BOS_TOKEN = "<BOS>"
-    EOS_TOKEN = "<EOS>"
+
+    BOS_TOKEN = "<bos>"
+    EOS_TOKEN = "<eos>"
     
     def __init__(self, strict=False):
         """Initialize parser with optional strict mode"""
-        
+
         self.strict = strict
-    
+
     def parse_line(self, line):
         """Parse a single line from model output"""
-        
+
         line = line.strip()
-        
-        if not line or line in (self.BOS_TOKEN, self.EOS_TOKEN, "<bos>", "<eos>"):
+
+        if not line or line in (self.BOS_TOKEN, self.EOS_TOKEN, "<BOS>", "<EOS>"):
             return None
-        
+
+        # Try compressed format first (no type prefix)
         match = self.FEATURE_PATTERN.match(line)
-        if not match:
-            match = self.FEATURE_PATTERN_SPACE.match(line)
-        
-        if not match:
-            if self.strict:
-                raise ValueError(f"Failed to parse line: {line}")
-            return None
-        
-        groups = match.groupdict()
-        
-        return ParsedFeature(
-            feature_type   = groups["type"].lower(),
-            start          = int(groups["start"]),
-            end            = int(groups["end"]),
-            strand         = groups["strand"],
-            phase          = groups["phase"],
-            biotype        = groups["biotype"],
-            gene_idx       = int(groups["gene_idx"]),
-            transcript_idx = int(groups["transcript_idx"]) if groups["transcript_idx"] else None,
-            raw_line       = line,
-        )
+        if match:
+            groups = match.groupdict()
+            return ParsedFeature(
+                feature_type   = "exon",
+                start          = int(groups["start"]),
+                end            = int(groups["end"]),
+                strand         = groups["strand"],
+                phase          = groups["phase"],
+                biotype        = groups["biotype"],
+                gene_idx       = int(groups["gene_idx"]),
+                transcript_idx = int(groups["transcript_idx"]) if groups.get("transcript_idx") else None,
+                raw_line       = line,
+            )
+
+        # Try legacy format (with type prefix)
+        match = self.FEATURE_PATTERN_LEGACY.match(line)
+        if match:
+            groups = match.groupdict()
+            return ParsedFeature(
+                feature_type   = groups["type"].lower(),
+                start          = int(groups["start"]),
+                end            = int(groups["end"]),
+                strand         = groups["strand"],
+                phase          = groups["phase"],
+                biotype        = groups["biotype"],
+                gene_idx       = int(groups["gene_idx"]),
+                transcript_idx = int(groups["transcript_idx"]) if groups.get("transcript_idx") else None,
+                raw_line       = line,
+            )
+
+        if self.strict:
+            raise ValueError(f"Failed to parse line: {line}")
+        return None
     
     def parse_sequence(self, text):
         """Parse complete model output with multiple sequences"""
-        
+
         sequences   = []
         current_seq = []
-        lines       = text.strip().split('\n')
-        
+
+        # Split on [\n] token (new format) or actual newline (legacy)
+        if r'[\n]' in text:
+            lines = text.strip().split(r'[\n]')
+        else:
+            lines = text.strip().split('\n')
+
         for line in lines:
             line = line.strip()
-            
-            if line.upper() in ("<BOS>", "BOS"):
+
+            # Handle <bos> - may be standalone or attached to first feature
+            if line.lower().startswith(("<bos>", "<BOS>")):
                 if current_seq:
                     sequences.append(current_seq)
                 current_seq = []
-                continue
-            
-            if line.upper() in ("<EOS>", "EOS"):
+                # Strip <bos> prefix if attached to content
+                if len(line) > 5:
+                    line = line[5:]
+                else:
+                    continue
+
+            # Handle <eos>
+            if line.lower() in ("<eos>", "<EOS>", "eos"):
                 if current_seq:
                     sequences.append(current_seq)
                     current_seq = []
                 continue
-            
+
+            if not line:
+                continue
+
             feature = self.parse_line(line)
             if feature:
                 current_seq.append(feature)
-        
+
         if current_seq:
             sequences.append(current_seq)
-        
+
         return sequences
 
 
