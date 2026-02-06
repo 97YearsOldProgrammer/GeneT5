@@ -11,6 +11,8 @@ import torch.utils.checkpoint      as ckpt
 import triton
 import triton.language             as tl
 
+from lib.blocks._component         import LayerNorm
+
 
 ####################
 #####  CONFIG  #####
@@ -604,9 +606,9 @@ class PerceiverLayer(nn.Module):
         super().__init__()
 
         self.self_attn = SelfAttention(embed_dim, num_heads, dropout)
-        self.norm1     = nn.LayerNorm(embed_dim)
+        self.norm1     = LayerNorm(embed_dim)
         self.ff        = FeedForward(embed_dim, ff_dim, dropout)
-        self.norm2     = nn.LayerNorm(embed_dim)
+        self.norm2     = LayerNorm(embed_dim)
 
     def forward(self, x):
 
@@ -654,7 +656,7 @@ class PerceiverCompressor(nn.Module):
             num_kv_heads = config.num_kv_heads,
             dropout      = config.dropout,
         )
-        self.cross_norm = nn.LayerNorm(config.embed_dim)
+        self.cross_norm = LayerNorm(config.embed_dim)
 
         # Self-attention layers for latent refinement
         self.layers = nn.ModuleList([
@@ -667,7 +669,7 @@ class PerceiverCompressor(nn.Module):
             for _ in range(config.num_layers)
         ])
 
-        self.final_norm = nn.LayerNorm(config.embed_dim)
+        self.final_norm = LayerNorm(config.embed_dim)
 
         self._init_weights(config.latent_init_std)
 
