@@ -8,9 +8,6 @@ import torch.nn                    as nn
 import torch.nn.functional         as F
 import torch.utils.checkpoint      as ckpt
 
-import triton
-import triton.language             as tl
-
 from lib.blocks._component         import LayerNorm
 
 
@@ -39,298 +36,13 @@ class PerceiverConfig:
             self.ff_dim = self.embed_dim * 4
 
 
-def _check_triton_support():
-    """Check if Triton is supported"""
-
-    import os
-    if os.environ.get("GENET5_DISABLE_PERCEIVER_TRITON", "0") == "1":
-        return False
-    if not th.cuda.is_available():
-        return False
-    cap = th.cuda.get_device_capability()
-    return cap[0] >= 7
-
-
-##########################
-##### TRITON KERNELS #####
-##########################
-
-
-@triton.jit
-def cross_attention_fwd_kernel(
-    Q_ptr, K_ptr, V_ptr, Out_ptr,
-    Mask_ptr,
-    num_q_tokens, num_kv_tokens, head_dim,
-    stride_qb, stride_qh, stride_qq, stride_qd,
-    stride_kb, stride_kh, stride_kk, stride_kd,
-    stride_vb, stride_vh, stride_vk, stride_vd,
-    stride_ob, stride_oh, stride_oq, stride_od,
-    stride_mb, stride_mk,
-    use_mask: tl.constexpr,
-    softmax_scale,
-    BLOCK_Q: tl.constexpr,
-    BLOCK_KV: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    HEADS_PER_GROUP: tl.constexpr,
-):
-    """
-    Cross-attention with online softmax (Flash Attention style)
-
-    Grid: (batch, num_kv_heads, num_q_blocks)
-    """
-
-    pid_batch   = tl.program_id(0)
-    pid_kv_head = tl.program_id(1)
-    pid_q_block = tl.program_id(2)
-
-    # Query block boundaries
-    q_start = pid_q_block * BLOCK_Q
-    offs_q  = q_start + tl.arange(0, BLOCK_Q)
-    offs_d  = tl.arange(0, BLOCK_D)
-    mask_q  = offs_q < num_q_tokens
-
-    # Load Q for all heads in group
-    q_base = Q_ptr + pid_batch * stride_qb + offs_q[:, None] * stride_qq + offs_d[None, :] * stride_qd
-
-    q_0 = tl.load(q_base + (pid_kv_head * HEADS_PER_GROUP + 0) * stride_qh, mask=mask_q[:, None], other=0.0)
-    q_1 = tl.zeros((BLOCK_Q, BLOCK_D), dtype=tl.float32)
-    q_2 = tl.zeros((BLOCK_Q, BLOCK_D), dtype=tl.float32)
-    q_3 = tl.zeros((BLOCK_Q, BLOCK_D), dtype=tl.float32)
-
-    if HEADS_PER_GROUP > 1:
-        q_1 = tl.load(q_base + (pid_kv_head * HEADS_PER_GROUP + 1) * stride_qh, mask=mask_q[:, None], other=0.0)
-    if HEADS_PER_GROUP > 2:
-        q_2 = tl.load(q_base + (pid_kv_head * HEADS_PER_GROUP + 2) * stride_qh, mask=mask_q[:, None], other=0.0)
-    if HEADS_PER_GROUP > 3:
-        q_3 = tl.load(q_base + (pid_kv_head * HEADS_PER_GROUP + 3) * stride_qh, mask=mask_q[:, None], other=0.0)
-
-    # Initialize online softmax accumulators
-    m_i_0 = tl.full((BLOCK_Q,), float('-inf'), dtype=tl.float32)
-    m_i_1 = tl.full((BLOCK_Q,), float('-inf'), dtype=tl.float32)
-    m_i_2 = tl.full((BLOCK_Q,), float('-inf'), dtype=tl.float32)
-    m_i_3 = tl.full((BLOCK_Q,), float('-inf'), dtype=tl.float32)
-
-    l_i_0 = tl.zeros((BLOCK_Q,), dtype=tl.float32)
-    l_i_1 = tl.zeros((BLOCK_Q,), dtype=tl.float32)
-    l_i_2 = tl.zeros((BLOCK_Q,), dtype=tl.float32)
-    l_i_3 = tl.zeros((BLOCK_Q,), dtype=tl.float32)
-
-    acc_0 = tl.zeros((BLOCK_Q, BLOCK_D), dtype=tl.float32)
-    acc_1 = tl.zeros((BLOCK_Q, BLOCK_D), dtype=tl.float32)
-    acc_2 = tl.zeros((BLOCK_Q, BLOCK_D), dtype=tl.float32)
-    acc_3 = tl.zeros((BLOCK_Q, BLOCK_D), dtype=tl.float32)
-
-    # Iterate over KV blocks
-    num_kv_blocks = tl.cdiv(num_kv_tokens, BLOCK_KV)
-
-    for kv_block_idx in range(num_kv_blocks):
-        kv_start = kv_block_idx * BLOCK_KV
-        offs_kv  = kv_start + tl.arange(0, BLOCK_KV)
-        mask_kv  = offs_kv < num_kv_tokens
-
-        # Load K and V (shared across all Q heads in group)
-        k_ptrs = (K_ptr +
-                  pid_batch * stride_kb +
-                  pid_kv_head * stride_kh +
-                  offs_kv[:, None] * stride_kk +
-                  offs_d[None, :] * stride_kd)
-        k = tl.load(k_ptrs, mask=mask_kv[:, None], other=0.0)
-
-        v_ptrs = (V_ptr +
-                  pid_batch * stride_vb +
-                  pid_kv_head * stride_vh +
-                  offs_kv[:, None] * stride_vk +
-                  offs_d[None, :] * stride_vd)
-        v = tl.load(v_ptrs, mask=mask_kv[:, None], other=0.0)
-
-        k_t = tl.trans(k)
-
-        # Base mask
-        base_mask = mask_q[:, None] & mask_kv[None, :]
-
-        # Apply attention mask if provided
-        if use_mask:
-            mask_ptrs  = Mask_ptr + pid_batch * stride_mb + offs_kv * stride_mk
-            attn_mask  = tl.load(mask_ptrs, mask=mask_kv, other=0)
-            valid_mask = attn_mask != 0
-            base_mask  = base_mask & valid_mask[None, :]
-
-        # Process head 0
-        scores_0   = tl.dot(q_0, k_t) * softmax_scale
-        scores_0   = tl.where(base_mask, scores_0, float('-inf'))
-        m_ij_0     = tl.max(scores_0, axis=1)
-        m_new_0    = tl.maximum(m_i_0, m_ij_0)
-        both_inf_0 = (m_i_0 == float('-inf')) & (m_new_0 == float('-inf'))
-        alpha_0    = tl.where(both_inf_0, 1.0, tl.exp(m_i_0 - m_new_0))
-        p_0        = tl.where(both_inf_0[:, None], 0.0, tl.exp(scores_0 - m_new_0[:, None]))
-        l_i_0      = alpha_0 * l_i_0 + tl.sum(p_0, axis=1)
-        acc_0      = alpha_0[:, None] * acc_0 + tl.dot(p_0.to(v.dtype), v)
-        m_i_0      = m_new_0
-
-        if HEADS_PER_GROUP > 1:
-            scores_1   = tl.dot(q_1, k_t) * softmax_scale
-            scores_1   = tl.where(base_mask, scores_1, float('-inf'))
-            m_ij_1     = tl.max(scores_1, axis=1)
-            m_new_1    = tl.maximum(m_i_1, m_ij_1)
-            both_inf_1 = (m_i_1 == float('-inf')) & (m_new_1 == float('-inf'))
-            alpha_1    = tl.where(both_inf_1, 1.0, tl.exp(m_i_1 - m_new_1))
-            p_1        = tl.where(both_inf_1[:, None], 0.0, tl.exp(scores_1 - m_new_1[:, None]))
-            l_i_1      = alpha_1 * l_i_1 + tl.sum(p_1, axis=1)
-            acc_1      = alpha_1[:, None] * acc_1 + tl.dot(p_1.to(v.dtype), v)
-            m_i_1      = m_new_1
-
-        if HEADS_PER_GROUP > 2:
-            scores_2   = tl.dot(q_2, k_t) * softmax_scale
-            scores_2   = tl.where(base_mask, scores_2, float('-inf'))
-            m_ij_2     = tl.max(scores_2, axis=1)
-            m_new_2    = tl.maximum(m_i_2, m_ij_2)
-            both_inf_2 = (m_i_2 == float('-inf')) & (m_new_2 == float('-inf'))
-            alpha_2    = tl.where(both_inf_2, 1.0, tl.exp(m_i_2 - m_new_2))
-            p_2        = tl.where(both_inf_2[:, None], 0.0, tl.exp(scores_2 - m_new_2[:, None]))
-            l_i_2      = alpha_2 * l_i_2 + tl.sum(p_2, axis=1)
-            acc_2      = alpha_2[:, None] * acc_2 + tl.dot(p_2.to(v.dtype), v)
-            m_i_2      = m_new_2
-
-        if HEADS_PER_GROUP > 3:
-            scores_3   = tl.dot(q_3, k_t) * softmax_scale
-            scores_3   = tl.where(base_mask, scores_3, float('-inf'))
-            m_ij_3     = tl.max(scores_3, axis=1)
-            m_new_3    = tl.maximum(m_i_3, m_ij_3)
-            both_inf_3 = (m_i_3 == float('-inf')) & (m_new_3 == float('-inf'))
-            alpha_3    = tl.where(both_inf_3, 1.0, tl.exp(m_i_3 - m_new_3))
-            p_3        = tl.where(both_inf_3[:, None], 0.0, tl.exp(scores_3 - m_new_3[:, None]))
-            l_i_3      = alpha_3 * l_i_3 + tl.sum(p_3, axis=1)
-            acc_3      = alpha_3[:, None] * acc_3 + tl.dot(p_3.to(v.dtype), v)
-            m_i_3      = m_new_3
-
-    # Finalize and store
-    out_base = Out_ptr + pid_batch * stride_ob + offs_q[:, None] * stride_oq + offs_d[None, :] * stride_od
-
-    zero_mask_0 = (l_i_0 == 0.0)[:, None]
-    l_i_0       = tl.where(l_i_0 == 0.0, 1.0, l_i_0)
-    acc_0       = tl.where(zero_mask_0, 0.0, acc_0 / l_i_0[:, None])
-    tl.store(out_base + (pid_kv_head * HEADS_PER_GROUP + 0) * stride_oh, acc_0, mask=mask_q[:, None])
-
-    if HEADS_PER_GROUP > 1:
-        zero_mask_1 = (l_i_1 == 0.0)[:, None]
-        l_i_1       = tl.where(l_i_1 == 0.0, 1.0, l_i_1)
-        acc_1       = tl.where(zero_mask_1, 0.0, acc_1 / l_i_1[:, None])
-        tl.store(out_base + (pid_kv_head * HEADS_PER_GROUP + 1) * stride_oh, acc_1, mask=mask_q[:, None])
-
-    if HEADS_PER_GROUP > 2:
-        zero_mask_2 = (l_i_2 == 0.0)[:, None]
-        l_i_2       = tl.where(l_i_2 == 0.0, 1.0, l_i_2)
-        acc_2       = tl.where(zero_mask_2, 0.0, acc_2 / l_i_2[:, None])
-        tl.store(out_base + (pid_kv_head * HEADS_PER_GROUP + 2) * stride_oh, acc_2, mask=mask_q[:, None])
-
-    if HEADS_PER_GROUP > 3:
-        zero_mask_3 = (l_i_3 == 0.0)[:, None]
-        l_i_3       = tl.where(l_i_3 == 0.0, 1.0, l_i_3)
-        acc_3       = tl.where(zero_mask_3, 0.0, acc_3 / l_i_3[:, None])
-        tl.store(out_base + (pid_kv_head * HEADS_PER_GROUP + 3) * stride_oh, acc_3, mask=mask_q[:, None])
-
-
-@triton.jit
-def self_attention_fwd_kernel(
-    Q_ptr, K_ptr, V_ptr, Out_ptr,
-    seq_len, head_dim,
-    stride_qb, stride_qh, stride_qs, stride_qd,
-    stride_kb, stride_kh, stride_ks, stride_kd,
-    stride_vb, stride_vh, stride_vs, stride_vd,
-    stride_ob, stride_oh, stride_os, stride_od,
-    softmax_scale,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    """Self-attention with online softmax for latent refinement"""
-
-    pid_batch = tl.program_id(0)
-    pid_head  = tl.program_id(1)
-    pid_block = tl.program_id(2)
-
-    # Query block
-    q_start = pid_block * BLOCK_M
-    offs_m  = q_start + tl.arange(0, BLOCK_M)
-    offs_d  = tl.arange(0, BLOCK_D)
-    mask_m  = offs_m < seq_len
-
-    # Load Q
-    q_ptrs = (Q_ptr +
-              pid_batch * stride_qb +
-              pid_head * stride_qh +
-              offs_m[:, None] * stride_qs +
-              offs_d[None, :] * stride_qd)
-    q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
-
-    # Initialize accumulators
-    m_i = tl.full((BLOCK_M,), float('-inf'), dtype=tl.float32)
-    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
-
-    # Iterate over K,V blocks
-    num_blocks = tl.cdiv(seq_len, BLOCK_N)
-
-    for block_idx in range(num_blocks):
-        kv_start = block_idx * BLOCK_N
-        offs_n   = kv_start + tl.arange(0, BLOCK_N)
-        mask_n   = offs_n < seq_len
-
-        # Load K, V
-        k_ptrs = (K_ptr +
-                  pid_batch * stride_kb +
-                  pid_head * stride_kh +
-                  offs_n[:, None] * stride_ks +
-                  offs_d[None, :] * stride_kd)
-        k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
-
-        v_ptrs = (V_ptr +
-                  pid_batch * stride_vb +
-                  pid_head * stride_vh +
-                  offs_n[:, None] * stride_vs +
-                  offs_d[None, :] * stride_vd)
-        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
-
-        k_t = tl.trans(k)
-
-        # Compute scores
-        scores = tl.dot(q, k_t) * softmax_scale
-        scores = tl.where(mask_m[:, None] & mask_n[None, :], scores, float('-inf'))
-
-        # Online softmax
-        m_ij     = tl.max(scores, axis=1)
-        m_new    = tl.maximum(m_i, m_ij)
-        both_inf = (m_i == float('-inf')) & (m_new == float('-inf'))
-        alpha    = tl.where(both_inf, 1.0, tl.exp(m_i - m_new))
-        p        = tl.where(both_inf[:, None], 0.0, tl.exp(scores - m_new[:, None]))
-        l_i      = alpha * l_i + tl.sum(p, axis=1)
-        acc      = alpha[:, None] * acc + tl.dot(p.to(v.dtype), v)
-        m_i      = m_new
-
-    # Finalize
-    zero_mask = (l_i == 0.0)[:, None]
-    l_i       = tl.where(l_i == 0.0, 1.0, l_i)
-    acc       = tl.where(zero_mask, 0.0, acc / l_i[:, None])
-
-    # Store
-    out_ptrs = (Out_ptr +
-                pid_batch * stride_ob +
-                pid_head * stride_oh +
-                offs_m[:, None] * stride_os +
-                offs_d[None, :] * stride_od)
-    tl.store(out_ptrs, acc, mask=mask_m[:, None])
-
-
 ########################
 #####  COMPONENTS  #####
 ########################
 
 
 class CrossAttention(nn.Module):
-    """Cross-attention with Triton kernel for memory efficiency"""
-
-    BLOCK_Q  = 16   # Reduced for shared memory limits
-    BLOCK_KV = 32
+    """Cross-attention with GQA via SDPA (Flash Attention)"""
 
     def __init__(self, embed_dim, num_heads, num_kv_heads, dropout=0.0):
 
@@ -344,7 +56,6 @@ class CrossAttention(nn.Module):
         self.heads_per_group = num_heads // num_kv_heads
 
         assert num_heads % num_kv_heads == 0
-        assert self.heads_per_group <= 4, "Triton kernel supports up to 4 heads per group"
 
         self.q_proj = nn.Linear(embed_dim, num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(embed_dim, num_kv_heads * self.head_dim, bias=False)
@@ -352,52 +63,6 @@ class CrossAttention(nn.Module):
         self.o_proj = nn.Linear(num_heads * self.head_dim, embed_dim, bias=False)
 
         self.dropout = nn.Dropout(dropout)
-        self._triton_supported = _check_triton_support()
-
-    def _forward_triton(self, q, k, v, attention_mask):
-        """Triton kernel path"""
-
-        B, L_q, H, D = q.shape
-        L_kv         = k.shape[1]
-
-        q = q.permute(0, 2, 1, 3).contiguous()
-        k = k.permute(0, 2, 1, 3).contiguous()
-        v = v.permute(0, 2, 1, 3).contiguous()
-
-        out = th.empty_like(q)
-
-        use_mask = attention_mask is not None
-        if use_mask:
-            attention_mask = attention_mask.contiguous()
-            stride_mb = attention_mask.stride(0)
-            stride_mk = attention_mask.stride(1) if attention_mask.dim() > 1 else 1
-        else:
-            stride_mb = 0
-            stride_mk = 0
-
-        num_q_blocks = (L_q + self.BLOCK_Q - 1) // self.BLOCK_Q
-        grid = (B, self.num_kv_heads, num_q_blocks)
-
-        cross_attention_fwd_kernel[grid](
-            q, k, v, out,
-            attention_mask if use_mask else q,
-            L_q, L_kv, self.head_dim,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-            stride_mb, stride_mk,
-            use_mask,
-            self.scale,
-            BLOCK_Q         = self.BLOCK_Q,
-            BLOCK_KV        = self.BLOCK_KV,
-            BLOCK_D         = self.head_dim,
-            HEADS_PER_GROUP = self.heads_per_group,
-        )
-
-        out = out.permute(0, 2, 1, 3).reshape(B, L_q, self.num_heads * self.head_dim)
-
-        return out
 
     def _expand_kv_for_gqa(self, k, v):
         """Expand KV heads for GQA using view/expand (no memory allocation)"""
@@ -460,28 +125,14 @@ class CrossAttention(nn.Module):
         k = self.k_proj(key_value).view(B, L_kv, self.num_kv_heads, self.head_dim)
         v = self.v_proj(key_value).view(B, L_kv, self.num_kv_heads, self.head_dim)
 
-        # Triton for inference, PyTorch for training (Triton lacks custom backward)
-        use_triton = (
-            self._triton_supported and
-            query.is_cuda and
-            not th.is_grad_enabled()
-        )
-
-        if use_triton:
-            out = self._forward_triton(q, k, v, attention_mask)
-        else:
-            out = self._forward_pytorch(q, k, v, attention_mask)
-
+        out = self._forward_pytorch(q, k, v, attention_mask)
         out = self.o_proj(out)
 
         return out
 
 
 class SelfAttention(nn.Module):
-    """Self-attention with Triton kernel for latent refinement"""
-
-    BLOCK_M = 16   # Reduced for shared memory limits
-    BLOCK_N = 16
+    """Self-attention via SDPA (Flash Attention)"""
 
     def __init__(self, embed_dim, num_heads, dropout=0.0):
 
@@ -498,38 +149,6 @@ class SelfAttention(nn.Module):
         self.o_proj = nn.Linear(embed_dim, embed_dim, bias=False)
 
         self.dropout = nn.Dropout(dropout)
-        self._triton_supported = _check_triton_support()
-
-    def _forward_triton(self, q, k, v):
-        """Triton kernel path"""
-
-        B, L, H, D = q.shape
-
-        q = q.permute(0, 2, 1, 3).contiguous()
-        k = k.permute(0, 2, 1, 3).contiguous()
-        v = v.permute(0, 2, 1, 3).contiguous()
-
-        out = th.empty_like(q)
-
-        num_blocks = (L + self.BLOCK_M - 1) // self.BLOCK_M
-        grid = (B, self.num_heads, num_blocks)
-
-        self_attention_fwd_kernel[grid](
-            q, k, v, out,
-            L, self.head_dim,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-            self.scale,
-            BLOCK_M = self.BLOCK_M,
-            BLOCK_N = self.BLOCK_N,
-            BLOCK_D = self.head_dim,
-        )
-
-        out = out.permute(0, 2, 1, 3).reshape(B, L, self.embed_dim)
-
-        return out
 
     def _forward_pytorch(self, q, k, v):
         """PyTorch fallback with Flash Attention via SDPA"""
@@ -561,17 +180,7 @@ class SelfAttention(nn.Module):
         k = self.k_proj(x).view(B, L, self.num_heads, self.head_dim)
         v = self.v_proj(x).view(B, L, self.num_heads, self.head_dim)
 
-        use_triton = (
-            self._triton_supported and
-            x.is_cuda and
-            not th.is_grad_enabled()
-        )
-
-        if use_triton:
-            out = self._forward_triton(q, k, v)
-        else:
-            out = self._forward_pytorch(q, k, v)
-
+        out = self._forward_pytorch(q, k, v)
         out = self.o_proj(out)
 
         return out
@@ -630,8 +239,7 @@ class PerceiverCompressor(nn.Module):
     Compresses encoder output [B, N, D] to latent representation [B, L, D]
     where L << N. Decoder cross-attention then operates on L tokens instead of N.
 
-    Uses Triton kernels for memory-efficient inference (no materialized attention matrix).
-    Falls back to PyTorch with SDPA (Flash Attention) during training.
+    Uses SDPA (Flash Attention) for memory-efficient attention.
     Supports gradient checkpointing to reduce peak memory during backward pass.
     """
 
@@ -741,16 +349,13 @@ class PerceiverCompressor(nn.Module):
     def get_memory_info(self, encoder_len):
         """Return memory usage comparison"""
 
-        dense_cross  = self.num_latents * encoder_len * self.num_heads
-        triton_cross = 0  # No materialization
-        self_attn    = self.num_latents * self.num_latents * self.num_heads
+        dense_cross = self.num_latents * encoder_len * self.num_heads
+        self_attn   = self.num_latents * self.num_latents * self.num_heads
 
         return {
-            "dense_cross_scores":  dense_cross,
-            "triton_cross_scores": triton_cross,
-            "self_attn_scores":    self_attn,
-            "total_dense":         dense_cross + self_attn,
-            "total_triton":        triton_cross + self_attn,
+            "cross_attn_scores": dense_cross,
+            "self_attn_scores":  self_attn,
+            "total_scores":      dense_cross + self_attn,
         }
 
 

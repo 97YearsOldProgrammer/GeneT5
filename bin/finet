@@ -96,6 +96,8 @@ def main():
         help='min batch size when using token budget [%(default)s]')
     parser.add_argument('--mxfp8', action='store_true',
         help='apply MXFP8 quantization to dense Linear layers (Blackwell only)')
+    parser.add_argument('--compile', action='store_true',
+        help='enable torch.compile on encoder, compressor, decoder')
 
     args = parser.parse_args()
 
@@ -120,6 +122,7 @@ def main():
     random.seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
+        torch.set_float32_matmul_precision('high')
     
     output_dir = pathlib.Path(args.output_dir)
     if is_main:
@@ -138,9 +141,27 @@ def main():
     if is_main:
         print(f"\nLoading model...")
     model = mdl.GeneT5.from_pretrained(pathlib.Path(args.model_path), device='cpu', dtype=torch.bfloat16)
+
+    # Regional torch.compile (before DDP so DDPOptimizer sees compiled submodules)
+    if args.compile:
+        if is_main:
+            print("\nCompiling model regions...")
+        compile_opts = {"mode": "default", "dynamic": True}
+        model.encoder    = torch.compile(model.encoder,    **compile_opts)
+        model.compressor = torch.compile(model.compressor, **compile_opts)
+        model.decoder    = torch.compile(model.decoder,    **compile_opts)
+        if is_main:
+            print("  Compiled: encoder, compressor, decoder")
+            print("  First ~3 batches will be slow (compilation warmup)")
+
     model = train_util.wrap_model_distributed(model, device,
-        find_unused_params=False, static_graph=True)
-    
+        find_unused_params=False, static_graph=False)
+
+    # Halve allreduce volume by compressing gradients to BF16
+    if is_dist:
+        from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
+        model.register_comm_hook(state=None, hook=default_hooks.bf16_compress_hook)
+
     raw_model = train_util.unwrap_model(model)
     stats     = raw_model.get_param_stats()
     if is_main:
@@ -429,12 +450,15 @@ def main():
         else:
             print(f"  Step checkpoints: disabled (use --save_steps N to enable)")
 
+    if args.compile and is_main:
+        print("  torch.compile warmup: first 3-5 batches will be 10-60x slower")
+
     patience_counter = 0
     global_step = 0  # Track optimizer steps across epochs
 
-    # Start memory watcher if enabled
+    # Start memory watcher if enabled (rank 0 only, output dir may be read-only on workers)
     mem_watcher = None
-    if args.memwatch:
+    if args.memwatch and is_main:
         mem_watcher = util.create_memory_watcher(output_dir, prefix="memory")
         mem_watcher.start()
 
@@ -515,12 +539,6 @@ def main():
 
                 loss.backward()
 
-            # Break computation graph links and release tensors
-            # detach_() breaks graph in-place, more effective than just del
-            # Reference: https://gist.github.com/thomwolf/ac7a7da6b1888c2eeac8ac8b9b05d3d3
-            for v in outputs.values():
-                if torch.is_tensor(v) and v.grad_fn is not None:
-                    v.detach_()
             del outputs, loss, batch, decoder_input_ids, labels, decoder_attention_mask
 
             if (step + 1) % args.grad_accum == 0:
