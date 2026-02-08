@@ -16,7 +16,7 @@ from lib.blocks._perceiver import PerceiverCompressor, PerceiverConfig
 
 
 ENCODER_DEFAULTS = {
-    "window_size": 512,
+    "window_size": -1,
 }
 
 DECODER_DEFAULTS = {

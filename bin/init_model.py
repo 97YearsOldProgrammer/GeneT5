@@ -18,8 +18,8 @@ parser.add_argument("--new_tokens", type=str, nargs="*", default=None,
 parser.add_argument("--new_tokens_file", type=str, default=None,
     help="Path to file containing new tokens (one per line).")
 
-parser.add_argument("--encoder_window_size", type=int, default=512,
-    help="Sliding window size for encoder attention.")
+parser.add_argument("--encoder_window_size", type=int, default=-1,
+    help="Sliding window size for encoder attention. -1 for full attention.")
 parser.add_argument("--decoder_block_size", type=int, default=16,
     help="Block size for decoder cross-attention.")
 parser.add_argument("--decoder_window_size", type=int, default=32,

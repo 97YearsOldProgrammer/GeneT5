@@ -4,8 +4,9 @@
 # Uses PyTorch distributed with NCCL backend over ConnectX-7 200Gb/s network
 #
 # Usage:
-#   Single node:  ./launch_distributed.sh --single
-#   Multi-node:   ./launch_distributed.sh --master <master_ip>
+#   Single node:  bin/distributed.sh <train.bin> <val.bin> <output> <model>
+#   Two Sparks:   bin/distributed.sh <train.bin> <val.bin> <output> <model> --nnodes 2 --node-rank 0 --master 192.168.100.10
+#   (run same command on worker with --node-rank 1)
 #
 
 set -e
@@ -17,23 +18,25 @@ NNODES="${NNODES:-1}"
 NODE_RANK="${NODE_RANK:-0}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 
-# Training defaults
-TRAIN_DATA="${TRAIN_DATA:-data/gene_prediction.jsonl}"
-OUTPUT_DIR="${OUTPUT_DIR:-checkpoints/genet5_finetuned}"
-MODEL_PATH="${MODEL_PATH:-checkpoints/genet5_init}"
-BATCH_SIZE="${BATCH_SIZE:-4}"
-GRAD_ACCUM="${GRAD_ACCUM:-16}"
-EPOCHS="${EPOCHS:-3}"
-LR="${LR:-1e-4}"
+# Detect ConnectX-7 interface (DGX Spark)
+CX7_IF=""
+for iface in enp1s0f1np1 enP2p1s0f0np0 enp1s0f1np1 enp1s0f0np0; do
+    if [ -d "/sys/class/net/$iface" ]; then
+        CX7_IF="$iface"
+        break
+    fi
+done
+
+# Positional args
+TRAIN_DATA=""
+VAL_DATA=""
+OUTPUT_DIR=""
+MODEL_PATH=""
+EXTRA_ARGS=()
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --single)
-            NNODES=1
-            NODE_RANK=0
-            shift
-            ;;
         --master)
             MASTER_ADDR="$2"
             shift 2
@@ -54,78 +57,80 @@ while [[ $# -gt 0 ]]; do
             NPROC_PER_NODE="$2"
             shift 2
             ;;
-        --train-data)
-            TRAIN_DATA="$2"
-            shift 2
-            ;;
-        --output-dir)
-            OUTPUT_DIR="$2"
-            shift 2
-            ;;
-        --model-path)
-            MODEL_PATH="$2"
-            shift 2
-            ;;
-        --batch-size)
-            BATCH_SIZE="$2"
-            shift 2
-            ;;
-        --epochs)
-            EPOCHS="$2"
-            shift 2
-            ;;
-        --lr)
-            LR="$2"
-            shift 2
+        --*)
+            EXTRA_ARGS+=("$1")
+            if [[ $# -gt 1 && ! "$2" =~ ^-- ]]; then
+                EXTRA_ARGS+=("$2")
+                shift
+            fi
+            shift
             ;;
         *)
-            echo "Unknown option: $1"
-            exit 1
+            if [ -z "$TRAIN_DATA" ]; then
+                TRAIN_DATA="$1"
+            elif [ -z "$VAL_DATA" ]; then
+                VAL_DATA="$1"
+            elif [ -z "$OUTPUT_DIR" ]; then
+                OUTPUT_DIR="$1"
+            elif [ -z "$MODEL_PATH" ]; then
+                MODEL_PATH="$1"
+            fi
+            shift
             ;;
     esac
 done
 
-# Print configuration
+if [ -z "$TRAIN_DATA" ] || [ -z "$VAL_DATA" ] || [ -z "$OUTPUT_DIR" ] || [ -z "$MODEL_PATH" ]; then
+    echo "Usage: $0 <train.bin> <val.bin> <output_dir> <model_path> [options]"
+    echo ""
+    echo "Multi-node options:"
+    echo "  --nnodes N        Number of nodes (default: 1)"
+    echo "  --node-rank N     This node's rank (0=master, 1=worker)"
+    echo "  --master IP       Master node IP (default: localhost)"
+    echo "  --port PORT       Master port (default: 29500)"
+    echo ""
+    echo "All other flags are passed to bin/finet (--epochs, --lr, --batch_size, etc.)"
+    exit 1
+fi
+
 echo "========================================"
-echo "DGX Spark Distributed Training Launch"
+echo "  DGX Spark Distributed Fine-Tuning"
 echo "========================================"
 echo "Master:          $MASTER_ADDR:$MASTER_PORT"
 echo "Nodes:           $NNODES (this is node $NODE_RANK)"
 echo "Procs per node:  $NPROC_PER_NODE"
+echo "Network iface:   ${CX7_IF:-auto}"
 echo "Train data:      $TRAIN_DATA"
+echo "Val data:        $VAL_DATA"
 echo "Output dir:      $OUTPUT_DIR"
 echo "Model path:      $MODEL_PATH"
-echo "Batch size:      $BATCH_SIZE"
-echo "Grad accum:      $GRAD_ACCUM"
-echo "Epochs:          $EPOCHS"
-echo "Learning rate:   $LR"
+echo "Extra args:      ${EXTRA_ARGS[*]}"
 echo "========================================"
 
-# Set NCCL environment variables for DGX Spark ConnectX-7 network
+# NCCL environment for DGX Spark ConnectX-7 200Gb/s RoCE
 export NCCL_DEBUG=INFO
 export NCCL_IB_DISABLE=0
 export NCCL_NET_GDR_LEVEL=5
-export NCCL_SOCKET_IFNAME=eth0
 
-# Enable TCP for initial rendezvous
-export GLOO_SOCKET_IFNAME=eth0
+# Point NCCL and Gloo at the ConnectX-7 interface (not Docker bridge)
+if [ -n "$CX7_IF" ]; then
+    export NCCL_SOCKET_IFNAME="$CX7_IF"
+    export GLOO_SOCKET_IFNAME="$CX7_IF"
+    echo "Using ConnectX-7 interface: $CX7_IF"
+else
+    echo "WARNING: No ConnectX-7 interface found, using default"
+    echo "         Make sure container runs with --network=host"
+fi
 
-# Launch with torchrun
 torchrun \
     --nnodes=$NNODES \
     --nproc_per_node=$NPROC_PER_NODE \
     --node_rank=$NODE_RANK \
     --master_addr=$MASTER_ADDR \
     --master_port=$MASTER_PORT \
-    bin/finet.py \
+    bin/finet \
     "$TRAIN_DATA" \
+    "$VAL_DATA" \
     "$OUTPUT_DIR" \
     "$MODEL_PATH" \
-    --distributed \
-    --backend nccl \
-    --batch_size $BATCH_SIZE \
-    --grad_accum $GRAD_ACCUM \
-    --epochs $EPOCHS \
-    --lr $LR \
-    --find_unused_params \
-    "$@"
+    "${EXTRA_ARGS[@]}"

@@ -105,9 +105,12 @@ class SparseAttention(nn.Module):
             v = v.unsqueeze(3).expand(B, L, self.num_kv_heads, self.heads_per_group, self.head_dim)
             v = v.reshape(B, L, self.num_heads, self.head_dim).contiguous()
 
-        # Window size: (left, right) - half window on each side
-        half_window = self.window_size // 2
-        window_size = (half_window, half_window)
+        # Window size: (left, right) - full attention when <= 0
+        if self.window_size <= 0:
+            window_size = (-1, -1)
+        else:
+            half_window = self.window_size // 2
+            window_size = (half_window, half_window)
 
         # ALiBi slopes must be fp32
         alibi = self.alibi_slopes.float() if self.alibi_slopes is not None else None
