@@ -42,3 +42,8 @@ from lib.util._memwatch import (
     MemoryWatcher,
     create_memory_watcher,
 )
+
+from lib.util._logger import (
+    TrainLogger,
+    create_train_logger,
+)

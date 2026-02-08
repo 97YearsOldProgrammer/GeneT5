@@ -108,23 +108,25 @@ def broadcast_object(obj, src=0):
 ############################
 
 
-def wrap_model_distributed(model, device, find_unused_params=False, gradient_as_bucket_view=True):
+def wrap_model_distributed(model, device, find_unused_params=False,
+                           gradient_as_bucket_view=True, static_graph=False):
     """Wrap model with DistributedDataParallel for multi-GPU training"""
-    
+
     if not dist.is_initialized():
         return model.to(device)
-    
+
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    
+
     model = model.to(device)
     model = nn.parallel.DistributedDataParallel(
         model,
-        device_ids             = [local_rank],
-        output_device          = local_rank,
-        find_unused_parameters = find_unused_params,
+        device_ids              = [local_rank],
+        output_device           = local_rank,
+        find_unused_parameters  = find_unused_params,
         gradient_as_bucket_view = gradient_as_bucket_view,
+        static_graph            = static_graph,
     )
-    
+
     return model
 
 

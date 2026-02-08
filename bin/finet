@@ -3,6 +3,7 @@
 import argparse
 import json
 import random
+import time
 import pathlib
 import os
 
@@ -12,6 +13,7 @@ import torch.distributed as dist
 import torch.utils.data as data_utils
 import transformers as tf
 
+from contextlib import nullcontext
 from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
 
 import lib.dataset      as ds
@@ -136,7 +138,8 @@ def main():
     if is_main:
         print(f"\nLoading model...")
     model = mdl.GeneT5.from_pretrained(pathlib.Path(args.model_path), device='cpu', dtype=torch.bfloat16)
-    model = train_util.wrap_model_distributed(model, device, find_unused_params=True)
+    model = train_util.wrap_model_distributed(model, device,
+        find_unused_params=False, static_graph=True)
     
     raw_model = train_util.unwrap_model(model)
     stats     = raw_model.get_param_stats()
@@ -217,7 +220,15 @@ def main():
 
     # Token budget batching (recommended)
     if args.token_budget:
-        print(f"  Using token budget batching (budget={args.token_budget:,} tokens)...")
+        # Shard indices across ranks for distributed training
+        shard_indices = None
+        if is_dist:
+            all_sorted    = sorted(range(len(label_lengths)),
+                                   key=lambda i: label_lengths[i], reverse=True)
+            shard_indices = all_sorted[dist_info['rank']::dist_info['world_size']]
+
+        if is_main:
+            print(f"  Using token budget batching (budget={args.token_budget:,} tokens)...")
         train_sampler = ds.TokenBudgetSampler(
             label_lengths,
             max_tokens     = args.token_budget,
@@ -226,16 +237,26 @@ def main():
             shuffle        = True,
             drop_last      = False,
             seed           = args.seed,
+            indices        = shard_indices,
         )
+
+        # Sync batch counts so no rank hangs waiting
+        if is_dist:
+            local_count = torch.tensor([len(train_sampler)], device=device)
+            dist.all_reduce(local_count, op=dist.ReduceOp.MIN)
+            train_sampler.set_max_batches(int(local_count.item()))
+
         train_shuffle = False
-        stats = train_sampler.get_batch_stats()
-        print(f"  Batch sizes: {stats['min_batch_size']} - {stats['max_batch_size']} (avg {stats['avg_batch_size']:.1f})")
-        print(f"  Tokens/batch: {stats['min_tokens']:,} - {stats['max_tokens']:,} (avg {stats['avg_tokens']:,.0f})")
-        print(f"  Total batches: {stats['num_batches']:,}")
+        if is_main:
+            stats = train_sampler.get_batch_stats()
+            print(f"  Batch sizes: {stats['min_batch_size']} - {stats['max_batch_size']} (avg {stats['avg_batch_size']:.1f})")
+            print(f"  Tokens/batch: {stats['min_tokens']:,} - {stats['max_tokens']:,} (avg {stats['avg_tokens']:,.0f})")
+            print(f"  Total batches: {stats['num_batches']:,}")
 
     # Sort by label length (legacy, for memory profiling)
     elif args.sort_by_length:
-        print(f"  Sorting batches by label length (largest first)...")
+        if is_main:
+            print(f"  Sorting batches by label length (largest first)...")
         sorted_indices = sorted(range(len(train_dataset)),
                                 key=lambda i: label_lengths[i],
                                 reverse=True)
@@ -245,7 +266,8 @@ def main():
             drop_last=True
         )
         train_shuffle = False
-        print(f"  First batch will have ~{max_lbl:,} token labels (peak memory)")
+        if is_main:
+            print(f"  First batch will have ~{max_lbl:,} token labels (peak memory)")
 
     persistent = args.num_workers > 0
 
@@ -416,6 +438,12 @@ def main():
         mem_watcher = util.create_memory_watcher(output_dir, prefix="memory")
         mem_watcher.start()
 
+    # Training metrics logger (CSV + stdout, rank 0 only)
+    train_logger = None
+    if is_main:
+        train_logger = util.create_train_logger(output_dir)
+        print(f"  Training log: {train_logger.log_path}")
+
     for epoch in range(start_epoch, args.epochs):
         if is_main:
             print(f"\nEpoch {epoch + 1}/{args.epochs}")
@@ -426,6 +454,8 @@ def main():
             dist_sampler.set_epoch(epoch)
         if val_dist_sampler:
             val_dist_sampler.set_epoch(epoch)
+        if train_sampler and hasattr(train_sampler, 'set_epoch'):
+            train_sampler.set_epoch(epoch)
 
         train_dataset.set_epoch(epoch)
 
@@ -439,7 +469,7 @@ def main():
         num_batches = len(train_loader)
         log_interval = max(1, num_batches * args.log_every_pct // 100)
         last_logged_pct = -1
-        epoch_start_time = __import__('time').time()
+        epoch_start_time = time.time()
 
         for step, batch in enumerate(train_loader):
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
@@ -454,31 +484,36 @@ def main():
             # Replace -100 with pad_token_id (can't pass -100 to embedding layer)
             decoder_input_ids[decoder_input_ids == -100] = tokenizer.pad_token_id
 
-            with torch.amp.autocast('cuda', dtype=dtype):
-                outputs = model(
-                    encoder_input_ids      = batch['input_ids'],
-                    decoder_input_ids      = decoder_input_ids,
-                    labels                 = labels if loss_fct is None else None,
-                    encoder_attention_mask = batch.get('attention_mask'),
-                    decoder_attention_mask = decoder_attention_mask,
-                )
+            # Only sync gradients on accumulation boundary
+            is_sync_step = (step + 1) % args.grad_accum == 0
+            sync_context = nullcontext() if (not is_dist or is_sync_step) else model.no_sync()
 
-                # Use label smoothing loss if enabled
-                if loss_fct is not None:
-                    logits = outputs['logits']
-                    loss = loss_fct(logits.reshape(-1, raw_model.vocab_size), labels.reshape(-1))
-                    if outputs.get('moe_loss') is not None:
-                        loss = loss + outputs['moe_loss']
-                    del logits
-                else:
-                    loss = outputs['loss']
+            with sync_context:
+                with torch.amp.autocast('cuda', dtype=dtype):
+                    outputs = model(
+                        encoder_input_ids      = batch['input_ids'],
+                        decoder_input_ids      = decoder_input_ids,
+                        labels                 = labels if loss_fct is None else None,
+                        encoder_attention_mask = batch.get('attention_mask'),
+                        decoder_attention_mask = decoder_attention_mask,
+                    )
 
-                loss = loss / args.grad_accum
+                    # Use label smoothing loss if enabled
+                    if loss_fct is not None:
+                        logits = outputs['logits']
+                        loss = loss_fct(logits.reshape(-1, raw_model.vocab_size), labels.reshape(-1))
+                        if outputs.get('moe_loss') is not None:
+                            loss = loss + outputs['moe_loss']
+                        del logits
+                    else:
+                        loss = outputs['loss']
 
-            # Save loss value before backward (for logging)
-            loss_val = loss.item() * args.grad_accum
+                    loss = loss / args.grad_accum
 
-            loss.backward()
+                # Save loss value before backward (for logging)
+                loss_val = loss.item() * args.grad_accum
+
+                loss.backward()
 
             # Break computation graph links and release tensors
             # detach_() breaks graph in-place, more effective than just del
@@ -518,27 +553,21 @@ def main():
 
             # Progress logging every N% (rank 0 only)
             current_pct = (step + 1) * 100 // num_batches
-            if is_main and current_pct >= last_logged_pct + args.log_every_pct:
+            if train_logger and current_pct >= last_logged_pct + args.log_every_pct:
                 last_logged_pct = (current_pct // args.log_every_pct) * args.log_every_pct
-                elapsed = __import__('time').time() - epoch_start_time
-                samples_done = step + 1
-                samples_per_sec = samples_done / elapsed if elapsed > 0 else 0
-                eta_epoch = (num_batches - samples_done) / samples_per_sec if samples_per_sec > 0 else 0
-                avg_loss_so_far = total_train_loss / (step + 1)
+                elapsed         = time.time() - epoch_start_time
+                batch_per_sec   = (step + 1) / elapsed if elapsed > 0 else 0
+                avg_loss        = total_train_loss / (step + 1)
 
-                import psutil
-                mem     = psutil.virtual_memory()
-                mem_str = f" | RAM: {mem.used/1e9:.1f}/{mem.total/1e9:.0f}GB"
-                if torch.cuda.is_available():
-                    gpu_mem = torch.cuda.memory_allocated() / 1e9
-                    gpu_max = torch.cuda.max_memory_allocated() / 1e9
-                    mem_str += f" | GPU: {gpu_mem:.1f}/{gpu_max:.1f}GB"
-
-                print(f"  [{last_logged_pct:3d}%] batch {step+1}/{num_batches} | "
-                      f"loss: {avg_loss_so_far:.4f} | "
-                      f"lr: {scheduler.get_last_lr()[0]:.2e} | "
-                      f"speed: {samples_per_sec:.1f} batch/s | "
-                      f"ETA epoch: {eta_epoch/3600:.1f}h{mem_str}")
+                train_logger.log_step(
+                    epoch         = epoch + 1,
+                    global_step   = global_step,
+                    batch         = step + 1,
+                    num_batches   = num_batches,
+                    loss          = avg_loss,
+                    lr            = scheduler.get_last_lr()[0],
+                    batch_per_sec = batch_per_sec,
+                )
 
         train_loss = total_train_loss / max(len(train_loader), 1)
 
@@ -585,9 +614,9 @@ def main():
             train_util.all_reduce_mean(val_tensor)
             val_loss = val_tensor.item()
 
-        if is_main:
-            print(f"  Train: {train_loss:.4f} | Val: {val_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
-        
+        if train_logger:
+            train_logger.log_epoch(epoch + 1, train_loss, val_loss, scheduler.get_last_lr()[0])
+
         # checkpointing (rank 0 saves, all ranks wait)
         save_model = train_util.unwrap_model(model)
 
@@ -637,9 +666,11 @@ def main():
 
         train_util.barrier()
     
-    # Stop memory watcher
+    # Stop memory watcher and close logger
     if mem_watcher:
         mem_watcher.stop()
+    if train_logger:
+        train_logger.close()
 
     # save final (rank 0 only)
     if is_main:

@@ -447,7 +447,7 @@ class TokenBudgetSampler:
     """
 
     def __init__(self, label_lengths, max_tokens=128000, max_batch_size=32, min_batch_size=1,
-                 shuffle=True, drop_last=False, seed=42):
+                 shuffle=True, drop_last=False, seed=42, indices=None):
 
         self.label_lengths  = label_lengths
         self.max_tokens     = max_tokens
@@ -459,9 +459,14 @@ class TokenBudgetSampler:
         self.epoch          = 0
 
         # Sort indices by label length (descending for largest-first)
-        self.sorted_indices = sorted(range(len(label_lengths)),
-                                     key=lambda i: label_lengths[i],
-                                     reverse=True)
+        if indices is not None:
+            self.sorted_indices = sorted(indices,
+                                         key=lambda i: label_lengths[i],
+                                         reverse=True)
+        else:
+            self.sorted_indices = sorted(range(len(label_lengths)),
+                                         key=lambda i: label_lengths[i],
+                                         reverse=True)
 
         # Pre-compute batches
         self._batches = self._build_batches()
@@ -504,6 +509,11 @@ class TokenBudgetSampler:
 
         self.epoch = epoch
 
+    def set_max_batches(self, n):
+        """Limit iteration to n batches for distributed sync"""
+
+        self._max_batches = n
+
     def __iter__(self):
 
         batches = self._batches.copy()
@@ -512,11 +522,18 @@ class TokenBudgetSampler:
             rng = random.Random(self.seed + self.epoch)
             rng.shuffle(batches)
 
+        limit = getattr(self, '_max_batches', None)
+        if limit is not None:
+            batches = batches[:limit]
+
         for batch in batches:
             yield batch
 
     def __len__(self):
 
+        limit = getattr(self, '_max_batches', None)
+        if limit is not None:
+            return min(len(self._batches), limit)
         return len(self._batches)
 
     def get_batch_stats(self):
