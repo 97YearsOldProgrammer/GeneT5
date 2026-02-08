@@ -138,6 +138,9 @@ else
     echo "         Make sure container runs with --network=host"
 fi
 
+# Ensure GeneT5 lib is importable
+export PYTHONPATH="${PYTHONPATH:-/workspace/GeneT5}"
+
 torchrun \
     --nnodes=$NNODES \
     --nproc_per_node=$NPROC_PER_NODE \

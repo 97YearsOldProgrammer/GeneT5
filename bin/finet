@@ -146,7 +146,7 @@ def main():
     if args.compile:
         if is_main:
             print("\nCompiling model regions...")
-        compile_opts = {"mode": "default", "dynamic": True}
+        compile_opts = {"mode": "default", "dynamic": None}
         model.encoder    = torch.compile(model.encoder,    **compile_opts)
         model.compressor = torch.compile(model.compressor, **compile_opts)
         model.decoder    = torch.compile(model.decoder,    **compile_opts)
