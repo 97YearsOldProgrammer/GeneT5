@@ -13,7 +13,7 @@ parser.add_argument('gff', type=str, metavar='<gff>',
     help='path to GFF3 annotation file')
 parser.add_argument('output_dir', type=str, metavar='<output>',
     help='output directory')
-parser.add_argument('--limit', required=False, type=int, default=25000,
+parser.add_argument('--limit', required=False, type=int, default=200000,
     metavar='<int>', help='chunk size limit in bp [%(default)i]')
 parser.add_argument('--overlap_ratio', required=False, type=float, default=1/2.718281828,
     metavar='<float>', help='window overlap ratio (1/e) [%(default).4f]')
@@ -37,6 +37,8 @@ parser.add_argument('--tokenizer', required=False, type=str, default=None,
     metavar='<path>', help='tokenizer path for storing token lengths')
 parser.add_argument('--compress', required=False, type=str, default=None,
     choices=['zlib', 'zstd'], help='compress output with zlib or zstd')
+parser.add_argument('--canonical_only', action='store_true',
+    help='keep only canonical (longest) transcript per gene')
 
 args = parser.parse_args()
 
@@ -50,9 +52,15 @@ sequences  = ds.parse_fasta(args.fasta)
 features   = ds.parse_gff(args.gff)
 gene_index = ds.build_gene_index(features)
 
+if args.canonical_only:
+    from lib.dataset._parser import filter_canonical_transcripts
+    gene_index = filter_canonical_transcripts(gene_index)
+
 print(f"\n  Sequences: {len(sequences)}")
 print(f"  Features:  {len(features)}")
 print(f"  Genes:     {len(gene_index)}")
+if args.canonical_only:
+    print(f"  Mode:      canonical only (one transcript per gene)")
 
 # Extract tokens if requested
 if args.extract_tokens:
@@ -258,5 +266,5 @@ print('Done!')
 print()
 print('Next steps:')
 print('  1. Update tokenizer with extracted tokens (if --extract_tokens used)')
-print('  2. Optionally compact with: bin/compact.py -o output.bin --compact_target N *.bin')
+print('  2. Train with: bin/finet --train training.bin --val validation.bin')
 print(f"{'='*60}")

@@ -220,17 +220,9 @@ class BinaryChunk:
         return gene_indices, transcript_indices
 
     def _format_gene_idx(self, gene_id, transcript_id, gene_indices, transcript_indices):
-        """Format gene index with optional transcript index for alt splicing"""
+        """Format gene index (one transcript per gene, no sub-indices)"""
 
         gene_idx = gene_indices.get(gene_id, 1)
-
-        # Check if gene has multiple transcripts
-        if gene_id and transcript_id:
-            trans_map = transcript_indices.get(gene_id, {})
-            if len(trans_map) > 1:
-                t_idx = trans_map.get(transcript_id, 1)
-                return f"{gene_idx}.{t_idx}"
-
         return str(gene_idx)
 
     def get_input_text(self):

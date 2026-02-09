@@ -15,18 +15,18 @@ import lib.util as util
 
 
 parser = argparse.ArgumentParser(
-    description="Bake all species data: parse, tokenize, compact")
+    description="Bake all species data: parse and tokenize")
 parser.add_argument("--raw_dir",    type=str, default="../raw",
     help="Directory containing species subdirectories [%(default)s]")
 parser.add_argument("--output_dir", type=str, default="../baked",
-    help="Output directory for final .packed files [%(default)s]")
+    help="Output directory for baked .bin files [%(default)s]")
 parser.add_argument("--log_dir",    type=str, default="../logs/baker",
     help="Directory for log files [%(default)s]")
 parser.add_argument("--taxa",       type=str, nargs='+', default=None,
     help="Process only specific taxa (default: all)")
 parser.add_argument("--species",    type=str, nargs='+', default=None,
     help="Process only specific species (default: all)")
-parser.add_argument("--window_size", type=int, default=10000,
+parser.add_argument("--window_size", type=int, default=200000,
     help="Window size in base pairs [%(default)s]")
 parser.add_argument("--species_parallel", type=int, default=3,
     help="Number of species to process in parallel [%(default)s]")
@@ -34,26 +34,16 @@ parser.add_argument("--n_workers",  type=int, default=None,
     help="Workers per species for chunking [auto]")
 parser.add_argument("--tokenizer",  type=str, required=True,
     help="Tokenizer path (required)")
-parser.add_argument("--target",     type=int, default=4000,
-    help="Target tokens per packed sequence [%(default)s]")
-parser.add_argument("--hard_limit", type=int, default=4400,
-    help="Hard limit for packing (default: target * 1.1)")
-parser.add_argument("--max_target_len", type=int, default=8000,
-    help="Max cumulative target tokens per packed sample")
-parser.add_argument("--file_parallel", type=int, default=18,
-    help="Files to process in parallel during compacting [%(default)s]")
-parser.add_argument("--compact_workers", type=int, default=18,
-    help="Parallel workers for compacting phase [%(default)s]")
 parser.add_argument("--num_complex", type=int, default=10,
     help="Number of complex genes for validation per species [%(default)s]")
 parser.add_argument("--num_normal",  type=int, default=10,
     help="Number of normal genes for validation per species [%(default)s]")
 parser.add_argument("--num_easy",    type=int, default=10,
     help="Number of easy genes for validation per species [%(default)s]")
-parser.add_argument("--keep_temp",  action="store_true",
-    help="Keep temporary per-species files (for debugging)")
 parser.add_argument("--compress", type=str, default=None,
     choices=['zlib', 'zstd'], help="Compress binary files with zlib or zstd")
+parser.add_argument("--canonical_only", action="store_true",
+    help="Keep only canonical (longest) transcript per gene")
 
 args = parser.parse_args()
 
@@ -71,8 +61,6 @@ log_dir    = pathlib.Path(args.log_dir)
 output_dir.mkdir(parents=True, exist_ok=True)
 log_dir.mkdir(parents=True, exist_ok=True)
 
-temp_dir = pathlib.Path(tempfile.mkdtemp(prefix="bake_"))
-
 
 ####################
 #####  Header  #####
@@ -87,14 +75,11 @@ print(f"  Output directory: {output_dir}")
 print(f"  Tokenizer:        {args.tokenizer}")
 print(f"")
 print(f"  Window size:      {args.window_size:,} bp")
-print(f"  Target tokens:    {args.target:,}")
-if args.max_target_len:
-    print(f"  Max target len:   {args.max_target_len:,}")
+print(f"  Canonical only:   {args.canonical_only}")
 print(f"")
 print(f"  Species:          {len(species_to_process)}")
 print(f"  Species parallel: {args.species_parallel}")
 print(f"  Workers/species:  {n_workers_per_species}")
-print(f"  Compact workers:  {args.compact_workers}")
 
 print(f"\n{' Taxa Summary ':=^60}")
 
@@ -112,8 +97,9 @@ for taxa, count in taxa_counts.items():
 
 
 work_items = [
-    (sp, raw_dir, temp_dir, log_dir, limit, None, args.tokenizer,
-     n_workers_per_species, args.num_complex, args.num_normal, args.num_easy, args.compress)
+    (sp, raw_dir, output_dir, log_dir, limit, None, args.tokenizer,
+     n_workers_per_species, args.num_complex, args.num_normal, args.num_easy,
+     args.compress, args.canonical_only)
     for sp, limit, taxa in species_to_process
 ]
 
@@ -134,158 +120,39 @@ with concurrent.futures.ProcessPoolExecutor(max_workers=args.species_parallel) a
 
             if result["success"]:
                 success += 1
-                print(f"  ✓ {species_name}")
+                print(f"  + {species_name}")
             else:
                 failed += 1
                 error = result.get("error", "Unknown error")
-                print(f"  ✗ {species_name}: {error}")
+                print(f"  x {species_name}: {error}")
 
         except Exception as e:
             failed += 1
             results.append({"species": species_name, "success": False, "error": str(e)})
-            print(f"  ✗ {species_name}: {e}")
+            print(f"  x {species_name}: {e}")
 
 print(f"\n{' Processing Results ':=^60}")
 print(f"  Success: {success}")
 print(f"  Failed:  {failed}")
 
-if success == 0:
-    print("\nNo species processed successfully. Exiting.")
-    if not args.keep_temp:
-        shutil.rmtree(temp_dir)
-    sys.exit(1)
-
 
 ##############################
-#####  Compact Training  #####
+#####  Merge Outputs     #####
 ##############################
 
-
-script_dir     = pathlib.Path(__file__).parent.resolve()
-compact_script = script_dir / "compact.py"
-
-print(f"\n{' Compacting Training ':=^60}")
-
-training_files = list(temp_dir.glob("*/training.bin"))
-
-if not training_files:
-    print("  No training.bin files found!")
-else:
-    print(f"  Found {len(training_files)} training files")
-
-    output_path = output_dir / "training.packed"
-
-    compact_cmd = [
-        "python3", str(compact_script),
-    ] + [str(f) for f in training_files] + [
-        "-o", str(output_path),
-        "--tokenizer", args.tokenizer,
-        "--target", str(args.target),
-        "--file_parallel", str(args.file_parallel),
-        "--workers", str(args.compact_workers),
-    ]
-
-    if args.hard_limit:
-        compact_cmd += ["--hard_limit", str(args.hard_limit)]
-    if args.max_target_len:
-        compact_cmd += ["--max_target_len", str(args.max_target_len)]
-
-    # Stream compact.py output directly to screen (unbuffered)
-    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
-    result = subprocess.run(compact_cmd, env=env)
-
-    if result.returncode == 0:
-        print(f"\n  ✓ Training compacting complete")
-    else:
-        print(f"\n  ✗ Training compacting failed (exit code {result.returncode})")
-
-
-##############################
-#####  Compact Validation ####
-##############################
-
-
-print(f"\n{' Compacting Validation ':=^60}")
-
-validation_files = list(temp_dir.glob("*/validation.bin"))
-
-if not validation_files:
-    print("  No validation.bin files found!")
-else:
-    print(f"  Found {len(validation_files)} validation files")
-
-    val_output_path = output_dir / "validation.packed"
-
-    val_compact_cmd = [
-        "python3", str(compact_script),
-    ] + [str(f) for f in validation_files] + [
-        "-o", str(val_output_path),
-        "--tokenizer", args.tokenizer,
-        "--target", str(args.target),
-        "--file_parallel", str(args.file_parallel),
-        "--workers", str(args.compact_workers),
-    ]
-
-    if args.hard_limit:
-        val_compact_cmd += ["--hard_limit", str(args.hard_limit)]
-    if args.max_target_len:
-        val_compact_cmd += ["--max_target_len", str(args.max_target_len)]
-
-    # Stream compact.py output directly to screen (unbuffered)
-    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
-    val_result = subprocess.run(val_compact_cmd, env=env)
-
-    if val_result.returncode == 0:
-        print(f"\n  ✓ Validation compacting complete")
-    else:
-        print(f"\n  ✗ Validation compacting failed (exit code {val_result.returncode})")
-
-
-##############################
-#####  Cleanup           #####
-##############################
-
-
-if args.keep_temp:
-    print(f"\n  Temp files kept at: {temp_dir}")
-else:
-    shutil.rmtree(temp_dir)
-    print(f"\n  Temp files cleaned up")
-
-
-##############################
-#####  Aggregate Stats   #####
-##############################
-
-
-print(f"\n{' Aggregating Stats ':=^60}")
-
-agg_stats = {
-    'windows': {
-        'windows_scanned': 0,
-        'windows_empty':   0,
-        'windows_n_heavy': 0,
-        'windows_kept':    0,
-    },
-    'samples': {
-        'raw_count':     0,
-        'aug_count':     0,
-        'total_samples': 0,
-    },
-}
-
-# Note: stats are in temp_dir which may be deleted
-# For now just show final output
 
 print(f"\n{' Final Output ':=^60}")
 
-train_path = output_dir / "training.packed"
-val_path   = output_dir / "validation.packed"
+# List all per-species training/validation bins
+training_bins   = sorted(output_dir.glob("*/training.bin"))
+validation_bins = sorted(output_dir.glob("*/validation.bin"))
 
-if train_path.exists():
-    print(f"  Training:   {train_path} ({train_path.stat().st_size / 1024 / 1024:.2f} MB)")
-if val_path.exists():
-    print(f"  Validation: {val_path} ({val_path.stat().st_size / 1024 / 1024:.2f} MB)")
+print(f"  Training files:   {len(training_bins)}")
+print(f"  Validation files: {len(validation_bins)}")
+
+for f in training_bins:
+    size_mb = f.stat().st_size / 1024 / 1024
+    print(f"    {f.parent.name:30s} {size_mb:.1f} MB")
 
 print(f"\n{'='*60}")
 print("Done!")

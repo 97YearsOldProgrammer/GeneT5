@@ -4,6 +4,7 @@ from lib.dataset.wrapper import (
     parse_fasta,
     parse_gff,
     build_gene_index,
+    filter_canonical_transcripts,
     extract_feature_types,
     extract_biotypes,
 
@@ -17,19 +18,6 @@ from lib.dataset.wrapper import (
     augment_with_hints,
     filter_n_heavy_chunks,
 
-    # Streaming Compacting (legacy - assigns group IDs only)
-    ChunkMeta,
-    stream_extract_metadata,
-    pack_from_metadata,
-    stream_write_compacted,
-
-    # Segment utilities
-    pack_with_isolation,
-    verify_isolation,
-    build_segment_mask,
-    align_to_block,
-    compute_effective_length,
-
     # Binary I/O (individual chunks)
     write_binary,
     read_binary,
@@ -37,24 +25,11 @@ from lib.dataset.wrapper import (
     read_chunk_at_index,
     BinaryChunk,
 
-    # Packed I/O (pre-packed sequences - ready to stream)
-    PackedSample,
-    PackedWriter,
-    pack_chunks_to_sample,
-    write_packed,
-    read_packed,
-    read_packed_at_index,
-    get_packed_info,
-
-    # Dataload (individual chunks - legacy)
+    # Dataload
     BinaryTrainDataset,
     DynamicPaddingCollator,
     SmartBatchSampler,
     TokenBudgetSampler,
-
-    # Dataload (pre-packed - recommended)
-    PackedTrainDataset,
-    PackedCollator,
 
     # Util
     append_tokens_to_txt,

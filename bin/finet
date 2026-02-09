@@ -189,12 +189,12 @@ def main():
         if is_main:
             print(f"  MXFP8: converted {n_mx} Linear layers to MXLinear")
 
-    # load datasets (packed format)
+    # load datasets
     if is_main:
         print(f"\nLoading datasets...")
 
-    train_dataset = ds.PackedTrainDataset(args.train_bin, args.seed)
-    val_dataset   = ds.PackedTrainDataset(args.val_bin, args.seed)
+    train_dataset = ds.BinaryTrainDataset(args.train_bin, tokenizer, args.seed)
+    val_dataset   = ds.BinaryTrainDataset(args.val_bin, tokenizer, args.seed)
 
     if is_main:
         print(f"  Train: {len(train_dataset):,}")
@@ -212,7 +212,7 @@ def main():
     if is_main:
         print(f"\nSetting up dataloaders...")
 
-    collator = ds.PackedCollator(tokenizer.pad_token_id, -100)
+    collator = ds.DynamicPaddingCollator(tokenizer.pad_token_id, -100)
 
     # Collect label lengths for smart batching
     train_sampler = None

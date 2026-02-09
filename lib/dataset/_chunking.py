@@ -308,7 +308,7 @@ def _chunk_chromosome_genecentric(args):
 ########################################
 
 
-def sliding_window_chunking(sequences, gene_index, window_size=25000, overlap_ratio=None, max_n_ratio=0.1, n_workers=None):
+def sliding_window_chunking(sequences, gene_index, window_size=200000, overlap_ratio=None, max_n_ratio=0.1, n_workers=None):
     """
     Gene-centric sliding window chunking
 

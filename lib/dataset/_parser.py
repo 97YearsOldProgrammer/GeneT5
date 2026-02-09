@@ -237,6 +237,47 @@ def build_gene_index(features):
     return gene_index
 
 
+def filter_canonical_transcripts(gene_index):
+    """Keep only the canonical (longest) transcript per gene"""
+
+    biotype_priority = {
+        "mrna": 0, "protein_coding": 0,
+        "lncrna": 1, "lnc_rna": 1,
+        "rrna": 2, "trna": 2, "snorna": 2, "snrna": 2, "mirna": 2,
+    }
+
+    for gene_id, gene_data in gene_index.items():
+        transcripts = gene_data.get("transcripts", {})
+
+        if len(transcripts) <= 1:
+            continue
+
+        best_tid   = None
+        best_score = (999, 0)
+
+        for tid, tdata in transcripts.items():
+            biotype  = tdata.get("biotype", "unknown").lower()
+            priority = biotype_priority.get(biotype, 10)
+            span     = tdata.get("end", 0) - tdata.get("start", 0)
+            score    = (priority, -span)
+
+            if best_tid is None or score < best_score:
+                best_tid   = tid
+                best_score = score
+
+        # Remove non-canonical transcripts
+        keep_features = []
+        for feat in gene_data.get("features", []):
+            parent = feat.get("attributes", {}).get("Parent", "")
+            if parent == best_tid or parent == gene_id or parent == "":
+                keep_features.append(feat)
+
+        gene_data["features"]    = keep_features
+        gene_data["transcripts"] = {best_tid: transcripts[best_tid]}
+
+    return gene_index
+
+
 def _merge_cds_into_exons(gene_index):
     """Merge CDS phase and boundaries into matching exon features"""
 

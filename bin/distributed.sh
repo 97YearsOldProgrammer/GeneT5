@@ -136,6 +136,9 @@ else
     echo "         Make sure container runs with --network=host"
 fi
 
+# bitsandbytes: NGC 25.12 ships CUDA 13.1 but bnb only has 13.0 prebuilt
+export BNB_CUDA_VERSION=130
+
 # Ensure GeneT5 lib is importable
 export PYTHONPATH="${PYTHONPATH:-/workspace/GeneT5}"
 

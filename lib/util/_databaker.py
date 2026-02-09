@@ -170,7 +170,7 @@ def find_genome_files(species_dir):
 #################################
 
 
-def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_dir, token_file=None, tokenizer_path=None, n_workers=1, num_complex=5, num_normal=5, num_easy=5, compress=None):
+def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_dir, token_file=None, tokenizer_path=None, n_workers=1, num_complex=5, num_normal=5, num_easy=5, compress=None, canonical_only=False):
     """Run parse_data.py for a single species"""
 
     cmd = [
@@ -193,7 +193,10 @@ def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_di
 
     if compress:
         cmd.extend(["--compress", compress])
-    
+
+    if canonical_only:
+        cmd.append("--canonical_only")
+
     log_file = log_dir / f"{species_name}.log"
     
     try:
@@ -262,12 +265,16 @@ def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_di
 def process_species(args):
     """Worker function for parallel species processing"""
 
-    # Handle both old (11 args) and new (12 args) calling convention
-    if len(args) == 12:
+    # Handle variable-length args tuples
+    if len(args) == 13:
+        species_name, raw_dir, baked_dir, log_dir, limit, token_file, tokenizer_path, n_workers, num_complex, num_normal, num_easy, compress, canonical_only = args
+    elif len(args) == 12:
         species_name, raw_dir, baked_dir, log_dir, limit, token_file, tokenizer_path, n_workers, num_complex, num_normal, num_easy, compress = args
+        canonical_only = False
     else:
         species_name, raw_dir, baked_dir, log_dir, limit, token_file, tokenizer_path, n_workers, num_complex, num_normal, num_easy = args
-        compress = None
+        compress       = None
+        canonical_only = False
 
     species_raw_dir = pathlib.Path(raw_dir) / species_name
 
@@ -304,7 +311,7 @@ def process_species(args):
         pass
 
     result = run_parse_data(
-        species_name, fasta_file, gff_file, output_dir, limit, log_dir, token_file, tokenizer_path, n_workers, num_complex, num_normal, num_easy, compress
+        species_name, fasta_file, gff_file, output_dir, limit, log_dir, token_file, tokenizer_path, n_workers, num_complex, num_normal, num_easy, compress, canonical_only
     )
 
     # Clean up decompressed files
