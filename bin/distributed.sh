@@ -114,6 +114,9 @@ export NCCL_DEBUG=INFO
 export NCCL_IB_HCA="roceP2p1s0f1"
 export NCCL_IB_TIMEOUT=22               # Max timeout (~17s per retry)
 export NCCL_IB_RETRY_CNT=7             # Max retries
+export NCCL_IB_MERGE_NICS=0            # Don't merge NICs (avoids socket type mismatch)
+export NCCL_CROSS_NIC=0                 # Stay on same NIC for all connections
+export NCCL_MAX_NCHANNELS=2             # Fewer channels = fewer socket connections to negotiate
 
 # GDR disabled: nvidia-peermem broken on DGX Spark UMA (DGX OS 7.x)
 export NCCL_NET_GDR_LEVEL=0
@@ -147,4 +150,6 @@ torchrun \
     "$VAL_DATA" \
     "$OUTPUT_DIR" \
     "$MODEL_PATH" \
+    --optim_8bit \
+    --memwatch \
     "${EXTRA_ARGS[@]}"
