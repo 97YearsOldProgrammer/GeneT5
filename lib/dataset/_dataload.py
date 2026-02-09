@@ -659,6 +659,8 @@ class PackedTrainDataset:
             vals = struct.unpack('<QI', raw[off:off + 12])
             self._offsets.append(vals)
 
+    _FADVISE_INTERVAL = 64
+
     def _get_file(self):
         """Lazy file handle — opens once per process (fork-safe for num_workers>0)"""
 
@@ -666,8 +668,12 @@ class PackedTrainDataset:
         if self._file is None or self._file.closed or self._file_pid != pid:
             if self._file is not None and not self._file.closed:
                 self._file.close()
-            self._file     = open(self.packed_path, 'rb')
-            self._file_pid = pid
+            self._file       = open(self.packed_path, 'rb')
+            fd               = self._file.fileno()
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            self._file_pid   = pid
+            self._read_count = 0
         return self._file
 
     def set_epoch(self, epoch):
@@ -684,7 +690,12 @@ class PackedTrainDataset:
         f              = self._get_file()
         f.seek(offset)
         data           = f.read(length)
-        sample         = packed.PackedSample.from_bytes(data)
+
+        self._read_count += 1
+        if self._read_count % self._FADVISE_INTERVAL == 0:
+            os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+
+        sample = packed.PackedSample.from_bytes(data)
 
         return {
             "input_ids":       sample.input_ids,

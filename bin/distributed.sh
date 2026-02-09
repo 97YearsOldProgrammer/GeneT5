@@ -150,6 +150,5 @@ torchrun \
     "$VAL_DATA" \
     "$OUTPUT_DIR" \
     "$MODEL_PATH" \
-    --optim_8bit \
     --memwatch \
     "${EXTRA_ARGS[@]}"
