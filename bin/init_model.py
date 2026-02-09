@@ -50,6 +50,11 @@ parser.add_argument("--num_experts", type=int, default=16,
 parser.add_argument("--moe_top_k", type=int, default=2,
     help="Top-K routing for MoE.")
 
+parser.add_argument("--num_latents", type=int, default=1024,
+    help="Number of perceiver latent tokens [%(default)s]")
+parser.add_argument("--perceiver_layers", type=int, default=2,
+    help="Number of perceiver self-attention layers [%(default)s]")
+
 parser.add_argument("--init_std", type=float, default=0.02,
     help="Default standard deviation for random parameter initialization.")
 parser.add_argument("--init_embed_std", type=float, default=None,
@@ -90,6 +95,8 @@ saved_path = build_gt5(
     vocab_size                = args.vocab_size,
     tie_weights               = args.tie_weights,
     new_tokens_list           = new_tokens_list if new_tokens_list else None,
+    num_latents               = args.num_latents,
+    perceiver_layers          = args.perceiver_layers,
     init_std                  = args.init_std,
     init_embed_std            = args.init_embed_std,
     init_ffn_std              = args.init_ffn_std,
