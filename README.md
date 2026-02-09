@@ -1,94 +1,106 @@
-### End-to-end gene prediction with pure deep learning structure
+## GeneT5
 
-The idea of this project is using deep learning approach to replace traditional Hidden Markov-model for gene prediction.    
-In short human language, for example, the goal is replacing Augustus with cutting-edge deep learning model.     
+End-to-end gene prediction using an encoder-decoder transformer, replacing traditional HMM-based tools like Augustus
 
-There are certain pros for considering such action:     
-
-1. Transformer have attention mechanism that reasonablily better than markov process.   
-   (no longer solely depend on previous state)     
-2. With certain deep learning mechanism, such as: pre-train, fine-tune, MoE.    
-   The model no longer need to self-trained again for achieve higher accuary as normal HMM.   
-
-Cons:
-1. It's computational hard for running such program. Def need more memory space and time complexity.    
-   Both require extremely nice engineering capability to handle them.     
-2. It's extremely hard to develop and design such program. That's why no biologists did it so far.  
-
-
----
-
-
-### Expanding the Tokenizer
-
-The tokenizer from the DNABERT model is not enough for our purpose. Since that was only trained for understanding the relationship of raw DNA Sequences. That satisfied the need of a encoder but not the decoder. For our purpose, we need to append more tokens to the original DNABERT-v2 tokenizer for further fine-tuning. A special case of tokenizer is the type of gene that we want the encoder-decoder capable of predicting. As colelcted from gff file of model species from prokaryotics and eukaryotics. The expansion of type tokens would be below:  
+### Architecture
 
 ```
-mobile_genetic_element
-origin_of_replication
-
-ncRNA
-rRNA
-tRNA    
+DNA Sequence --> DNABERT-2 Encoder (12L) --> Perceiver Compressor (1024 latents)
+                                                    |
+                                                    v
+Gene Annotation <-- Decoder (12L, MoE x16, GQA) <--+
 ```
 
-Run the following cmd to get new tokens that would be append into the original tokenizer. 
-```python3
-python3 bin/tokenizer.py --output ./data/new_tokens.txt
+- **Encoder**: DNABERT-2 117M with sparse windowed attention
+- **Compressor**: Perceiver with 1024 learned latents (variable-length input -> fixed representation)
+- **Decoder**: 12 layers, grouped-query attention (12H/3KV), Mixture-of-Experts (16 experts, top-2)
+- **Total**: 1.55B parameters
+
+### Why Deep Learning for Gene Prediction
+
+1. Attention mechanism captures long-range dependencies that Markov models miss
+2. Pre-trained encoder (DNABERT-2) provides cross-species transfer learning
+3. MoE enables capacity scaling without proportional compute cost
+4. Single model handles prokaryotes through vertebrates
+
+### Setup
+
+**Container** (recommended)
+```bash
+./start-gt5.sh           # single node
+./start-gt5-multi.sh     # multi-node (run on both nodes)
 ```
 
----
+Requires `nvcr.io/nvidia/pytorch:25.12-py3` (PyTorch 2.10, CUDA 13.1)
 
+**Hardware**: NVIDIA DGX Spark (GB10, 128GB UMA) or any Blackwell GPU
 
-### Dependencies
+### Quick Start
 
-The first part of getting the nn is copying weights and biases from the pre-trarined model. For achieving that, the CUDA environment is required for accessing the triton packages to get weights and biases from DNABERT-v2 through hugging faces. Here is a full backing receipe for Windows user.  
+```bash
+# Inside container
+cd /workspace/GeneT5
 
-```powershell
-wsl --install -d Ubuntu
+# Train on 5% subset (fast iteration)
+PYTHONPATH=. python bin/finet \
+    ../baked/w5k_c4.5k_5pct/training.packed \
+    ../baked/w5k_c4.5k_5pct/validation.packed \
+    ../model/test_run ../model/base \
+    --epochs 1 --lr 1e-4 --token_budget 36400 --max_batch_size 8 \
+    --grad_accum 64 --compile --log_every_pct 5
+
+# Full training (2x DGX Spark)
+bin/distributed.sh ../baked/w5k_c4.5k/training.packed \
+    ../baked/w5k_c4.5k/validation.packed \
+    ../model/run_001 ../model/base \
+    --nnodes 2 --node-rank 0 --master 192.168.100.10 \
+    --epochs 4 --lr 1e-4 --token_budget 45500 --max_batch_size 8 \
+    --grad_accum 64 --compile --memwatch
 ```
 
-And then register an account. 
+See [bin/README.md](bin/README.md) for full command recipes
 
-```wsl
-pip install torch transformers einops triton
+### Project Structure
+
+```
+bin/            CLI entry points (init, bake, train, eval)
+lib/
+  blocks/       Encoder, decoder, perceiver, MoE, sparse attention
+  dataset/      Data loading, packing, token budget batching
+  util/         Training loop, memory monitoring, logging
+  nosing/       Post-processing (exon/intron/protein extraction)
+  model.py      Main GeneT5 architecture
+  tokenizer.py  Tokenizer wrapper
+test/           Evaluation (BUSCO, F1 metrics)
+tests/          Development benchmarks and tests
 ```
 
-The software require pytorch to build building blocks of nn.
+### Data Layout
 
-```zsh
-conda create -n nameyouwannaput
-conda install pytorch -c conda-forge
+```
+/workspace/
+  raw/          Raw GFF + FASTA by taxa (prokaryotes, vertebrates, ...)
+  baked/        Packed training datasets (tokenized, ready for training)
+  model/        Model checkpoints (base/, exp_* experiments)
+  logs/         Training logs, memory profiles
 ```
 
-Besides, it require the huggingface transformer model to get access to the DNABERT for their weights and tokenizer.
+### Performance
 
-```zsh
-conda install -c conda-forge transformers
-```
+| Config | Batch/s | Notes |
+|--------|---------|-------|
+| Single node, no compile | 0.55 | Baseline |
+| Single node + torch.compile | 0.73 | 33% speedup, dynamic=None |
+| 2x Spark + compile (target) | ~1.4 | Linear scaling expected |
 
-**The packages below require the CUDA for running.**
+### Training Data
 
-Furthermore, for optimizing the whole algorithm, such as Spare MoE and Spare Attention Mechanism. We need external packages to get access for creating own CUDA C++ Kernel and parallelism training. For creating custom CUDA Kernel, we need 
+5 taxonomic groups, 70,000 genes total, packed binary format
 
-```zsh
-conda install -c conda-forge triton
-```
-
-For parallelism training, we need optimizer packages DeepSpeed.
-
-```zsh
-conda install -c conda-forge deepspeed
-```
-
-For not CUDA user, the trainning script also support MPS through PyTorch packages. For that purpose, the only required package would be pytorch.   
-
-
----
-
-
-### Fine Tuning
-
-For letting the model have ideal functionality for proper Ab Inito prediction is fine-tuning on datas from multiple species. 
-
-Fine-tuning seem like taking 60GB of RAM through Pytorch packages.   
+| Taxa | Genes | Avg Size |
+|------|-------|----------|
+| Prokaryotes | 10,000 | 9 kb |
+| Unicellular | 15,000 | 15 kb |
+| Invertebrates | 15,000 | 25 kb |
+| Vertebrates | 15,000 | 30 kb |
+| Plants | 15,000 | 25 kb |

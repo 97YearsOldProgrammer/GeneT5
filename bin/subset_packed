@@ -9,8 +9,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import lib.dataset as ds
 
 
-SRC_DIR  = pathlib.Path('../baked/5k4.5k')
-DST_DIR  = pathlib.Path('../baked/5%5k4.5k')
+SRC_DIR  = pathlib.Path('../baked/w5k_c4.5k')
+DST_DIR  = pathlib.Path('../baked/w5k_c4.5k_5pct')
 FRACTION = 0.05
 SEED     = 42
 

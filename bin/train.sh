@@ -9,10 +9,10 @@
 
 set -e
 
-TRAIN_DATA="../baked/5k4.5k/training.packed"
-VAL_DATA="../baked/5k4.5k/validation.packed"
-OUTPUT_DIR="../model/feb5"
-MODEL_PATH="../model/init"
+TRAIN_DATA="../baked/w5k_c4.5k/training.packed"
+VAL_DATA="../baked/w5k_c4.5k/validation.packed"
+OUTPUT_DIR="../model/exp_$(date +%Y%m%d)_train"
+MODEL_PATH="../model/base"
 
 bin/distributed.sh \
     "$TRAIN_DATA" "$VAL_DATA" "$OUTPUT_DIR" "$MODEL_PATH" \

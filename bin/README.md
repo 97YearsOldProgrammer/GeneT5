@@ -13,7 +13,7 @@ Reproducible commands for building and training GeneT5 from scratch
 
 ```bash
 PYTHONPATH=. python bin/init_model.py \
-    --save_dir ../model/init \
+    --save_dir ../model/base \
     --dnabert_path "zhihan1996/DNABERT-2-117M" \
     --tie_weights \
     --decoder_layers 12 \
@@ -47,12 +47,12 @@ Prepare multi-species training data from raw GFF/FASTA
 ```bash
 PYTHONPATH=. python bin/bake_data \
     --raw_dir ../raw \
-    --output_dir ../baked/5k4.5k \
+    --output_dir ../baked/w5k_c4.5k \
     --n_workers 5 \
     --species_parallel 3 \
-    --tokenizer ../model/init \
+    --tokenizer ../model/base \
     --window_size 10000 \
-    2>&1 | tee ../logs/baker/5k4.5k.log
+    2>&1 | tee ../logs/baker/w5k_c4.5k.log
 ```
 
 **Species Limits**
@@ -69,8 +69,8 @@ PYTHONPATH=. python bin/bake_data \
 
 ```bash
 PYTHONPATH=. python bin/subset_packed \
-    ../baked/5k4.5k/training.packed \
-    ../baked/5%5k4.5k/training.packed \
+    ../baked/w5k_c4.5k/training.packed \
+    ../baked/w5k_c4.5k_5pct/training.packed \
     --fraction 0.05
 ```
 
@@ -89,13 +89,13 @@ PYTHONPATH=. python bin/init_tk.py data/new_tokens.txt
 Append new tokens discovered during baking
 
 ```bash
-PYTHONPATH=. python bin/append_tk.py data/new_tokens.txt ../model/init/tokenizer.json
+PYTHONPATH=. python bin/append_tk.py data/new_tokens.txt ../model/base/tokenizer.json
 ```
 
 Resize embeddings after tokenizer changes
 
 ```bash
-PYTHONPATH=. python bin/resize_model.py ../model/init ../model/init
+PYTHONPATH=. python bin/resize_model.py ../model/base ../model/base
 ```
 
 
@@ -106,10 +106,10 @@ PYTHONPATH=. python bin/resize_model.py ../model/init ../model/init
 
 ```bash
 PYTHONPATH=. python bin/finet \
-    ../baked/5k4.5k/training.packed \
-    ../baked/5k4.5k/validation.packed \
+    ../baked/w5k_c4.5k/training.packed \
+    ../baked/w5k_c4.5k/validation.packed \
     ../model/run_001 \
-    ../model/init \
+    ../model/base \
     --epochs 4 \
     --lr 1e-4 \
     --token_budget 45500 \
@@ -150,10 +150,10 @@ Uses `torchrun` + NCCL over ConnectX-7 RoCE
 **Master** (spark-1089, 192.168.100.10)
 ```bash
 bin/distributed.sh \
-    ../baked/5k4.5k/training.packed \
-    ../baked/5k4.5k/validation.packed \
+    ../baked/w5k_c4.5k/training.packed \
+    ../baked/w5k_c4.5k/validation.packed \
     ../model/run_002_dist \
-    ../model/init \
+    ../model/base \
     --nnodes 2 --node-rank 0 --master 192.168.100.10 \
     --epochs 4 --lr 1e-4 --token_budget 45500 --max_batch_size 8 \
     --grad_accum 64 --compile --log_every_pct 5 --memwatch
@@ -162,10 +162,10 @@ bin/distributed.sh \
 **Worker** (spark-0b7c, 192.168.100.11)
 ```bash
 bin/distributed.sh \
-    ../baked/5k4.5k/training.packed \
-    ../baked/5k4.5k/validation.packed \
+    ../baked/w5k_c4.5k/training.packed \
+    ../baked/w5k_c4.5k/validation.packed \
     ../model/run_002_dist \
-    ../model/init \
+    ../model/base \
     --nnodes 2 --node-rank 1 --master 192.168.100.10 \
     --epochs 4 --lr 1e-4 --token_budget 45500 --max_batch_size 8 \
     --grad_accum 64 --compile --log_every_pct 5
@@ -189,6 +189,45 @@ ib_write_bw -d rocep1s0f1 -x 3 192.168.100.10 --report_gbits  # client
 **RoCE Fallback**: If RDMA fails, uncomment Socket transport in `distributed.sh` lines 127-128
 
 **NCCL Logs**: Look for `NET/IB` (RoCE active) vs `NET/Socket` (fallback)
+
+
+---
+
+
+### Logging
+
+All commands use `tee` to write to both stdout and a log file. Use this pattern for any new run:
+
+```bash
+# Convention: ../logs/<category>/<run_name>.log
+# Categories: tune/, baker/, init.log
+
+# Training run with timestamped log
+RUN="exp_$(date +%Y%m%d)_desc"
+PYTHONPATH=. python bin/finet \
+    ../baked/w5k_c4.5k/training.packed \
+    ../baked/w5k_c4.5k/validation.packed \
+    ../model/$RUN ../model/base \
+    --epochs 4 --lr 1e-4 --token_budget 45500 --max_batch_size 8 \
+    --grad_accum 64 --compile --memwatch \
+    2>&1 | tee ../logs/tune/${RUN}.log
+
+# Bake run (per-species logs go to baker/ subdir)
+PYTHONPATH=. python bin/bake_data \
+    --raw_dir ../raw --output_dir ../baked/w5k_c4k \
+    --tokenizer ../model/base --window_size 5000 --target 4000 \
+    --log_dir ../logs/baker/w5k_c4k \
+    2>&1 | tee ../logs/baker/w5k_c4k.log
+```
+
+**Log locations**
+
+| Category | Path | Content |
+| :------- | :--- | :------ |
+| Model init | `../logs/init.log` | Architecture, param counts |
+| Baking | `../logs/baker/<dataset>.log` | Per-species stats, packing summary |
+| Per-species bake | `../logs/baker/<dataset>/<Species>.log` | Gene extraction, token stats |
+| Training | `../logs/tune/<run>.log` | Loss, lr, batch/s, memory |
 
 
 ---
