@@ -18,10 +18,10 @@ NNODES="${NNODES:-1}"
 NODE_RANK="${NODE_RANK:-0}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 
-# Detect ConnectX-7 interface (DGX Spark)
+# Detect ConnectX-7 P2P interface (DGX Spark — cable is on the P2P NIC)
 CX7_IF=""
-for iface in enp1s0f1np1 enP2p1s0f0np0 enp1s0f1np1 enp1s0f0np0; do
-    if [ -d "/sys/class/net/$iface" ]; then
+for iface in enP2p1s0f1np1 enP2p1s0f0np0 enp1s0f1np1 enp1s0f0np0; do
+    if [ -d "/sys/class/net/$iface" ] && [ "$(cat /sys/class/net/$iface/operstate 2>/dev/null)" = "up" ]; then
         CX7_IF="$iface"
         break
     fi
@@ -110,21 +110,16 @@ echo "========================================"
 # NCCL environment for DGX Spark ConnectX-7 200Gb/s RoCE
 export NCCL_DEBUG=INFO
 
-# RoCE transport — pin to ACTIVE device only (rocep1s0f0 is DOWN)
-export NCCL_IB_HCA="rocep1s0f1"
-export NCCL_IB_GID_INDEX=3              # RoCEv2 + IPv4 (verified via show_gids)
+# RoCE transport — pin to P2P NIC (cable is on roceP2p1s0f1, not rocep1s0f1)
+export NCCL_IB_HCA="roceP2p1s0f1"
 export NCCL_IB_TIMEOUT=22               # Max timeout (~17s per retry)
 export NCCL_IB_RETRY_CNT=7             # Max retries
-export NCCL_IB_TC=106                   # RoCE traffic class
-export NCCL_IB_ROCE_VERSION_NUM=2       # Force RoCEv2
-export NCCL_IB_ADDR_FAMILY=AF_INET     # Force IPv4
-export NCCL_IB_MERGE_NICS=1            # Merge dual-port NIC
 
 # GDR disabled: nvidia-peermem broken on DGX Spark UMA (DGX OS 7.x)
 export NCCL_NET_GDR_LEVEL=0
 export NCCL_NET_GDR_READ=0
 
-# Fallback: uncomment these two lines to force Socket transport if RoCE fails
+# Fallback: uncomment these two lines to force Socket transport (~3.4 GB/s vs ~25 GB/s)
 # export NCCL_NET_PLUGIN=none
 # export NCCL_IB_DISABLE=1
 
