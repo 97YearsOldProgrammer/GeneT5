@@ -32,7 +32,6 @@ from lib.dataset.wrapper import (
     TokenBudgetSampler,
 
     # Util
-    append_tokens_to_txt,
     format_size,
     print_run_stats,
 )

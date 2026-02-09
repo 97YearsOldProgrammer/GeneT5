@@ -1,5 +1,4 @@
 import argparse
-from pathlib import Path
 
 from lib.util.build_model import build_gt5
 
@@ -11,12 +10,6 @@ parser.add_argument("--save_dir", type=str, default="./checkpoints/genet5_init",
     help="Directory to save the initialized model weights and config.")
 parser.add_argument("--dnabert_path", type=str, default="zhihan1996/DNABERT-2-117M",
     help="HuggingFace model ID or local path to DNABERT-2.")
-parser.add_argument("--vocab_size", type=int, default=None,
-    help="Vocabulary size. If None, auto-detect from tokenizer.")
-parser.add_argument("--new_tokens", type=str, nargs="*", default=None,
-    help="New tokens to add to tokenizer.")
-parser.add_argument("--new_tokens_file", type=str, default=None,
-    help="Path to file containing new tokens (one per line).")
 
 parser.add_argument("--encoder_window_size", type=int, default=-1,
     help="Sliding window size for encoder attention. -1 for full attention.")
@@ -68,13 +61,6 @@ parser.add_argument("--init_moe_router_std", type=float, default=0.006,
 
 args = parser.parse_args()
 
-
-new_tokens_list = args.new_tokens or []
-if args.new_tokens_file:
-    with open(args.new_tokens_file, "r") as f:
-        file_tokens = [line.strip() for line in f if line.strip()]
-    new_tokens_list.extend(file_tokens)
-
 print(f"\n{' GeneT5 Initialization ':=^60}")
 
 saved_path = build_gt5(
@@ -92,9 +78,7 @@ saved_path = build_gt5(
     decoder_use_moe           = args.use_moe,
     decoder_num_experts       = args.num_experts,
     decoder_moe_top_k         = args.moe_top_k,
-    vocab_size                = args.vocab_size,
     tie_weights               = args.tie_weights,
-    new_tokens_list           = new_tokens_list if new_tokens_list else None,
     num_latents               = args.num_latents,
     perceiver_layers          = args.perceiver_layers,
     init_std                  = args.init_std,

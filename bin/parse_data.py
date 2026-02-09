@@ -13,7 +13,7 @@ parser.add_argument('gff', type=str, metavar='<gff>',
     help='path to GFF3 annotation file')
 parser.add_argument('output_dir', type=str, metavar='<output>',
     help='output directory')
-parser.add_argument('--limit', required=False, type=int, default=200000,
+parser.add_argument('--limit', required=False, type=int, default=20000,
     metavar='<int>', help='chunk size limit in bp [%(default)i]')
 parser.add_argument('--overlap_ratio', required=False, type=float, default=1/2.718281828,
     metavar='<float>', help='window overlap ratio (1/e) [%(default).4f]')
@@ -23,8 +23,6 @@ parser.add_argument('--hint_ratio', required=False, type=float, default=0.5,
     metavar='<float>', help='hint augmentation ratio [%(default).2f]')
 parser.add_argument('--seed', required=False, type=int, default=42,
     metavar='<int>', help='random seed [%(default)i]')
-parser.add_argument('--extract_tokens', required=False, type=str, default=None,
-    metavar='<file>', help='extract tokens to file')
 parser.add_argument('--num_complex', required=False, type=int, default=5,
     metavar='<int>', help='number of complex genes for validation [%(default)i]')
 parser.add_argument('--num_normal', required=False, type=int, default=5,
@@ -61,15 +59,6 @@ print(f"  Features:  {len(features)}")
 print(f"  Genes:     {len(gene_index)}")
 if args.canonical_only:
     print(f"  Mode:      canonical only (one transcript per gene)")
-
-# Extract tokens if requested
-if args.extract_tokens:
-    feature_types = ds.extract_feature_types(features)
-    biotypes      = ds.extract_biotypes(features)
-    all_types     = feature_types | biotypes
-    added         = ds.append_tokens_to_txt(sorted(all_types), args.extract_tokens)
-    if added:
-        print(f"  Added {len(added)} new tokens")
 
 # Build validation set
 print(f"\n{' Building Validation Set ':=^60}")
@@ -265,6 +254,5 @@ print(f"\n{'='*60}")
 print('Done!')
 print()
 print('Next steps:')
-print('  1. Update tokenizer with extracted tokens (if --extract_tokens used)')
-print('  2. Train with: bin/finet --train training.bin --val validation.bin')
+print('  Train with: bin/finet --train training.bin --val validation.bin')
 print(f"{'='*60}")

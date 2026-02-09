@@ -572,22 +572,11 @@ def setup_gene_prediction_model(model_path, tokenizer, device):
     return model
 
 
-def prepare_tokenizer(model_path, special_tokens=None):
-    """Load and prepare tokenizer with special tokens"""
-    from transformers import AutoTokenizer
-    
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    
-    if special_tokens is None:
-        special_tokens = ["[GENE]", "[CLS]"]
-    
-    new_tokens = [t for t in special_tokens if t not in tokenizer.get_vocab()]
-    if new_tokens:
-        tokenizer.add_tokens(new_tokens)
-        if is_main_process():
-            print(f"Added tokens: {new_tokens}")
-    
-    return tokenizer
+def prepare_tokenizer(model_path):
+    """Load tokenizer (tokens already hardcoded during init)"""
+
+    from lib.tokenizer import GeneTokenizer
+    return GeneTokenizer(model_path)
 
 
 def prepare_optimizer_scheduler(model, train_loader, lr, weight_decay, 

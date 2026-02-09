@@ -26,7 +26,7 @@ parser.add_argument("--taxa",       type=str, nargs='+', default=None,
     help="Process only specific taxa (default: all)")
 parser.add_argument("--species",    type=str, nargs='+', default=None,
     help="Process only specific species (default: all)")
-parser.add_argument("--window_size", type=int, default=200000,
+parser.add_argument("--window_size", type=int, default=20000,
     help="Window size in base pairs [%(default)s]")
 parser.add_argument("--species_parallel", type=int, default=3,
     help="Number of species to process in parallel [%(default)s]")

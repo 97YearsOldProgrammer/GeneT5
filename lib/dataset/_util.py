@@ -6,28 +6,6 @@ import pathlib
 #######################
 
 
-def append_tokens_to_txt(tokens, txt_path):
-    """Append new tokens to txt file if not present"""
-
-    txt_path = pathlib.Path(txt_path)
-
-    existing = set()
-    if txt_path.exists():
-        with open(txt_path, 'r') as f:
-            for line in f:
-                existing.add(line.strip())
-
-    new_tokens = [t for t in tokens if t not in existing]
-
-    if new_tokens:
-        txt_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(txt_path, 'a') as f:
-            for token in new_tokens:
-                f.write(token + '\n')
-
-    return new_tokens
-
-
 def print_run_stats(run_stats, chunk_stats, validation, output_path):
     """Print comprehensive run statistics"""
 
@@ -58,14 +36,6 @@ def print_run_stats(run_stats, chunk_stats, validation, output_path):
         print(f"    Easy samples: {len(validation.get('easy_samples', []))}")
         print(f"    Total genes:  {len(validation.get('all_ids', []))}")
         print(f"    Scenarios:    {len(validation.get('scenarios', []))}")
-
-    if "compact_stats" in run_stats:
-        cs = run_stats["compact_stats"]
-        print(f"\n  Compacting:")
-        print(f"    Groups:       {cs['total_groups']}")
-        print(f"    Utilization:  {cs['avg_utilization']*100:.1f}%")
-        print(f"    Overflow:     {cs['overflow_count']}")
-        print(f"    Singletons:   {cs['singleton_count']}")
 
     file_size = run_stats.get("file_size", 0)
     print(f"\n  Output:")

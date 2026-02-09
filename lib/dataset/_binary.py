@@ -252,15 +252,14 @@ class BinaryChunk:
         for f in sorted_features:
             ftype = f.get("type", "exon").lower()
 
-            # Skip CDS features - info merged into exon
-            if ftype == "cds":
+            # Only emit exon features (CDS boundaries encoded as trailing coords)
+            if ftype != "exon":
                 continue
 
             fstart  = f.get("start", 0)
             fend    = f.get("end", 0)
             fstrand = f.get("strand", "+")
-            fphase  = f.get("phase", ".")
-            biotype = f.get("biotype", ".")
+            biotype = f.get("biotype", "protein_coding")
 
             gene_id       = f.get("gene_id", "")
             transcript_id = f.get("transcript_id", "")
@@ -269,9 +268,9 @@ class BinaryChunk:
                 gene_id, transcript_id, gene_indices, transcript_indices
             )
 
-            # Build trailing - UTR lines have [\t]{cds_coord}
-            # 5'UTR: cds_start (where CDS begins)
-            # 3'UTR: cds_end (where CDS ends)
+            # Trailing CDS boundary coords (encodes UTR implicitly)
+            # 5' end: cds_start (where CDS begins)
+            # 3' end: cds_end   (where CDS ends)
             cds_start = f.get("cds_start")
             cds_end   = f.get("cds_end")
 
@@ -282,8 +281,8 @@ class BinaryChunk:
             else:
                 trailing = ""
 
-            # Format: {start}[\t]{end}{strand}{phase}{biotype}{gene_idx}[[\t]{cds_coord}][\n]
-            target_text += rf"{fstart}[\t]{fend}{fstrand}{fphase}{biotype}{gene_idx_str}{trailing}[\n]"
+            # Format: {start}[\t]{end}{strand}{biotype}{gene_idx}[[\t]{cds_coord}][\n]
+            target_text += rf"{fstart}[\t]{fend}{fstrand}{biotype}{gene_idx_str}{trailing}[\n]"
 
         target_text += "<eos>"
 

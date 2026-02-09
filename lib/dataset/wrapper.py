@@ -68,7 +68,6 @@ TokenBudgetSampler     = dataload.TokenBudgetSampler
 ###################
 
 
-append_tokens_to_txt   = util.append_tokens_to_txt
 format_size            = util.format_size
 print_run_stats        = util.print_run_stats
 print_validation_stats = validation.print_validation_stats

@@ -1,123 +1,27 @@
-import json
 from pathlib import Path
 from transformers import AutoTokenizer
 
 
-#####################
-##### Auxilary  #####
-#####################
+DNABERT_PATH = "zhihan1996/DNABERT-2-117M"
 
 
-def load_tokenizer_config(tokenizer_path):
-    """Load tokenizer.json config file"""
-    
-    path = Path(tokenizer_path)
-    
-    if path.is_dir():
-        config_file = path / "tokenizer.json"
-    else:
-        config_file = path
-    
-    if not config_file.exists():
-        raise FileNotFoundError(f"Tokenizer not found: {config_file}")
-    
-    with open(config_file, 'r') as f:
-        return json.load(f), config_file
+#############################
+#####  Token Inventory  #####
+#############################
 
 
-def get_existing_tokens(config):
-    """Extract all existing tokens from tokenizer config"""
-    tokens = set()
-    
-    if "model" in config and "vocab" in config["model"]:
-        vocab = config["model"]["vocab"]
-        if isinstance(vocab, dict):
-            tokens.update(vocab.keys())
-        elif isinstance(vocab, list):
-            tokens.update(vocab)
-    
-    if "added_tokens" in config:
-        for token_info in config["added_tokens"]:
-            if isinstance(token_info, dict) and "content" in token_info:
-                tokens.add(token_info["content"])
-            elif isinstance(token_info, str):
-                tokens.add(token_info)
-    
-    return tokens
+SPECIAL  = ["<bos>", "<eos>"]
+FORMAT   = ["[ATT]", "[HIT]", "+", "-", r"[\t]", r"[\n]"]
+NUMBERS  = [str(i) for i in range(1000)]
+NMASK    = ["N" * i for i in range(1, 7)]
+FEATURES = ["exon"]
+BIOTYPES = [
+    "protein_coding", "lncrna", "pseudogene",
+    "trna", "rrna", "snorna", "snrna", "mirna",
+]
+HINTS    = ["intron_hc", "intron_lc"]
 
-
-def load_tokens_from_txt(txt_path):
-    """Load tokens from a text file (one per line)"""
-    tokens = []
-    
-    with open(txt_path, 'r') as f:
-        for line in f:
-            token = line.strip()
-            if token:
-                tokens.append(token)
-    
-    return tokens
-
-
-def append_tokens_to_config(config, new_tokens):
-    """Append new tokens to tokenizer config"""
-    if not new_tokens:
-        return config, []
-    
-    max_id = 0
-    
-    if "added_tokens" in config:
-        for token_info in config["added_tokens"]:
-            if isinstance(token_info, dict) and "id" in token_info:
-                max_id = max(max_id, token_info["id"])
-    
-    if "model" in config and "vocab" in config["model"]:
-        vocab = config["model"]["vocab"]
-        if isinstance(vocab, dict):
-            max_id = max(max_id, max(vocab.values()) if vocab else 0)
-    
-    if "added_tokens" not in config:
-        config["added_tokens"] = []
-    
-    added = []
-    for i, token in enumerate(new_tokens):
-        new_id      = max_id + 1 + i
-        token_entry = {
-            "id":         new_id,
-            "content":    token,
-            "single_word": False,
-            "lstrip":     False,
-            "rstrip":     False,
-            "normalized": False,
-            "special":    False
-        }
-        config["added_tokens"].append(token_entry)
-        added.append((token, new_id))
-    
-    return config, added
-
-
-def save_tokenizer_config(config, output_path):
-    """Save tokenizer config to file"""
-    
-    output_file = Path(output_path)
-    
-    if output_file.is_dir():
-        output_file = output_file / "tokenizer.json"
-    
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    
-    with open(output_file, 'w') as f:
-        json.dump(config, f, indent=2)
-    
-    return output_file
-
-
-def find_missing_tokens(config, tokens):
-    """Find tokens not present in tokenizer config"""
-    
-    existing = get_existing_tokens(config)
-    return [t for t in tokens if t not in existing]
+GFF_TOKENS = SPECIAL + FORMAT + NUMBERS + NMASK + FEATURES + BIOTYPES + HINTS
 
 
 #######################
@@ -126,127 +30,62 @@ def find_missing_tokens(config, tokens):
 
 
 class GeneTokenizer:
-    """Wrapper around HuggingFace tokenizer for GeneT5 models."""
-    
-    def __init__(self, tokenizer_path, trust_remote_code=True):
-        """
-        Load tokenizer from path.
-        
-        Args:
-            tokenizer_path: Path to tokenizer directory or tokenizer.json
-            trust_remote_code: Whether to trust remote code (default: True)
-        """
-        self.tokenizer_path = Path(tokenizer_path)
-        
-        # Try loading with AutoTokenizer first (handles most cases)
-        try:
-            self._tokenizer = AutoTokenizer.from_pretrained(
-                str(tokenizer_path), 
-                trust_remote_code=trust_remote_code
-            )
-        except Exception as e:
-            # Fallback: try loading tokenizer.json directly
-            config, _ = load_tokenizer_config(tokenizer_path)
-            self._vocab = self._extract_vocab(config)
-            self._tokenizer = None
-    
-    def _extract_vocab(self, config):
-        """Extract vocabulary from tokenizer config."""
-        vocab = {}
-        
-        # Get vocab from model section
-        if "model" in config and "vocab" in config["model"]:
-            model_vocab = config["model"]["vocab"]
-            if isinstance(model_vocab, dict):
-                vocab.update(model_vocab)
-            elif isinstance(model_vocab, list):
-                vocab = {token: i for i, token in enumerate(model_vocab)}
-        
-        # Add tokens from added_tokens section
-        if "added_tokens" in config:
-            for token_info in config["added_tokens"]:
-                if isinstance(token_info, dict):
-                    if "content" in token_info and "id" in token_info:
-                        vocab[token_info["content"]] = token_info["id"]
-                elif isinstance(token_info, str):
-                    if token_info not in vocab:
-                        vocab[token_info] = len(vocab)
-        
-        return vocab
-    
+    """Tokenizer for GeneT5 gene finder"""
+
+    def __init__(self, path):
+
+        self._tok = AutoTokenizer.from_pretrained(
+            str(path), trust_remote_code=True
+        )
+
+    @classmethod
+    def from_dnabert(cls, dnabert_path=DNABERT_PATH, save_dir=None):
+        """Build gene finder tokenizer from DNABERT-2 base"""
+
+        tok = AutoTokenizer.from_pretrained(dnabert_path, trust_remote_code=True)
+        base_size = len(tok)
+        tok.add_tokens(GFF_TOKENS)
+
+        print(f"Tokenizer: {base_size} base + {len(GFF_TOKENS)} GFF = {len(tok)}")
+
+        if save_dir:
+            Path(save_dir).mkdir(parents=True, exist_ok=True)
+            tok.save_pretrained(save_dir)
+
+        obj      = object.__new__(cls)
+        obj._tok = tok
+        return obj
+
     def __len__(self):
-        """Return vocabulary size."""
-        if self._tokenizer is not None:
-            return len(self._tokenizer)
-        return len(self._vocab)
-    
+        return len(self._tok)
+
     def __call__(self, text, **kwargs):
-        """Tokenize text."""
-        if self._tokenizer is not None:
-            return self._tokenizer(text, **kwargs)
-        raise NotImplementedError("Direct tokenization requires HuggingFace tokenizer")
-    
+        return self._tok(text, **kwargs)
+
     def encode(self, text, **kwargs):
-        """Encode text to token ids."""
-        if self._tokenizer is not None:
-            return self._tokenizer.encode(text, **kwargs)
-        raise NotImplementedError("Encoding requires HuggingFace tokenizer")
-    
+        return self._tok.encode(text, **kwargs)
+
     def decode(self, token_ids, **kwargs):
-        """Decode token ids to text."""
-        if self._tokenizer is not None:
-            return self._tokenizer.decode(token_ids, **kwargs)
-        raise NotImplementedError("Decoding requires HuggingFace tokenizer")
-    
+        return self._tok.decode(token_ids, **kwargs)
+
     @property
     def vocab_size(self):
-        """Return vocabulary size."""
         return len(self)
 
     @property
     def pad_token_id(self):
-        """Return pad token ID."""
-        if self._tokenizer is not None:
-            return self._tokenizer.pad_token_id
-        # Check common pad token formats
-        for token in ("[PAD]", "<PAD>", "<pad>"):
-            if token in self._vocab:
-                return self._vocab[token]
-        return 0
+        return self._tok.pad_token_id or 0
 
     @property
     def eos_token_id(self):
-        """Return end-of-sequence token ID."""
-
-        if self._tokenizer is not None:
-            return self._tokenizer.eos_token_id
-        # Prefer lowercase (canonical), then uppercase fallbacks
-        for token in ("<eos>", "<EOS>", "[EOS]", "</s>"):
-            if token in self._vocab:
-                return self._vocab[token]
-        return None
+        return self._tok.convert_tokens_to_ids("<eos>")
 
     @property
     def bos_token_id(self):
-        """Return beginning-of-sequence token ID."""
+        return self._tok.convert_tokens_to_ids("<bos>")
 
-        if self._tokenizer is not None:
-            return self._tokenizer.bos_token_id
-        # Prefer lowercase (canonical), then uppercase fallbacks
-        for token in ("<bos>", "<BOS>", "[BOS]", "<s>"):
-            if token in self._vocab:
-                return self._vocab[token]
-        return None
-    
     def get_vocab(self):
-        """Return vocabulary dictionary."""
-        if self._tokenizer is not None:
-            return self._tokenizer.get_vocab()
-        return self._vocab.copy()
-    
-    def save_pretrained(self, save_path):
-        """Save tokenizer to directory."""
-        if self._tokenizer is not None:
-            self._tokenizer.save_pretrained(save_path)
-        else:
-            raise NotImplementedError("Saving requires HuggingFace tokenizer")
+        return self._tok.get_vocab()
+
+    def save_pretrained(self, path):
+        self._tok.save_pretrained(path)

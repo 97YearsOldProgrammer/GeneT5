@@ -3,10 +3,11 @@ import torch.nn as nn
 import json
 import gc
 
-from transformers import AutoModel, AutoTokenizer, AutoConfig
+from transformers import AutoModel, AutoConfig
 from pathlib      import Path
 
-from lib.blocks import Encoder, Decoder, PerceiverCompressor, PerceiverConfig
+from lib.blocks    import Encoder, Decoder, PerceiverCompressor, PerceiverConfig
+from lib.tokenizer import GeneTokenizer
 
 
 #####################
@@ -57,7 +58,6 @@ def build_gt5(
     # Vocab
     vocab_size          = None,
     tie_weights         = True,
-    new_tokens_list     = None,
     # Perceiver
     num_latents         = 1024,
     perceiver_layers    = 2,
@@ -102,27 +102,17 @@ def build_gt5(
     print("=" * 60)
     print(f"\nInit std: {init_std}, embed: {init_embed_std}, ffn: {init_ffn_std}, attn: {init_attn_std}, router: {init_moe_router_std}")
     
-    # Load Pre-trained Model
-    print(f"\n[1] Loading DNABERT-2: {dnabert_model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(dnabert_model_name, trust_remote_code=True)
-    
-    # Expand Tokenizer
-    if new_tokens_list:
-        print(f"\n[1.5] Expanding Tokenizer: {len(tokenizer)} -> ", end="")
-        tokenizer.add_tokens(new_tokens_list)
-        print(f"{len(tokenizer)}")
-    
+    # Build tokenizer with hardcoded gene finder tokens
+    print(f"\n[1] Building tokenizer from DNABERT-2: {dnabert_model_name}")
+    tokenizer = GeneTokenizer.from_dnabert(dnabert_model_name, save_dir=save_dir)
+
     if vocab_size is None:
-        vocab_size = len(tokenizer)
+        vocab_size = tokenizer.vocab_size
     print(f"      vocab_size: {vocab_size}")
 
-    # Load config first and set pad_token_id (required by DNABERT-2 custom code)
-    dna_config              = AutoConfig.from_pretrained(dnabert_model_name, trust_remote_code=True)
-    dna_config.pad_token_id = tokenizer.pad_token_id
+    # Load DNABERT-2 config and raw weights (bypass model construction for NGC compat)
+    dna_config = AutoConfig.from_pretrained(dnabert_model_name, trust_remote_code=True)
 
-    original_model = AutoModel.from_pretrained(dnabert_model_name, config=dna_config, trust_remote_code=True)
-    
-    # Decoder defaults to encoder
     if decoder_num_layers is None:
         decoder_num_layers = dna_config.num_hidden_layers
     if decoder_num_heads is None:
@@ -131,122 +121,79 @@ def build_gt5(
         decoder_ff_dim = dna_config.intermediate_size
     if decoder_num_kv_heads is None:
         decoder_num_kv_heads = max(1, decoder_num_heads // 4)
-    
-    print(f"\n    DNABERT-2: hidden={dna_config.hidden_size}, layers={dna_config.num_hidden_layers}, heads={dna_config.num_attention_heads}")
+
+    embed_dim  = dna_config.hidden_size
+    num_layers = dna_config.num_hidden_layers
+    num_heads  = dna_config.num_attention_heads
+    ff_dim     = dna_config.intermediate_size
+
+    print(f"\n    DNABERT-2: hidden={embed_dim}, layers={num_layers}, heads={num_heads}")
     print(f"    Decoder:   layers={decoder_num_layers}, heads={decoder_num_heads}, kv_heads={decoder_num_kv_heads}, moe={decoder_use_moe}")
     print(f"    Encoder: window={encoder_window_size}")
     print(f"    Decoder Sparse: block={decoder_block_size}, window={decoder_window_size}")
-    # Get BERT backbone
-    bert = original_model.bert if hasattr(original_model, 'bert') else original_model
-    
+
+    # Load raw state dict (no model construction needed)
+    print(f"\n[2] Loading DNABERT-2 weights")
+    from huggingface_hub import hf_hub_download
+    weight_path = hf_hub_download(dnabert_model_name, "pytorch_model.bin")
+    sd = torch.load(weight_path, map_location="cpu", weights_only=False)
+    print(f"    ✓ {len(sd)} tensors loaded")
+
     # Extract Encoder Embedding
-    print("\n[2] Extracting Encoder Embedding")
-    encoder_embed = nn.Embedding(vocab_size, dna_config.hidden_size)
-    
-    if hasattr(bert, 'embeddings') and hasattr(bert.embeddings, 'word_embeddings'):
-        orig_embed = bert.embeddings.word_embeddings.weight.data
-        copy_size  = min(orig_embed.shape[0], vocab_size)
-        encoder_embed.weight.data[:copy_size].copy_(orig_embed[:copy_size])
-        if vocab_size > orig_embed.shape[0]:
-            nn.init.normal_(encoder_embed.weight.data[orig_embed.shape[0]:], mean=0.0, std=init_embed_std)
-        print(f"    ✓ Copied {copy_size} embeddings")
-    else:
-        nn.init.normal_(encoder_embed.weight, mean=0.0, std=init_embed_std)
-        print(f"    ! Random init")
-    
-    # Build Encoder (sliding window attention via FlexAttention)
-    print(f"\n[3] Building Encoder")
+    print(f"\n[3] Extracting Encoder Embedding")
+    encoder_embed = nn.Embedding(vocab_size, embed_dim)
+    orig_embed    = sd["bert.embeddings.word_embeddings.weight"]
+    copy_size     = min(orig_embed.shape[0], vocab_size)
+    encoder_embed.weight.data[:copy_size].copy_(orig_embed[:copy_size])
+    if vocab_size > orig_embed.shape[0]:
+        nn.init.normal_(encoder_embed.weight.data[orig_embed.shape[0]:], mean=0.0, std=init_embed_std)
+    print(f"    ✓ Copied {copy_size}, random init {max(0, vocab_size - copy_size)} new")
+
+    # Build Encoder
+    print(f"\n[4] Building Encoder")
     encoder = Encoder(
-        num_layers   = dna_config.num_hidden_layers,
-        embed_dim    = dna_config.hidden_size,
-        num_heads    = dna_config.num_attention_heads,
-        ff_dim       = dna_config.intermediate_size,
+        num_layers   = num_layers,
+        embed_dim    = embed_dim,
+        num_heads    = num_heads,
+        ff_dim       = ff_dim,
         dropout      = dna_config.hidden_dropout_prob,
         attn_dropout = dna_config.attention_probs_dropout_prob,
         use_alibi    = True,
         window_size  = encoder_window_size,
     )
-    
-    # Transfer Encoder Weights
-    print("\n[4] Transferring Encoder Weights")
-    original_layers = bert.encoder.layer
-    
-    for idx, (orig, new) in enumerate(zip(original_layers, encoder.layers)):
-        orig_attn = orig.attention.self
-        new_attn  = new.self_attn
-        
-        # Q/K/V weights
-        if hasattr(orig_attn, 'Wqkv'):
-            Wqkv = orig_attn.Wqkv.weight.data
-            q_weight, k_weight, v_weight = Wqkv.chunk(3, dim=0)
-            new_attn.q.weight.data.copy_(q_weight)
-            new_attn.k.weight.data.copy_(k_weight)
-            new_attn.v.weight.data.copy_(v_weight)
-            if orig_attn.Wqkv.bias is not None:
-                q_bias, k_bias, v_bias = orig_attn.Wqkv.bias.data.chunk(3, dim=0)
-                if hasattr(new_attn.q, 'bias') and new_attn.q.bias is not None:
-                    new_attn.q.bias.data.copy_(q_bias)
-                    new_attn.k.bias.data.copy_(k_bias)
-                    new_attn.v.bias.data.copy_(v_bias)
-        else:
-            new_attn.q.weight.data.copy_(orig_attn.query.weight.data)
-            new_attn.k.weight.data.copy_(orig_attn.key.weight.data)
-            new_attn.v.weight.data.copy_(orig_attn.value.weight.data)
-        
-        new_attn.o.weight.data.copy_(orig.attention.output.dense.weight.data)
-        new.norm1.weight.data.copy_(orig.attention.output.LayerNorm.weight.data)
-        
-        # FFN weights
-        if hasattr(orig, 'mlp'):
-            mlp = orig.mlp
-            if hasattr(mlp, 'gated_layers') and hasattr(mlp, 'wo'):
-                gated_weight = mlp.gated_layers.weight.data
-                gate_weight, up_weight = gated_weight.chunk(2, dim=0)
-                new.ff.wi_0.weight.data.copy_(gate_weight)
-                new.ff.wi_1.weight.data.copy_(up_weight)
-                new.ff.wo.weight.data.copy_(mlp.wo.weight.data)
-                if hasattr(mlp, 'layernorm'):
-                    new.norm2.weight.data.copy_(mlp.layernorm.weight.data)
-                else:
-                    nn.init.ones_(new.norm2.weight)
-            elif hasattr(mlp, 'fc1') and hasattr(mlp, 'fc2'):
-                fc1_weight = mlp.fc1.weight.data
-                fc2_weight = mlp.fc2.weight.data
-                if fc1_weight.shape[0] == 2 * fc2_weight.shape[1]:
-                    gate_weight, up_weight = fc1_weight.chunk(2, dim=0)
-                    new.ff.wi_0.weight.data.copy_(gate_weight)
-                    new.ff.wi_1.weight.data.copy_(up_weight)
-                else:
-                    new.ff.wi_0.weight.data.copy_(fc1_weight)
-                    new.ff.wi_1.weight.data.copy_(fc1_weight)
-                new.ff.wo.weight.data.copy_(fc2_weight)
-                nn.init.ones_(new.norm2.weight)
-            else:
-                nn.init.normal_(new.ff.wi_0.weight, mean=0.0, std=init_ffn_std)
-                nn.init.normal_(new.ff.wi_1.weight, mean=0.0, std=init_ffn_std)
-                nn.init.normal_(new.ff.wo.weight, mean=0.0, std=init_ffn_std)
-                nn.init.ones_(new.norm2.weight)
-        else:
-            new.ff.wi_0.weight.data.copy_(orig.intermediate.dense.weight.data)
-            new.ff.wi_1.weight.data.copy_(orig.intermediate.dense.weight.data)
-            new.ff.wo.weight.data.copy_(orig.output.dense.weight.data)
-            new.norm2.weight.data.copy_(orig.output.LayerNorm.weight.data)
-    
-    # Final encoder norm
-    if hasattr(bert.encoder, 'LayerNorm'):
-        encoder.final_norm.weight.data.copy_(bert.encoder.LayerNorm.weight.data)
-    elif hasattr(bert, 'LayerNorm'):
-        encoder.final_norm.weight.data.copy_(bert.LayerNorm.weight.data)
-    else:
-        nn.init.ones_(encoder.final_norm.weight)
-    
-    print("    ✓ Done")
-    
-    # Free DNABERT memory
-    del original_model, bert, original_layers
+
+    # Transfer Encoder Weights from raw state dict
+    print(f"\n[5] Transferring Encoder Weights")
+    for idx in range(num_layers):
+        layer  = encoder.layers[idx]
+        prefix = f"bert.encoder.layer.{idx}"
+
+        # Q/K/V from fused Wqkv
+        Wqkv = sd[f"{prefix}.attention.self.Wqkv.weight"]
+        q_w, k_w, v_w = Wqkv.chunk(3, dim=0)
+        layer.self_attn.q.weight.data.copy_(q_w)
+        layer.self_attn.k.weight.data.copy_(k_w)
+        layer.self_attn.v.weight.data.copy_(v_w)
+
+        # Output projection
+        layer.self_attn.o.weight.data.copy_(sd[f"{prefix}.attention.output.dense.weight"])
+
+        # Post-attention LayerNorm
+        layer.norm1.weight.data.copy_(sd[f"{prefix}.attention.output.LayerNorm.weight"])
+
+        # FFN: gated_layers = [gate; up] fused, wo = down
+        gated = sd[f"{prefix}.mlp.gated_layers.weight"]
+        gate_w, up_w = gated.chunk(2, dim=0)
+        layer.ff.wi_0.weight.data.copy_(gate_w)
+        layer.ff.wi_1.weight.data.copy_(up_w)
+        layer.ff.wo.weight.data.copy_(sd[f"{prefix}.mlp.wo.weight"])
+        layer.norm2.weight.data.copy_(sd[f"{prefix}.mlp.layernorm.weight"])
+
+    nn.init.ones_(encoder.final_norm.weight)
+    print(f"    ✓ {num_layers} layers transferred")
+
+    del sd
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
     
     # Build Perceiver Compressor
     print(f"\n[5] Building Perceiver Compressor (latents={num_latents}, layers={perceiver_layers})")
@@ -373,7 +320,6 @@ def build_gt5(
         "lm_head":       lm_head.state_dict()
     }
     torch.save(checkpoint, save_path / "pytorch_model.bin")
-    tokenizer.save_pretrained(save_path)
     
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
