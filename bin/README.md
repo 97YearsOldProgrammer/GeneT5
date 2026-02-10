@@ -131,10 +131,7 @@ Uses `torchrun` + NCCL over ConnectX-7 RoCE
 
 **Master** (spark-1089, 192.168.100.10)
 ```bash
-bin/distributed.sh ../baked/w20k/train.bin ../baked/w20k/val.bin \
-    ../model/exp_20260209 ../model/base \
-    --worker 192.168.100.11 \
-    --epochs 10 --lr 1e-4 --batch_size 4
+bash bin/sft.sh ../baked/GeneT5/w20k_ts51_v2/training.bin ../baked/GeneT5/w20k_ts51_v2/validation.bin ../model/GeneT5/feb10_run1/ ../model/GeneT5/ --worker 192.168.100.11 --label_smoothing 0.1 --num_workers 3 --batch_size 8 --epochs 4 --save_steps 2000 --optim_8bit --empty_cache_steps 500 --memwatch
 ```
 
 **RoCE Verification** (before distributed run)

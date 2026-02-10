@@ -390,9 +390,6 @@ def main():
             dist_sampler.set_epoch(epoch)
         if val_dist_sampler:
             val_dist_sampler.set_epoch(epoch)
-        if train_sampler and hasattr(train_sampler, 'set_epoch'):
-            train_sampler.set_epoch(epoch)
-
         train_dataset.set_epoch(epoch)
 
         # train epoch

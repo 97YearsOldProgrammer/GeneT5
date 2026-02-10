@@ -24,12 +24,22 @@ WORKER_IP=""
 WORKER_USER="cg666"
 CONTAINER="gt5"
 
-# Detect ConnectX-7 P2P interface
+# Detect ConnectX-7 P2P interface (must be up AND have an IP)
 CX7_IF=""
+CX7_HCA=""
 for iface in enP2p1s0f1np1 enP2p1s0f0np0 enp1s0f1np1 enp1s0f0np0; do
     if [ -d "/sys/class/net/$iface" ] && [ "$(cat /sys/class/net/$iface/operstate 2>/dev/null)" = "up" ]; then
-        CX7_IF="$iface"
-        break
+        HAS_IP=$(python3 -c "
+import socket,struct,fcntl; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+try: print(socket.inet_ntoa(fcntl.ioctl(s.fileno(),0x8915,struct.pack('256s',b'$iface'))[20:24]))
+except: pass" 2>/dev/null)
+        if [ -n "$HAS_IP" ]; then
+            CX7_IF="$iface"
+            # Derive HCA name: enP2p1s0f1np1 -> roceP2p1s0f1
+            local_tmp="${iface#en}"
+            CX7_HCA="roce${local_tmp%np*}"
+            break
+        fi
     fi
 done
 
@@ -122,15 +132,15 @@ fi
 
 # ── Auto-detect master IP when using --worker ──
 if [[ -n "$WORKER_IP" && "$MASTER_ADDR" == "localhost" ]]; then
-    # Try to get our IP on the P2P interface
-    for iface in enp1s0f1np1 enP2p1s0f1np1 enp1s0f0np0 enP7s7; do
-        DETECTED_IP=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP 'inet \K[^/]+' || true)
-        if [[ -n "$DETECTED_IP" ]]; then
-            MASTER_ADDR="$DETECTED_IP"
+    # Find our IP on the same subnet as the worker (for rendezvous)
+    WORKER_SUBNET=$(echo "$WORKER_IP" | grep -oP '^\d+\.\d+\.\d+\.')
+    for ip in $(hostname -I 2>/dev/null); do
+        if [[ "$ip" == ${WORKER_SUBNET}* ]]; then
+            MASTER_ADDR="$ip"
             break
         fi
     done
-    # Fallback to hostname
+    # Fallback to first IP
     if [[ "$MASTER_ADDR" == "localhost" ]]; then
         MASTER_ADDR=$(hostname -I 2>/dev/null | awk '{print $1}')
     fi
@@ -144,7 +154,7 @@ fi
 
 NCCL_ENVS=(
     "NCCL_DEBUG=INFO"
-    "NCCL_IB_HCA=roceP2p1s0f1"
+    "NCCL_IB_HCA=${CX7_HCA:-roceP2p1s0f1}"
     "NCCL_IB_TIMEOUT=22"
     "NCCL_IB_RETRY_CNT=7"
     "NCCL_IB_MERGE_NICS=0"
@@ -234,18 +244,51 @@ if [[ -n "$WORKER_IP" ]]; then
         done
     fi
 
-    # Build env string for docker exec
+    # Build env string for docker exec (skip per-node vars — worker detects its own)
     ENV_STR=""
     for env in "${NCCL_ENVS[@]}"; do
-        ENV_STR+="export $env; "
+        case "$env" in
+            NCCL_SOCKET_IFNAME=*|GLOO_SOCKET_IFNAME=*|NCCL_IB_HCA=*) ;;
+            *) ENV_STR+="export $env; " ;;
+        esac
     done
     ENV_STR+="export BNB_CUDA_VERSION=130; "
     ENV_STR+="export PYTHONPATH=/workspace/GeneT5; "
+    # Worker detects its own CX7 interface + HCA (may differ from master)
+    ENV_STR+="for iface in enP2p1s0f1np1 enP2p1s0f0np0 enp1s0f1np1 enp1s0f0np0; do "
+    ENV_STR+="  if [ -d /sys/class/net/\$iface ] && python3 -c \"import socket,struct,fcntl;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);socket.inet_ntoa(fcntl.ioctl(s.fileno(),0x8915,struct.pack('256s',b'\$iface'))[20:24])\" 2>/dev/null; then "
+    ENV_STR+="    export NCCL_SOCKET_IFNAME=\$iface; export GLOO_SOCKET_IFNAME=\$iface; "
+    ENV_STR+="    tmp=\${iface#en}; export NCCL_IB_HCA=roce\${tmp%np*}; break; "
+    ENV_STR+="  fi; "
+    ENV_STR+="done; "
     ENV_STR+="cd /workspace/GeneT5; "
 
     WORKER_CMD="${ENV_STR}$(build_torchrun_cmd 1)"
 
-    # Launch worker via SSH
+    MASTER_PID=""
+    WORKER_PID=""
+
+    # Kill both sides on exit, Ctrl+C, or if either side dies
+    kill_remote_torchrun() {
+        ssh -F /dev/null -o StrictHostKeyChecking=no \
+            -o IdentityFile=~/.ssh/id_ed25519_spark -o IdentitiesOnly=yes \
+            "${WORKER_USER}@${WORKER_IP}" \
+            "docker exec ${CONTAINER} pkill -f 'torchrun.*finet'" 2>/dev/null || true
+    }
+
+    cleanup() {
+        trap - EXIT INT TERM
+        echo ""
+        echo "[cleanup] Shutting down both nodes..."
+        [ -n "$MASTER_PID" ] && kill $MASTER_PID 2>/dev/null
+        [ -n "$WORKER_PID" ] && kill $WORKER_PID 2>/dev/null
+        kill_remote_torchrun
+        wait $MASTER_PID 2>/dev/null
+        wait $WORKER_PID 2>/dev/null
+    }
+    trap cleanup EXIT INT TERM
+
+    # Launch worker via SSH (background)
     echo ""
     echo "[worker] Launching on ${WORKER_IP}..."
     ssh -F /dev/null -o StrictHostKeyChecking=no -o IdentityFile=~/.ssh/id_ed25519_spark -o IdentitiesOnly=yes "${WORKER_USER}@${WORKER_IP}" \
@@ -257,15 +300,35 @@ if [[ -n "$WORKER_IP" ]]; then
     # Give worker a head start to open the rendezvous port listener
     sleep 3
 
-    # Launch master locally
+    # Launch master locally (background)
     echo "[master] Launching locally..."
     echo ""
-    eval "$(build_torchrun_cmd 0)"
-    MASTER_EXIT=$?
+    eval "$(build_torchrun_cmd 0)" &
+    MASTER_PID=$!
 
-    # Wait for worker
-    wait $WORKER_PID || true
-    WORKER_EXIT=$?
+    # Wait for first process to finish
+    MASTER_EXIT=0
+    WORKER_EXIT=0
+    wait -n $MASTER_PID $WORKER_PID 2>/dev/null || true
+
+    # Determine which finished and kill the other
+    if ! kill -0 $MASTER_PID 2>/dev/null; then
+        wait $MASTER_PID 2>/dev/null; MASTER_EXIT=$?
+        echo ""
+        echo "[master] Exited (code=$MASTER_EXIT), stopping worker..."
+        kill $WORKER_PID 2>/dev/null
+        kill_remote_torchrun
+        wait $WORKER_PID 2>/dev/null; WORKER_EXIT=$?
+    elif ! kill -0 $WORKER_PID 2>/dev/null; then
+        wait $WORKER_PID 2>/dev/null; WORKER_EXIT=$?
+        echo ""
+        echo "[worker] Exited (code=$WORKER_EXIT), stopping master..."
+        kill $MASTER_PID 2>/dev/null
+        wait $MASTER_PID 2>/dev/null; MASTER_EXIT=$?
+    fi
+
+    # Disable trap — we already cleaned up
+    trap - EXIT INT TERM
 
     echo ""
     echo "========================================"
