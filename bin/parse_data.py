@@ -1,6 +1,7 @@
 import argparse
 import pathlib
 import multiprocessing
+import json
 
 import lib.dataset as ds
 
@@ -23,12 +24,8 @@ parser.add_argument('--hint_ratio', required=False, type=float, default=0.5,
     metavar='<float>', help='hint augmentation ratio [%(default).2f]')
 parser.add_argument('--seed', required=False, type=int, default=42,
     metavar='<int>', help='random seed [%(default)i]')
-parser.add_argument('--num_complex', required=False, type=int, default=5,
-    metavar='<int>', help='number of complex genes for validation [%(default)i]')
-parser.add_argument('--num_normal', required=False, type=int, default=5,
-    metavar='<int>', help='number of mean-complexity genes [%(default)i]')
-parser.add_argument('--num_easy', required=False, type=int, default=5,
-    metavar='<int>', help='number of easy genes [%(default)i]')
+parser.add_argument('--val_ratio', required=False, type=float, default=0.05,
+    metavar='<float>', help='validation split ratio [%(default).2f]')
 parser.add_argument('--n_workers', required=False, type=int, default=None,
     metavar='<int>', help='parallel workers [auto]')
 parser.add_argument('--tokenizer', required=False, type=str, default=None,
@@ -60,41 +57,16 @@ print(f"  Genes:     {len(gene_index)}")
 if args.canonical_only:
     print(f"  Mode:      canonical only (one transcript per gene)")
 
-# Build validation set
-print(f"\n{' Building Validation Set ':=^60}")
-
-validation = ds.build_validation_set(
-    gene_index,
-    args.num_complex,
-    args.num_normal,
-    args.num_easy,
-    args.seed,
-    args.limit,
-)
-
-print(f"  Validation genes:     {len(validation['all_ids'])}")
-print(f"  Validation scenarios: {len(validation['scenarios'])}")
-
-existing_val_ids = set()
-
-# Build training chunks
+# Sliding window chunking on ALL genes
 print(f"\n{' Sliding Window Chunking ':=^60}")
 
 print(f"  Window size:   {args.limit/1000:.1f} kb")
 print(f"  Overlap ratio: {args.overlap_ratio:.4f} (1/e)")
 print(f"  Max N ratio:   {args.max_n_ratio*100:.0f}%")
 
-all_validation_ids = validation['all_ids'] | existing_val_ids
-train_gene_index   = {
-    gid: gdata for gid, gdata in gene_index.items()
-    if gid not in all_validation_ids
-}
-
-print(f"  Training genes: {len(train_gene_index)}")
-
-train_chunks, chunk_stats = ds.sliding_window_chunking(
+all_raw_chunks, chunk_stats = ds.sliding_window_chunking(
     sequences,
-    train_gene_index,
+    gene_index,
     window_size   = args.limit,
     overlap_ratio = args.overlap_ratio,
     max_n_ratio   = args.max_n_ratio,
@@ -113,12 +85,21 @@ if chunk_stats['features_per_chunk']:
 # Augment with hints (parallel)
 print(f"\n{' Hint Augmentation (Parallel) ':=^60}")
 
-all_chunks = ds.augment_with_hints(train_chunks, args.hint_ratio, args.seed, n_workers)
+all_chunks = ds.augment_with_hints(all_raw_chunks, args.hint_ratio, args.seed, n_workers)
 
 raw_count = sum(1 for c in all_chunks if not c.is_augmented)
 aug_count = sum(1 for c in all_chunks if c.is_augmented)
 print(f"  Raw chunks:       {raw_count}")
 print(f"  Augmented chunks: {aug_count}")
+
+# Split into train and validation
+print(f"\n{' Validation Split ':=^60}")
+
+train_chunks, val_chunks = ds.split_validation(all_chunks, args.val_ratio, args.seed)
+
+print(f"  Val ratio:    {args.val_ratio:.2f}")
+print(f"  Train chunks: {len(train_chunks)}")
+print(f"  Val chunks:   {len(val_chunks)}")
 
 # Tokenize if tokenizer provided
 tokenizer = None
@@ -128,29 +109,30 @@ if args.tokenizer:
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
     print(f"  Vocab size: {len(tokenizer)}")
 
-    batch_size   = 1000
-    total_chunks = len(all_chunks)
+    for label, chunks in [("train", train_chunks), ("val", val_chunks)]:
+        batch_size   = 1000
+        total_chunks = len(chunks)
 
-    for batch_start in range(0, total_chunks, batch_size):
-        batch_end    = min(batch_start + batch_size, total_chunks)
-        batch_chunks = all_chunks[batch_start:batch_end]
+        for batch_start in range(0, total_chunks, batch_size):
+            batch_end    = min(batch_start + batch_size, total_chunks)
+            batch        = chunks[batch_start:batch_end]
 
-        input_texts  = [c.get_input_text() for c in batch_chunks]
-        target_texts = [c.get_target_text() for c in batch_chunks]
+            input_texts  = [c.get_input_text() for c in batch]
+            target_texts = [c.get_target_text() for c in batch]
 
-        input_enc  = tokenizer(input_texts, add_special_tokens=False)
-        target_enc = tokenizer(target_texts, add_special_tokens=False)
+            input_enc  = tokenizer(input_texts, add_special_tokens=False)
+            target_enc = tokenizer(target_texts, add_special_tokens=False)
 
-        for i, chunk in enumerate(batch_chunks):
-            chunk.input_ids  = input_enc['input_ids'][i]
-            chunk.target_ids = target_enc['input_ids'][i]
-            chunk.input_len  = len(chunk.input_ids)
-            chunk.target_len = len(chunk.target_ids)
+            for i, chunk in enumerate(batch):
+                chunk.input_ids  = input_enc['input_ids'][i]
+                chunk.target_ids = target_enc['input_ids'][i]
+                chunk.input_len  = len(chunk.input_ids)
+                chunk.target_len = len(chunk.target_ids)
 
-        pct = 100 * batch_end / total_chunks
-        print(f"    Tokenized: {batch_end:,}/{total_chunks:,} ({pct:.1f}%)", end='\r')
+            pct = 100 * batch_end / total_chunks
+            print(f"    {label}: {batch_end:,}/{total_chunks:,} ({pct:.1f}%)", end='\r')
 
-    print(f"    Tokenized: {total_chunks:,}/{total_chunks:,} (100.0%)")
+        print(f"    {label}: {total_chunks:,}/{total_chunks:,} (100.0%)")
 
 # Write outputs
 output_dir = pathlib.Path(args.output_dir)
@@ -160,58 +142,9 @@ print(f"\n{' Writing Outputs ':=^60}")
 
 # Write training
 train_path = output_dir / 'training.bin'
-ds.write_binary(all_chunks, train_path, compress=args.compress)
+ds.write_binary(train_chunks, train_path, compress=args.compress)
 train_size = train_path.stat().st_size
 print(f"  Training:   {train_path} ({ds.format_size(train_size)})")
-
-# Build validation chunks
-val_sequences = sequences
-
-val_chunks = []
-for scenario in validation.get('scenarios', []):
-    gene_id  = scenario.get('gene_id', 'unknown')
-    start    = scenario.get('start', 0)
-    end      = scenario.get('end', 0)
-    strand   = scenario.get('strand', '+')
-    feats    = scenario.get('features', [])
-    hints    = scenario.get('hints', [])
-    stype    = scenario.get('scenario_type', 'unknown')
-
-    seq = ''
-    for seqid, full_seq in val_sequences.items():
-        if start < len(full_seq) and end <= len(full_seq):
-            seq = full_seq[start:end]
-            break
-
-    chunk = ds.BinaryChunk(
-        seqid        = gene_id,
-        start        = start,
-        end          = end,
-        strand       = strand,
-        sequence     = seq,
-        features     = feats,
-        biotype      = stype,
-        gene_ids     = [gene_id],
-        has_hints    = len(hints) > 0,
-        hints        = hints,
-        chunk_index  = 0,
-        is_augmented = False,
-    )
-    val_chunks.append(chunk)
-
-# Batch tokenize validation chunks
-if tokenizer and val_chunks:
-    input_texts  = [c.get_input_text() for c in val_chunks]
-    target_texts = [c.get_target_text() for c in val_chunks]
-
-    input_enc  = tokenizer(input_texts, add_special_tokens=False)
-    target_enc = tokenizer(target_texts, add_special_tokens=False)
-
-    for i, chunk in enumerate(val_chunks):
-        chunk.input_ids  = input_enc['input_ids'][i]
-        chunk.target_ids = target_enc['input_ids'][i]
-        chunk.input_len  = len(chunk.input_ids)
-        chunk.target_len = len(chunk.target_ids)
 
 # Write validation
 val_path = output_dir / 'validation.bin'
@@ -219,33 +152,23 @@ ds.write_binary(val_chunks, val_path, compress=args.compress)
 val_size = val_path.stat().st_size
 print(f"  Validation: {val_path} ({ds.format_size(val_size)})")
 
-# Write validation metadata
-val_meta_path = output_dir / 'validation.json'
-ds.save_validation_set(validation, val_meta_path)
-
 # Print stats
 run_stats = {
     'raw_count':     raw_count,
     'aug_count':     aug_count,
-    'total_samples': len(all_chunks),
+    'total_samples': len(train_chunks),
     'file_size':     train_size,
 }
 
-ds.print_run_stats(run_stats, chunk_stats, validation, train_path)
+ds.print_run_stats(run_stats, chunk_stats, len(val_chunks), train_path)
 
 # Write stats JSON for aggregation
-import json
 stats_path = output_dir / 'stats.json'
 stats_json = {
     'run_stats':   run_stats,
     'chunk_stats': {k: v for k, v in chunk_stats.items() if k != 'features_per_chunk'},
-    'validation': {
-        'complex_loci':  len(validation.get('complex_loci', [])),
-        'normal_genes':  len(validation.get('normal_genes', [])),
-        'easy_samples':  len(validation.get('easy_samples', [])),
-        'all_ids':       len(validation.get('all_ids', [])),
-        'scenarios':     len(validation.get('scenarios', [])),
-    },
+    'val_chunks':  len(val_chunks),
+    'val_ratio':   args.val_ratio,
 }
 with open(stats_path, 'w') as f:
     json.dump(stats_json, f, indent=2)

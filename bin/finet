@@ -97,7 +97,7 @@ def main():
     parser.add_argument('--mxfp8', action='store_true',
         help='apply MXFP8 quantization to dense Linear layers (Blackwell only)')
     parser.add_argument('--compile', action='store_true',
-        help='enable torch.compile on encoder, compressor, decoder')
+        help='enable torch.compile on encoder and decoder')
 
     args = parser.parse_args()
 
@@ -147,11 +147,10 @@ def main():
         if is_main:
             print("\nCompiling model regions...")
         compile_opts = {"mode": "default", "dynamic": None}
-        model.encoder    = torch.compile(model.encoder,    **compile_opts)
-        model.compressor = torch.compile(model.compressor, **compile_opts)
-        model.decoder    = torch.compile(model.decoder,    **compile_opts)
+        model.encoder = torch.compile(model.encoder, **compile_opts)
+        model.decoder = torch.compile(model.decoder, **compile_opts)
         if is_main:
-            print("  Compiled: encoder, compressor, decoder")
+            print("  Compiled: encoder, decoder")
             print("  First ~3 batches will be slow (compilation warmup)")
 
     model = train_util.wrap_model_distributed(model, device,
@@ -518,7 +517,6 @@ def main():
                         encoder_input_ids      = batch['input_ids'],
                         decoder_input_ids      = decoder_input_ids,
                         labels                 = labels if loss_fct is None else None,
-                        encoder_attention_mask = batch.get('attention_mask'),
                         decoder_attention_mask = decoder_attention_mask,
                     )
 
@@ -615,7 +613,6 @@ def main():
                         encoder_input_ids      = batch['input_ids'],
                         decoder_input_ids      = decoder_input_ids,
                         labels                 = labels,
-                        encoder_attention_mask = batch.get('attention_mask'),
                         decoder_attention_mask = decoder_attention_mask,
                     )
 

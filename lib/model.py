@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import json
 
 from pathlib    import Path
-from lib.blocks import Encoder, Decoder, PerceiverCompressor, PerceiverConfig
+from lib.blocks import Encoder, Decoder
 
 from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
 
@@ -31,8 +31,6 @@ class GeneT5(nn.Module):
         encoder_window_size  = 512,
         decoder_block_size   = 256,
         decoder_window_size  = 32,
-        num_latents          = 1024,
-        perceiver_layers     = 2,
     ):
         super().__init__()
 
@@ -62,18 +60,6 @@ class GeneT5(nn.Module):
             window_size  = encoder_window_size,
         )
 
-        # Perceiver compressor (encoder → latents)
-        self.compressor = PerceiverCompressor(PerceiverConfig(
-            embed_dim              = embed_dim,
-            num_latents            = num_latents,
-            num_heads              = encoder_num_heads,
-            num_kv_heads           = max(1, encoder_num_heads // 4),
-            num_layers             = perceiver_layers,
-            ff_dim                 = encoder_ff_dim,
-            dropout                = decoder_dropout,
-            gradient_checkpointing = True,
-        ))
-
         # Decoder
         self.decoder = Decoder(
             num_layers   = decoder_num_layers,
@@ -102,24 +88,20 @@ class GeneT5(nn.Module):
         if tie_weights:
             self.lm_head.weight = self.decoder_embed.weight
 
-    def encode(self, encoder_input_ids, encoder_attention_mask=None):
-        """Encode and compress input sequence via perceiver"""
+    def encode(self, encoder_input_ids):
+        """Encode input sequence"""
 
         encoder_embeds = self.encoder_embed(encoder_input_ids)
         encoder_embeds = self.encoder_embed_dropout(encoder_embeds)
-        encoder_hidden = self.encoder(encoder_embeds, attention_mask=encoder_attention_mask)
+        encoder_hidden = self.encoder(encoder_embeds)
 
-        # Compress: [B, N, D] → [B, num_latents, D]
-        compressed = self.compressor(encoder_hidden, encoder_mask=encoder_attention_mask)
-
-        return compressed
+        return encoder_hidden
 
     def forward(
         self,
         encoder_input_ids,
         decoder_input_ids,
         labels                 = None,
-        encoder_attention_mask = None,
         decoder_attention_mask = None,
         encoder_hidden_states  = None,
         past_key_values        = None,
@@ -127,9 +109,7 @@ class GeneT5(nn.Module):
     ):
         # Encode (or use cached encoder output)
         if encoder_hidden_states is None:
-            encoder_hidden_states = self.encode(
-                encoder_input_ids, encoder_attention_mask
-            )
+            encoder_hidden_states = self.encode(encoder_input_ids)
 
         # Create decoder attention mask from padding if not provided
         if decoder_attention_mask is None and decoder_input_ids is not None:
@@ -145,8 +125,7 @@ class GeneT5(nn.Module):
         decoder_embeds = self.decoder_embed(decoder_input_ids_safe)
         decoder_embeds = self.decoder_embed_dropout(decoder_embeds)
 
-        # Decode with cross-attention to compressed latents
-        # No encoder_attention_mask needed: all latents are valid (no padding)
+        # Decode with cross-attention to encoder output
         decoder_output, moe_loss = self.decoder(
             hidden_states          = decoder_embeds,
             encoder_hidden_states  = encoder_hidden_states,
@@ -181,22 +160,21 @@ class GeneT5(nn.Module):
     def generate(
         self,
         encoder_input_ids,
-        encoder_attention_mask = None,
-        max_length             = 100,
-        temperature            = 1.0,
-        top_k                  = 50,
-        top_p                  = 0.9,
-        bos_token_id           = 1,
-        eos_token_id           = 2,
-        pad_token_id           = 0
+        max_length   = 100,
+        temperature  = 1.0,
+        top_k        = 50,
+        top_p        = 0.9,
+        bos_token_id = 1,
+        eos_token_id = 2,
+        pad_token_id = 0
     ):
         """Autoregressive generation"""
 
-        self.eval()
+        self.train(False)
         device = encoder_input_ids.device
         batch  = encoder_input_ids.size(0)
 
-        encoder_hidden = self.encode(encoder_input_ids, encoder_attention_mask)
+        encoder_hidden = self.encode(encoder_input_ids)
 
         # Start with BOS
         generated = torch.full((batch, 1), bos_token_id, dtype=torch.long, device=device)
@@ -204,10 +182,9 @@ class GeneT5(nn.Module):
 
         for _ in range(max_length):
             outputs = self.forward(
-                encoder_input_ids      = None,
-                decoder_input_ids      = generated,
-                encoder_hidden_states  = encoder_hidden,
-                encoder_attention_mask = None,
+                encoder_input_ids     = None,
+                decoder_input_ids     = generated,
+                encoder_hidden_states = encoder_hidden,
             )
 
             logits = outputs["logits"][:, -1, :]
@@ -249,7 +226,6 @@ class GeneT5(nn.Module):
         enc_emb_train = sum(p.numel() for p in self.encoder_embed.parameters() if p.requires_grad)
         enc_train     = sum(p.numel() for p in self.encoder.parameters() if p.requires_grad)
         enc_frozen    = sum(p.numel() for p in self.encoder.parameters() if not p.requires_grad)
-        comp_train    = sum(p.numel() for p in self.compressor.parameters() if p.requires_grad)
         dec_train     = sum(p.numel() for p in self.decoder.parameters() if p.requires_grad)
         emb_train     = sum(p.numel() for p in self.decoder_embed.parameters() if p.requires_grad)
         head_train    = sum(p.numel() for p in self.lm_head.parameters() if p.requires_grad)
@@ -258,11 +234,10 @@ class GeneT5(nn.Module):
             "encoder_embed_trainable": enc_emb_train,
             "encoder_trainable":       enc_train,
             "encoder_frozen":          enc_frozen,
-            "compressor_trainable":    comp_train,
             "decoder_trainable":       dec_train,
             "embed_trainable":         emb_train,
             "head_trainable":          head_train,
-            "total_trainable":         enc_emb_train + enc_train + comp_train + dec_train + emb_train + head_train,
+            "total_trainable":         enc_emb_train + enc_train + dec_train + emb_train + head_train,
             "total_frozen":            enc_frozen
         }
 
@@ -286,7 +261,6 @@ class GeneT5(nn.Module):
         ckpt = {
             "encoder_embed": self.encoder_embed.state_dict(),
             "encoder":       self.encoder.state_dict(),
-            "compressor":    self.compressor.state_dict(),
             "decoder":       self.decoder.state_dict(),
             "decoder_embed": self.decoder_embed.state_dict(),
             "lm_head":       self.lm_head.state_dict()
@@ -302,7 +276,7 @@ class GeneT5(nn.Module):
             self.encoder_embed.load_state_dict(ckpt["encoder_embed"], strict=strict)
         self.encoder.load_state_dict(ckpt["encoder"], strict=strict)
         if "compressor" in ckpt:
-            self.compressor.load_state_dict(ckpt["compressor"], strict=strict)
+            print(f"  Warning: skipping perceiver compressor weights (removed)")
         self.decoder.load_state_dict(ckpt["decoder"], strict=strict)
         self.decoder_embed.load_state_dict(ckpt["decoder_embed"], strict=strict)
         self.lm_head.load_state_dict(ckpt["lm_head"], strict=strict)
@@ -336,8 +310,6 @@ class GeneT5(nn.Module):
             encoder_window_size  = config.get("encoder_window_size", 512),
             decoder_block_size   = config.get("decoder_block_size", 16),
             decoder_window_size  = config.get("decoder_window_size", 32),
-            num_latents          = config.get("num_latents", 1024),
-            perceiver_layers     = config.get("perceiver_layers", 2),
         )
 
         model.load(path / "pytorch_model.bin")

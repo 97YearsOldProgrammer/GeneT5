@@ -6,7 +6,7 @@ import gc
 from transformers import AutoModel, AutoConfig
 from pathlib      import Path
 
-from lib.blocks    import Encoder, Decoder, PerceiverCompressor, PerceiverConfig
+from lib.blocks    import Encoder, Decoder
 from lib.tokenizer import GeneTokenizer
 
 
@@ -58,9 +58,6 @@ def build_gt5(
     # Vocab
     vocab_size          = None,
     tie_weights         = True,
-    # Perceiver
-    num_latents         = 1024,
-    perceiver_layers    = 2,
     # Init
     init_std            = INIT_DEFAULTS["std"],
     init_embed_std      = INIT_DEFAULTS["embed_std"],
@@ -194,23 +191,9 @@ def build_gt5(
 
     del sd
     gc.collect()
-    
-    # Build Perceiver Compressor
-    print(f"\n[5] Building Perceiver Compressor (latents={num_latents}, layers={perceiver_layers})")
-    compressor = PerceiverCompressor(PerceiverConfig(
-        embed_dim              = dna_config.hidden_size,
-        num_latents            = num_latents,
-        num_heads              = dna_config.num_attention_heads,
-        num_kv_heads           = max(1, dna_config.num_attention_heads // 4),
-        num_layers             = perceiver_layers,
-        ff_dim                 = dna_config.intermediate_size,
-        dropout                = decoder_dropout,
-        gradient_checkpointing = True,
-    ))
-    print("    + Random init (no pretrained weights for perceiver)")
 
     # Build Decoder
-    print(f"\n[6] Building Decoder")
+    print(f"\n[6] Building Decoder & Transferring Weights")
     decoder = Decoder(
         num_layers   = decoder_num_layers,
         embed_dim    = dna_config.hidden_size,
@@ -228,7 +211,7 @@ def build_gt5(
     )
     
     # Transfer Decoder Self-Attention from Encoder
-    print("\n[7] Transferring Decoder Self-Attention")
+    print("\n[7] Copying Encoder Self-Attention to Decoder")
     num_copy = min(decoder_num_layers, len(encoder.layers))
     for idx in range(num_copy):
         enc_attn = encoder.layers[idx].self_attn
@@ -268,7 +251,7 @@ def build_gt5(
     nn.init.ones_(decoder.final_norm.weight)
 
     # Embeddings and LM Head
-    print(f"\n[10] Building Decoder Embeddings and LM Head")
+    print(f"\n[9] Building Decoder Embeddings and LM Head")
     decoder_embed = nn.Embedding(vocab_size, dna_config.hidden_size)
     lm_head       = nn.Linear(dna_config.hidden_size, vocab_size, bias=False)
     nn.init.normal_(decoder_embed.weight, mean=0.0, std=init_embed_std)
@@ -281,7 +264,7 @@ def build_gt5(
         print("    ✓ Separate weights")
     
     # Save
-    print(f"\n[11] Saving to {save_dir}")
+    print(f"\n[10] Saving to {save_dir}")
     save_path = Path(save_dir)
     save_path.mkdir(parents=True, exist_ok=True)
     
@@ -304,8 +287,6 @@ def build_gt5(
         "encoder_window_size":  encoder_window_size,
         "decoder_block_size":   decoder_block_size,
         "decoder_window_size":  decoder_window_size,
-        "num_latents":          num_latents,
-        "perceiver_layers":     perceiver_layers,
     }
     
     with open(save_path / "config.json", "w") as f:
@@ -314,7 +295,6 @@ def build_gt5(
     checkpoint = {
         "encoder_embed": encoder_embed.state_dict(),
         "encoder":       encoder.state_dict(),
-        "compressor":    compressor.state_dict(),
         "decoder":       decoder.state_dict(),
         "decoder_embed": decoder_embed.state_dict(),
         "lm_head":       lm_head.state_dict()
@@ -326,7 +306,6 @@ def build_gt5(
     
     total_params  = sum(p.numel() for p in encoder_embed.parameters())
     total_params += sum(p.numel() for p in encoder.parameters())
-    total_params += sum(p.numel() for p in compressor.parameters())
     total_params += sum(p.numel() for p in decoder.parameters())
     total_params += sum(p.numel() for p in decoder_embed.parameters())
     total_params += sum(p.numel() for p in lm_head.parameters())

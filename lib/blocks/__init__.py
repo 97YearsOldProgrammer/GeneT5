@@ -11,18 +11,9 @@ from ._blockcross import (
     BlockCrossAttentionConfig,
 )
 
-from ._perceiver import (
-    PerceiverCompressor,
-    PerceiverConfig,
-    create_perceiver_compressor,
-)
-
 __all__ = [
     "Encoder",
     "Decoder",
     "BlockCrossAttention",
     "BlockCrossAttentionConfig",
-    "PerceiverCompressor",
-    "PerceiverConfig",
-    "create_perceiver_compressor",
 ]

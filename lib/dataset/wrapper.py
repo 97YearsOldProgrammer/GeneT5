@@ -44,13 +44,12 @@ augment_with_hints      = chunking.augment_with_hints
 filter_n_heavy_chunks   = chunking.filter_n_heavy_chunks
 
 
-######################
-#####  Validation ####
-######################
+########################
+#####  Validation  #####
+########################
 
 
-build_validation_set  = validation.build_validation_set
-save_validation_set   = validation.save_validation_set
+split_validation = validation.split_validation
 
 
 #####################
@@ -69,6 +68,5 @@ TokenBudgetSampler     = dataload.TokenBudgetSampler
 ###################
 
 
-format_size            = util.format_size
-print_run_stats        = util.print_run_stats
-print_validation_stats = validation.print_validation_stats
+format_size     = util.format_size
+print_run_stats = util.print_run_stats

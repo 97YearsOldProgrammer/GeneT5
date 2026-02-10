@@ -192,7 +192,7 @@ def find_genome_files(species_dir):
 #################################
 
 
-def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_dir, token_file=None, tokenizer_path=None, n_workers=1, num_complex=5, num_normal=5, num_easy=5, compress=None, canonical_only=False):
+def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_dir, token_file=None, tokenizer_path=None, n_workers=1, val_ratio=0.05, compress=None, canonical_only=False):
     """Run parse_data.py for a single species"""
 
     cmd = [
@@ -202,9 +202,7 @@ def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_di
         str(output_dir),
         "--limit", str(limit),
         "--n_workers", str(n_workers),
-        "--num_complex", str(num_complex),
-        "--num_normal", str(num_normal),
-        "--num_easy", str(num_easy),
+        "--val_ratio", str(val_ratio),
     ]
 
     if token_file:
@@ -288,13 +286,13 @@ def process_species(args):
     """Worker function for parallel species processing"""
 
     # Handle variable-length args tuples
-    if len(args) == 13:
-        species_name, raw_dir, baked_dir, log_dir, limit, token_file, tokenizer_path, n_workers, num_complex, num_normal, num_easy, compress, canonical_only = args
-    elif len(args) == 12:
-        species_name, raw_dir, baked_dir, log_dir, limit, token_file, tokenizer_path, n_workers, num_complex, num_normal, num_easy, compress = args
+    if len(args) == 11:
+        species_name, raw_dir, baked_dir, log_dir, limit, token_file, tokenizer_path, n_workers, val_ratio, compress, canonical_only = args
+    elif len(args) == 10:
+        species_name, raw_dir, baked_dir, log_dir, limit, token_file, tokenizer_path, n_workers, val_ratio, compress = args
         canonical_only = False
     else:
-        species_name, raw_dir, baked_dir, log_dir, limit, token_file, tokenizer_path, n_workers, num_complex, num_normal, num_easy = args
+        species_name, raw_dir, baked_dir, log_dir, limit, token_file, tokenizer_path, n_workers, val_ratio = args
         compress       = None
         canonical_only = False
 
@@ -333,7 +331,7 @@ def process_species(args):
         pass
 
     result = run_parse_data(
-        species_name, fasta_file, gff_file, output_dir, limit, log_dir, token_file, tokenizer_path, n_workers, num_complex, num_normal, num_easy, compress, canonical_only
+        species_name, fasta_file, gff_file, output_dir, limit, log_dir, token_file, tokenizer_path, n_workers, val_ratio, compress, canonical_only
     )
 
     # Clean up decompressed files
@@ -419,7 +417,6 @@ def collect_species_stats(baked_dir, species_name):
     species_dir = pathlib.Path(baked_dir) / species_name
     train_path  = species_dir / "training.bin"
     val_path    = species_dir / "validation.bin"
-    val_meta    = species_dir / "validation.json"
     
     stats = {
         "species":       species_name,
@@ -430,10 +427,6 @@ def collect_species_stats(baked_dir, species_name):
         "val_size":      0,
         "raw_count":     0,
         "aug_count":     0,
-        "complex_loci":  0,
-        "normal_genes":  0,
-        "easy_samples":  0,
-        "val_scenarios": 0,
     }
     
     if not train_path.exists():
@@ -460,18 +453,6 @@ def collect_species_stats(baked_dir, species_name):
             val_info           = ds.get_binary_info(val_path)
             stats["val_chunks"] = val_info["num_chunks"]
             stats["val_size"]   = val_path.stat().st_size
-        except Exception:
-            pass
-    
-    # Get validation metadata
-    if val_meta.exists():
-        try:
-            with open(val_meta, 'r') as f:
-                meta = json.load(f)
-            stats["complex_loci"]  = len(meta.get("complex_loci", []))
-            stats["normal_genes"]  = len(meta.get("normal_genes", []))
-            stats["easy_samples"]  = len(meta.get("easy_samples", []))
-            stats["val_scenarios"] = len(meta.get("scenarios", []))
         except Exception:
             pass
     
@@ -534,11 +515,6 @@ def write_bake_summary(log_path, run_config, species_results, species_stats, tok
         total_train_size   = sum(s["train_size"] for s in species_stats)
         total_val_size     = sum(s["val_size"] for s in species_stats)
         
-        total_complex   = sum(s["complex_loci"] for s in species_stats)
-        total_normal    = sum(s["normal_genes"] for s in species_stats)
-        total_easy      = sum(s["easy_samples"] for s in species_stats)
-        total_scenarios = sum(s["val_scenarios"] for s in species_stats)
-
         f.write(f"\n  Training Data:\n")
         f.write(f"    Total chunks:     {total_train_chunks:,}\n")
         f.write(f"    Raw chunks:       {total_raw:,}\n")
@@ -547,10 +523,6 @@ def write_bake_summary(log_path, run_config, species_results, species_stats, tok
 
         f.write(f"\n  Validation Data:\n")
         f.write(f"    Total chunks:     {total_val_chunks:,}\n")
-        f.write(f"    Complex loci:     {total_complex}\n")
-        f.write(f"    Normal genes:     {total_normal}\n")
-        f.write(f"    Easy samples:     {total_easy}\n")
-        f.write(f"    Scenarios:        {total_scenarios} ({total_scenarios//2} ab initio + {total_scenarios//2} hinted)\n")
         f.write(f"    Total size:       {ds.format_size(total_val_size)}\n")
         f.write(f"\n")
         

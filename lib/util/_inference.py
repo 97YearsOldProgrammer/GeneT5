@@ -182,22 +182,21 @@ class GeneT5Inference:
             return self.tokenizer.decode_batch(token_ids)
     
     @torch.no_grad()
-    def generate(self, encoder_input_ids, encoder_attention_mask=None, config=None):
+    def generate(self, encoder_input_ids, config=None):
         """Generate output sequences"""
-        
+
         config = config or GenerationConfig()
-        self.model.eval()
-        
+        self.model.train(False)
+
         return self.model.generate(
-            encoder_input_ids      = encoder_input_ids,
-            encoder_attention_mask = encoder_attention_mask,
-            max_length             = config.max_length,
-            temperature            = config.temperature,
-            top_k                  = config.top_k,
-            top_p                  = config.top_p,
-            bos_token_id           = config.bos_token_id,
-            eos_token_id           = config.eos_token_id,
-            pad_token_id           = config.pad_token_id,
+            encoder_input_ids = encoder_input_ids,
+            max_length        = config.max_length,
+            temperature       = config.temperature,
+            top_k             = config.top_k,
+            top_p             = config.top_p,
+            bos_token_id      = config.bos_token_id,
+            eos_token_id      = config.eos_token_id,
+            pad_token_id      = config.pad_token_id,
         )
     
     def predict(self, sequences, seqids=None, output_dir=None, source="GeneT5",
@@ -233,9 +232,8 @@ class GeneT5Inference:
 
             with torch.amp.autocast(self.device.type, dtype=self.dtype):
                 generated = self.generate(
-                    encoder_input_ids      = encoded["input_ids"],
-                    encoder_attention_mask = encoded["attention_mask"],
-                    config                 = gen_config,
+                    encoder_input_ids = encoded["input_ids"],
+                    config            = gen_config,
                 )
 
             decoded_outputs = self.decode(generated)

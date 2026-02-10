@@ -9,8 +9,7 @@ from lib.dataset.wrapper import (
     extract_biotypes,
 
     # Validation
-    build_validation_set,
-    save_validation_set,
+    split_validation,
 
     # Chunking
     dynamic_chunking,
