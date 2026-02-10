@@ -45,25 +45,8 @@ PYTHONPATH=. python bin/init_model.py \
 Prepare multi-species training data from raw GFF/FASTA
 
 ```bash
-PYTHONPATH=. python bin/bake_data \
-    --raw_dir ../raw \
-    --output_dir ../baked/w5k_c4.5k \
-    --n_workers 5 \
-    --species_parallel 3 \
-    --tokenizer ../model/base \
-    --window_size 10000 \
-    2>&1 | tee ../logs/baker/w5k_c4.5k.log
+bash bin/bake.sh --worker 192.168.100.11 --tokenizer ../model/GeneT5/ --output_dir ../baked/GeneT5/w20k_s53/ --window_size 20000 --species_parallel 4 --canonical_only
 ```
-
-**Species Limits**
-
-| Taxa           | Gene Limit | Token Est  | Avg Gene Size       |
-| :------------- | :--------: | :--------: | :------------------ |
-| Prokaryotes    | 10,000     | ~2.2k      | 9,000 bp (no introns) |
-| Unicellular    | 15,000     | ~3.3k      | 15,000 bp (~P95+)   |
-| Invertebrates  | 15,000     | ~5.5k      | 25,000 bp (~P90)    |
-| Vertebrates    | 15,000     | ~6.6k      | 30,000 bp (~P75)    |
-| Plants         | 15,000     | ~5.5k      | 25,000 bp (~P85-90) |
 
 **Subsetting** (for dev/test with smaller data)
 
@@ -149,26 +132,10 @@ Uses `torchrun` + NCCL over ConnectX-7 RoCE
 
 **Master** (spark-1089, 192.168.100.10)
 ```bash
-bin/distributed.sh \
-    ../baked/w5k_c4.5k/training.packed \
-    ../baked/w5k_c4.5k/validation.packed \
-    ../model/run_002_dist \
-    ../model/base \
-    --nnodes 2 --node-rank 0 --master 192.168.100.10 \
-    --epochs 4 --lr 1e-4 --token_budget 45500 --max_batch_size 8 \
-    --grad_accum 64 --compile --log_every_pct 5 --memwatch
-```
-
-**Worker** (spark-0b7c, 192.168.100.11)
-```bash
-bin/distributed.sh \
-    ../baked/w5k_c4.5k/training.packed \
-    ../baked/w5k_c4.5k/validation.packed \
-    ../model/run_002_dist \
-    ../model/base \
-    --nnodes 2 --node-rank 1 --master 192.168.100.10 \
-    --epochs 4 --lr 1e-4 --token_budget 45500 --max_batch_size 8 \
-    --grad_accum 64 --compile --log_every_pct 5
+bin/distributed.sh ../baked/w20k/train.bin ../baked/w20k/val.bin \
+    ../model/exp_20260209 ../model/base \
+    --worker 192.168.100.11 \
+    --epochs 10 --lr 1e-4 --batch_size 4
 ```
 
 **RoCE Verification** (before distributed run)

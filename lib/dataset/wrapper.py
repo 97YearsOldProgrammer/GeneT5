@@ -30,6 +30,7 @@ read_binary         = binary.read_binary
 get_binary_info     = binary.get_binary_info
 read_chunk_at_index = binary.read_chunk_at_index
 iter_binary         = binary.iter_binary
+merge_binary_files  = binary.merge_binary_files
 
 
 #####################

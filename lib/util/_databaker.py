@@ -72,6 +72,10 @@ TAXA_SPECIES = {
         "Synechocystis.PCC6803",
         "H.salinarum",
         "V.fischeri",
+        "S.aureus",
+        "P.aeruginosa",
+        "M.tuberculosis",
+        "S.solfataricus",
     ],
     "Unicellular": [
         "S.cerevisiae",
@@ -80,6 +84,12 @@ TAXA_SPECIES = {
         "N.crassa",
         "D.discoideum",
         "T.thermophila",
+        "T.gondii",
+    ],
+    "Fungi": [
+        "A.nidulans",
+        "C.neoformans",
+        "M.oryzae",
     ],
     "Invertebrates": [
         "C.elegans",
@@ -89,6 +99,13 @@ TAXA_SPECIES = {
         "H.vulgaris",
         "A.mellifera",
         "B.mori",
+        "T.castaneum",
+        "P.tepidariorum",
+        "B.terrestris",
+        "A.aegypti",
+        "S.mansoni",
+        "C.intestinalis",
+        "B.floridae",
     ],
     "Vertebrates": [
         "C.jacchus",
@@ -100,6 +117,7 @@ TAXA_SPECIES = {
         "M.musculus",
         "R.norvegicus",
         "D.rerio",
+        "B.taurus",
     ],
     "Plants": [
         "P.patens",
@@ -107,6 +125,10 @@ TAXA_SPECIES = {
         "M.truncatula",
         "O.sativa",
         "A.thaliana",
+        "S.lycopersicum",
+        "P.trichocarpa",
+        "V.vinifera",
+        "T.aestivum",
     ],
 }
 

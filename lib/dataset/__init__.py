@@ -23,6 +23,7 @@ from lib.dataset.wrapper import (
     read_binary,
     get_binary_info,
     read_chunk_at_index,
+    merge_binary_files,
     BinaryChunk,
 
     # Dataload
