@@ -32,7 +32,6 @@ PYTHONPATH=. python bin/init_model.py \
     --encoder_window_size 512 \
     --decoder_block_size 16 \
     --decoder_window_size 32 \
-    --num_latents 1024 \
     2>&1 | tee ../logs/init.log
 ```
 
@@ -45,8 +44,10 @@ PYTHONPATH=. python bin/init_model.py \
 Prepare multi-species training data from raw GFF/FASTA
 
 ```bash
-bash bin/bake.sh --worker 192.168.100.11 --tokenizer ../model/GeneT5/ --output_dir ../baked/GeneT5/w20k_s53/ --window_size 20000 --species_parallel 4 --canonical_only
+bash bin/bake.sh --worker 192.168.100.11 --tokenizer ../model/GeneT5/ --output_dir ../baked/GeneT5/w20k_ts51_v2/ --window_size 20000 --species_parallel 4 --canonical_only --val_species B.taurus,S.lycopersicum --val_windows 2000
 ```
+
+Validation comes exclusively from held-out species, capped at `--val_windows` (default 3000). Training species produce zero validation data.
 
 **Subsetting** (for dev/test with smaller data)
 
@@ -95,8 +96,7 @@ PYTHONPATH=. python bin/finet \
     ../model/base \
     --epochs 4 \
     --lr 1e-4 \
-    --token_budget 45500 \
-    --max_batch_size 8 \
+    --batch_size 8 \
     --grad_accum 64 \
     --weight_decay 0.01 \
     --warmup_ratio 0.03 \
@@ -115,9 +115,8 @@ PYTHONPATH=. python bin/finet \
 
 | Flag               | Purpose                                    |
 | :----------------- | :----------------------------------------- |
-| `--compile`        | torch.compile on encoder/compressor/decoder (~33% speedup) |
+| `--compile`        | torch.compile on encoder/decoder (~33% speedup) |
 | `--memwatch`       | Background memory CSV (5s intervals, then 30s) |
-| `--token_budget N` | Variable batch sizes based on label tokens |
 | `--mxfp8`          | MXFP8 quantization (Blackwell only)        |
 | `--optim_8bit`     | 8-bit AdamW (saves ~12GB optimizer memory) |
 | `--log_every_pct N`| Progress log frequency                     |
@@ -175,7 +174,7 @@ PYTHONPATH=. python bin/finet \
     ../baked/w5k_c4.5k/training.packed \
     ../baked/w5k_c4.5k/validation.packed \
     ../model/$RUN ../model/base \
-    --epochs 4 --lr 1e-4 --token_budget 45500 --max_batch_size 8 \
+    --epochs 4 --lr 1e-4 --batch_size 8 \
     --grad_accum 64 --compile --memwatch \
     2>&1 | tee ../logs/tune/${RUN}.log
 

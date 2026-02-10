@@ -507,7 +507,7 @@ def iter_binary(input_path):
             yield chunk_idx, BinaryChunk.from_bytes(data)
 
 
-def merge_binary_files(input_paths, output_path, compress=None, show_progress=True):
+def merge_binary_files(input_paths, output_path, compress=None, show_progress=True, max_chunks=None, seed=42):
     """
     Stream-merge multiple .bin files into one unified file
 
@@ -515,6 +515,7 @@ def merge_binary_files(input_paths, output_path, compress=None, show_progress=Tr
     and writes directly to output without deserializing BinaryChunk
 
     Handles mixed compression: decompresses if needed, optionally recompresses
+    When max_chunks is set, randomly subsamples to cap total output
     """
     output_path = pathlib.Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -565,6 +566,27 @@ def merge_binary_files(input_paths, output_path, compress=None, show_progress=Tr
     if total_chunks == 0:
         return output_path
 
+    # Subsample if total exceeds max_chunks
+    selected = None
+    if max_chunks is not None and max_chunks > 0 and total_chunks > max_chunks:
+        import random
+        random.seed(seed)
+
+        # Build flat list of (file_idx, chunk_idx) then sample
+        all_indices = []
+        for fi, meta in enumerate(file_metas):
+            for ci in range(meta['num_chunks']):
+                all_indices.append((fi, ci))
+
+        chosen       = set(random.sample(all_indices, max_chunks))
+        selected     = {}
+        for fi, ci in chosen:
+            selected.setdefault(fi, set()).add(ci)
+
+        if show_progress:
+            print(f"  Subsampling {total_chunks:,} -> {max_chunks:,} chunks")
+        total_chunks = max_chunks
+
     # Determine output compression
     if compress == 'zstd':
         try:
@@ -600,14 +622,18 @@ def merge_binary_files(input_paths, output_path, compress=None, show_progress=Tr
         out_offsets   = []
         chunks_done   = 0
 
-        for meta in file_metas:
+        for fi, meta in enumerate(file_metas):
             src_decomp = _get_decompressor(meta['compress'])
 
             # Can we skip decompression+recompression?
             passthrough = (meta['compress'] == out_compress)
+            file_selected = selected.get(fi) if selected else None
 
             with open(meta['path'], 'rb') as src:
-                for src_offset, src_length in meta['offsets']:
+                for ci, (src_offset, src_length) in enumerate(meta['offsets']):
+                    if file_selected is not None and ci not in file_selected:
+                        continue
+
                     src.seek(src_offset)
                     raw_bytes = src.read(src_length)
 

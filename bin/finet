@@ -24,9 +24,9 @@ import lib.util.train   as train_util
 
 
 DEFAULTS = {
-    'batch_size':     4,
+    'batch_size':     8,
     'lr':             1e-4,
-    'epochs':         3,
+    'epochs':         4,
     'weight_decay':   0.1,
     'warmup_ratio':   0.03,
     'grad_accum':     64,
@@ -86,14 +86,6 @@ def main():
         help='disable pin_memory in dataloaders (can reduce CPU memory pressure)')
     parser.add_argument('--memwatch', action='store_true',
         help='enable background memory monitoring to CSV (first 5min: 5s intervals, then 30s)')
-    parser.add_argument('--sort_by_length', action='store_true',
-        help='sort batches by label length descending (largest first for memory profiling)')
-    parser.add_argument('--token_budget', type=int, default=None,
-        help='use token budget batching instead of fixed batch size (recommended: 128000)')
-    parser.add_argument('--max_batch_size', type=int, default=32,
-        help='max batch size when using token budget [%(default)s]')
-    parser.add_argument('--min_batch_size', type=int, default=1,
-        help='min batch size when using token budget [%(default)s]')
     parser.add_argument('--mxfp8', action='store_true',
         help='apply MXFP8 quantization to dense Linear layers (Blackwell only)')
     parser.add_argument('--compile', action='store_true',
@@ -213,105 +205,26 @@ def main():
 
     collator = ds.DynamicPaddingCollator(tokenizer.pad_token_id, -100)
 
-    # Collect label lengths for smart batching
-    train_sampler = None
-    train_shuffle = True
-    label_lengths = None
-
     # Distributed sampler for multi-node training
     dist_sampler     = None
     val_dist_sampler = None
     if is_dist:
         dist_sampler     = data_utils.distributed.DistributedSampler(train_dataset, shuffle=True)
         val_dist_sampler = data_utils.distributed.DistributedSampler(val_dataset, shuffle=False)
-        train_shuffle    = False
-
-    if args.token_budget or args.sort_by_length:
-        if is_main:
-            print(f"  Collecting label lengths...")
-        label_lengths = []
-        for i in range(len(train_dataset)):
-            sample = train_dataset[i]
-            label_lengths.append(len(sample['labels']))
-        max_lbl = max(label_lengths)
-        min_lbl = min(label_lengths)
-        if is_main:
-            print(f"  Label lengths: {min_lbl:,} - {max_lbl:,} tokens")
-
-    # Token budget batching (recommended)
-    if args.token_budget:
-        # Shard indices across ranks for distributed training
-        shard_indices = None
-        if is_dist:
-            all_sorted    = sorted(range(len(label_lengths)),
-                                   key=lambda i: label_lengths[i], reverse=True)
-            shard_indices = all_sorted[dist_info['rank']::dist_info['world_size']]
-
-        if is_main:
-            print(f"  Using token budget batching (budget={args.token_budget:,} tokens)...")
-        train_sampler = ds.TokenBudgetSampler(
-            label_lengths,
-            max_tokens     = args.token_budget,
-            max_batch_size = args.max_batch_size,
-            min_batch_size = args.min_batch_size,
-            shuffle        = True,
-            drop_last      = False,
-            seed           = args.seed,
-            indices        = shard_indices,
-        )
-
-        # Sync batch counts so no rank hangs waiting
-        if is_dist:
-            local_count = torch.tensor([len(train_sampler)], device=device)
-            dist.all_reduce(local_count, op=dist.ReduceOp.MIN)
-            train_sampler.set_max_batches(int(local_count.item()))
-
-        train_shuffle = False
-        if is_main:
-            stats = train_sampler.get_batch_stats()
-            print(f"  Batch sizes: {stats['min_batch_size']} - {stats['max_batch_size']} (avg {stats['avg_batch_size']:.1f})")
-            print(f"  Tokens/batch: {stats['min_tokens']:,} - {stats['max_tokens']:,} (avg {stats['avg_tokens']:,.0f})")
-            print(f"  Total batches: {stats['num_batches']:,}")
-
-    # Sort by label length (legacy, for memory profiling)
-    elif args.sort_by_length:
-        if is_main:
-            print(f"  Sorting batches by label length (largest first)...")
-        sorted_indices = sorted(range(len(train_dataset)),
-                                key=lambda i: label_lengths[i],
-                                reverse=True)
-        train_sampler = data_utils.sampler.BatchSampler(
-            sorted_indices,
-            batch_size=args.batch_size,
-            drop_last=True
-        )
-        train_shuffle = False
-        if is_main:
-            print(f"  First batch will have ~{max_lbl:,} token labels (peak memory)")
 
     persistent = args.num_workers > 0
 
-    if train_sampler:
-        train_loader = data_utils.DataLoader(
-            train_dataset,
-            batch_sampler      = train_sampler,
-            collate_fn         = collator,
-            num_workers        = args.num_workers,
-            pin_memory         = not args.no_pin_memory,
-            persistent_workers = persistent,
-        )
-    else:
-        train_loader = data_utils.DataLoader(
-            train_dataset,
-            batch_size         = args.batch_size,
-            shuffle            = train_shuffle if not dist_sampler else False,
-            sampler            = dist_sampler,
-            collate_fn         = collator,
-            num_workers        = args.num_workers,
-            pin_memory         = not args.no_pin_memory,
-            drop_last          = True,
-            persistent_workers = persistent,
-        )
+    train_loader = data_utils.DataLoader(
+        train_dataset,
+        batch_size         = args.batch_size,
+        shuffle            = not is_dist,
+        sampler            = dist_sampler,
+        collate_fn         = collator,
+        num_workers        = args.num_workers,
+        pin_memory         = not args.no_pin_memory,
+        drop_last          = True,
+        persistent_workers = persistent,
+    )
 
     val_loader = data_utils.DataLoader(
         val_dataset,

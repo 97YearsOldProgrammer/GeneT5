@@ -1,7 +1,6 @@
 import lib.dataset._parser     as parser
 import lib.dataset._binary     as binary
 import lib.dataset._chunking   as chunking
-import lib.dataset._validation as validation
 import lib.dataset._dataload   as dataload
 import lib.dataset._util       as util
 
@@ -44,14 +43,6 @@ augment_with_hints      = chunking.augment_with_hints
 filter_n_heavy_chunks   = chunking.filter_n_heavy_chunks
 
 
-########################
-#####  Validation  #####
-########################
-
-
-split_validation = validation.split_validation
-
-
 #####################
 #####  Dataload #####
 #####################
@@ -59,8 +50,6 @@ split_validation = validation.split_validation
 
 BinaryTrainDataset     = dataload.BinaryTrainDataset
 DynamicPaddingCollator = dataload.DynamicPaddingCollator
-SmartBatchSampler      = dataload.SmartBatchSampler
-TokenBudgetSampler     = dataload.TokenBudgetSampler
 
 
 ###################

@@ -180,7 +180,7 @@ def _chunk_chromosome_genecentric(args):
     Slides window across gene regions only, uses binary search for lookups
     """
 
-    seqid, sequence, chr_gene_index, window_size, overlap_bp, anchor_pad = args
+    seqid, sequence, chr_gene_index, window_size, step_bp, anchor_pad = args
 
     seq_len = len(sequence)
     chunks  = []
@@ -211,7 +211,7 @@ def _chunk_chromosome_genecentric(args):
     first_gene_start = gene_idx.get_first_gene_start()
     last_gene_end    = gene_idx.get_last_gene_end()
     window_start     = max(0, first_gene_start - anchor_pad)
-    step_size        = window_size - overlap_bp
+    step_size        = step_bp
 
     chunk_index = 0
 
@@ -224,9 +224,10 @@ def _chunk_chromosome_genecentric(args):
         if cut_pos < seq_len:
             is_inside, blocking_gene = gene_idx.check_position_inside_gene(cut_pos)
 
-            if is_inside:
-                # Try backtracking
-                new_cut      = cut_pos - overlap_bp
+            if is_inside and blocking_gene:
+                # Backtrack to just before the blocking gene's start
+                gene_start = chr_gene_index[blocking_gene]["start"]
+                new_cut    = max(window_start + 1, gene_start - 1)
                 still_inside = gene_idx.check_position_inside_gene(new_cut)[0]
 
                 if not still_inside and new_cut > window_start:
@@ -319,7 +320,9 @@ def sliding_window_chunking(sequences, gene_index, window_size=20000, overlap_ra
     if overlap_ratio is None:
         overlap_ratio = 1 / math.e
 
-    overlap_bp = int(window_size * overlap_ratio)
+    # overlap_ratio is the STEP ratio: fraction of window that's new each slide
+    # step = W/e, overlap = W(1-1/e), so 2 adjacent windows cover W(1+1/e) unique bp
+    step_bp    = int(window_size * overlap_ratio)
     anchor_pad = window_size // 5
 
     if n_workers is None:
@@ -346,7 +349,7 @@ def sliding_window_chunking(sequences, gene_index, window_size=20000, overlap_ra
     for seqid in work_seqids:
         sequence       = sequences[seqid]
         chr_gene_index = genes_by_seqid[seqid]
-        work_items.append((seqid, sequence, chr_gene_index, window_size, overlap_bp, anchor_pad))
+        work_items.append((seqid, sequence, chr_gene_index, window_size, step_bp, anchor_pad))
 
     if len(work_items) <= 2 or n_workers == 1:
         for args in work_items:

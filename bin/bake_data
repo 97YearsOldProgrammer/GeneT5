@@ -34,12 +34,10 @@ parser.add_argument("--n_workers",  type=int, default=None,
     help="Workers per species for chunking [auto]")
 parser.add_argument("--tokenizer",  type=str, required=True,
     help="Tokenizer path (required)")
-parser.add_argument("--val_ratio",  type=float, default=0.05,
-    help="Validation split ratio [%(default)s]")
 parser.add_argument("--val_species", type=str, default=None,
     help="Comma-separated held-out species for validation only (e.g. B.taurus,S.lycopersicum)")
-parser.add_argument("--val_windows", type=int, default=1000,
-    help="Max random windows per held-out species [%(default)s]")
+parser.add_argument("--val_windows", type=int, default=3000,
+    help="Max total validation windows from held-out species [%(default)s]")
 parser.add_argument("--compress", type=str, default=None,
     choices=['zlib', 'zstd'], help="Compress binary files with zlib or zstd")
 parser.add_argument("--canonical_only", action="store_true",
@@ -111,7 +109,6 @@ print(f"  Output directory: {output_dir}")
 print(f"  Tokenizer:        {args.tokenizer}")
 print(f"")
 print(f"  Window size:      {args.window_size:,} bp")
-print(f"  Val ratio:        {args.val_ratio}")
 print(f"  Canonical only:   {args.canonical_only}")
 if val_species_set:
     print(f"  Held-out species: {', '.join(sorted(val_species_set))}")
@@ -143,7 +140,7 @@ for taxa, count in taxa_counts.items():
 
 work_items = [
     (sp, raw_dir, output_dir, log_dir, limit, None, args.tokenizer,
-     n_workers_per_species, args.val_ratio, args.compress, args.canonical_only)
+     n_workers_per_species, args.compress, args.canonical_only)
     for sp, limit, taxa in species_to_process
 ]
 
@@ -190,7 +187,7 @@ if heldout_to_process:
 
     heldout_items = [
         (sp, raw_dir, output_dir, log_dir, limit, None, args.tokenizer,
-         n_workers_per_species, 1.0, args.compress, args.canonical_only)
+         n_workers_per_species, args.compress, args.canonical_only)
         for sp, limit, taxa in heldout_to_process
     ]
 
@@ -203,18 +200,6 @@ if heldout_to_process:
                 result = future.result()
                 if result["success"]:
                     print(f"  + {species_name} (held-out)")
-
-                    # Move: all chunks go to validation only, cap at val_windows
-                    sp_dir    = output_dir / species_name
-                    train_bin = sp_dir / "training.bin"
-                    val_bin   = sp_dir / "validation.bin"
-
-                    # For held-out species, training.bin has val_ratio=1.0 so
-                    # everything went to validation. But parse_data with val_ratio=1.0
-                    # puts everything in val. Remove any training.bin
-                    if train_bin.exists() and train_bin.stat().st_size > 0:
-                        train_bin.unlink()
-
                 else:
                     error = result.get("error", "Unknown error")
                     print(f"  x {species_name}: {error}")
@@ -232,16 +217,21 @@ import lib.dataset as ds
 
 print(f"\n{' Merging Per-Species Bins ':=^60}")
 
-# Exclude held-out species from training merge
-train_species_names = {sp for sp, _, _ in species_to_process}
+# Training species -> training.bin, held-out species -> validation.bin
+train_species_names   = {sp for sp, _, _ in species_to_process}
+heldout_species_names = {sp for sp, _, _ in heldout_to_process} if heldout_to_process else set()
+
 training_bins = sorted(
     f for f in output_dir.glob("*/training.bin")
     if f.parent.name in train_species_names
 )
-validation_bins = sorted(output_dir.glob("*/validation.bin"))
+validation_bins = sorted(
+    f for f in output_dir.glob("*/training.bin")
+    if f.parent.name in heldout_species_names
+)
 
 print(f"  Training files:   {len(training_bins)}")
-print(f"  Validation files: {len(validation_bins)}")
+print(f"  Validation files: {len(validation_bins)} (held-out species)")
 
 for f in training_bins:
     size_mb = f.stat().st_size / 1024 / 1024
@@ -253,17 +243,18 @@ if training_bins:
     ds.merge_binary_files(
         training_bins,
         output_dir / "training.bin",
-        compress       = args.compress,
-        show_progress  = True,
+        compress      = args.compress,
+        show_progress = True,
     )
 
 if validation_bins:
-    print(f"\n  Validation merge:")
+    print(f"\n  Validation merge (capped at {args.val_windows:,}):")
     ds.merge_binary_files(
         validation_bins,
         output_dir / "validation.bin",
-        compress       = args.compress,
-        show_progress  = True,
+        compress      = args.compress,
+        show_progress = True,
+        max_chunks    = args.val_windows,
     )
 
 # Final summary

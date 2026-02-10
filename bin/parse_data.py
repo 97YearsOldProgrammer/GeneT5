@@ -17,15 +17,13 @@ parser.add_argument('output_dir', type=str, metavar='<output>',
 parser.add_argument('--limit', required=False, type=int, default=20000,
     metavar='<int>', help='chunk size limit in bp [%(default)i]')
 parser.add_argument('--overlap_ratio', required=False, type=float, default=1/2.718281828,
-    metavar='<float>', help='window overlap ratio (1/e) [%(default).4f]')
+    metavar='<float>', help='step ratio: fraction of window as new territory (1/e) [%(default).4f]')
 parser.add_argument('--max_n_ratio', required=False, type=float, default=0.1,
     metavar='<float>', help='max N ratio before skipping window [%(default).2f]')
 parser.add_argument('--hint_ratio', required=False, type=float, default=0.5,
     metavar='<float>', help='hint augmentation ratio [%(default).2f]')
 parser.add_argument('--seed', required=False, type=int, default=42,
     metavar='<int>', help='random seed [%(default)i]')
-parser.add_argument('--val_ratio', required=False, type=float, default=0.05,
-    metavar='<float>', help='validation split ratio [%(default).2f]')
 parser.add_argument('--n_workers', required=False, type=int, default=None,
     metavar='<int>', help='parallel workers [auto]')
 parser.add_argument('--tokenizer', required=False, type=str, default=None,
@@ -92,15 +90,6 @@ aug_count = sum(1 for c in all_chunks if c.is_augmented)
 print(f"  Raw chunks:       {raw_count}")
 print(f"  Augmented chunks: {aug_count}")
 
-# Split into train and validation
-print(f"\n{' Validation Split ':=^60}")
-
-train_chunks, val_chunks = ds.split_validation(all_chunks, args.val_ratio, args.seed)
-
-print(f"  Val ratio:    {args.val_ratio:.2f}")
-print(f"  Train chunks: {len(train_chunks)}")
-print(f"  Val chunks:   {len(val_chunks)}")
-
 # Tokenize if tokenizer provided
 tokenizer = None
 if args.tokenizer:
@@ -109,73 +98,60 @@ if args.tokenizer:
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
     print(f"  Vocab size: {len(tokenizer)}")
 
-    for label, chunks in [("train", train_chunks), ("val", val_chunks)]:
-        batch_size   = 1000
-        total_chunks = len(chunks)
+    batch_size   = 1000
+    total_chunks = len(all_chunks)
 
-        for batch_start in range(0, total_chunks, batch_size):
-            batch_end    = min(batch_start + batch_size, total_chunks)
-            batch        = chunks[batch_start:batch_end]
+    for batch_start in range(0, total_chunks, batch_size):
+        batch_end = min(batch_start + batch_size, total_chunks)
+        batch     = all_chunks[batch_start:batch_end]
 
-            input_texts  = [c.get_input_text() for c in batch]
-            target_texts = [c.get_target_text() for c in batch]
+        input_texts  = [c.get_input_text() for c in batch]
+        target_texts = [c.get_target_text() for c in batch]
 
-            input_enc  = tokenizer(input_texts, add_special_tokens=False)
-            target_enc = tokenizer(target_texts, add_special_tokens=False)
+        input_enc  = tokenizer(input_texts, add_special_tokens=False)
+        target_enc = tokenizer(target_texts, add_special_tokens=False)
 
-            for i, chunk in enumerate(batch):
-                chunk.input_ids  = input_enc['input_ids'][i]
-                chunk.target_ids = target_enc['input_ids'][i]
-                chunk.input_len  = len(chunk.input_ids)
-                chunk.target_len = len(chunk.target_ids)
+        for i, chunk in enumerate(batch):
+            chunk.input_ids  = input_enc['input_ids'][i]
+            chunk.target_ids = target_enc['input_ids'][i]
+            chunk.input_len  = len(chunk.input_ids)
+            chunk.target_len = len(chunk.target_ids)
 
-            pct = 100 * batch_end / total_chunks
-            print(f"    {label}: {batch_end:,}/{total_chunks:,} ({pct:.1f}%)", end='\r')
+        pct = 100 * batch_end / total_chunks
+        print(f"    {batch_end:,}/{total_chunks:,} ({pct:.1f}%)", end='\r')
 
-        print(f"    {label}: {total_chunks:,}/{total_chunks:,} (100.0%)")
+    print(f"    {total_chunks:,}/{total_chunks:,} (100.0%)")
 
-# Write outputs
+# Write output
 output_dir = pathlib.Path(args.output_dir)
 output_dir.mkdir(parents=True, exist_ok=True)
 
-print(f"\n{' Writing Outputs ':=^60}")
+print(f"\n{' Writing Output ':=^60}")
 
-# Write training
 train_path = output_dir / 'training.bin'
-ds.write_binary(train_chunks, train_path, compress=args.compress)
+ds.write_binary(all_chunks, train_path, compress=args.compress)
 train_size = train_path.stat().st_size
-print(f"  Training:   {train_path} ({ds.format_size(train_size)})")
-
-# Write validation
-val_path = output_dir / 'validation.bin'
-ds.write_binary(val_chunks, val_path, compress=args.compress)
-val_size = val_path.stat().st_size
-print(f"  Validation: {val_path} ({ds.format_size(val_size)})")
+print(f"  training.bin: {train_path} ({ds.format_size(train_size)})")
 
 # Print stats
 run_stats = {
     'raw_count':     raw_count,
     'aug_count':     aug_count,
-    'total_samples': len(train_chunks),
+    'total_samples': len(all_chunks),
     'file_size':     train_size,
 }
 
-ds.print_run_stats(run_stats, chunk_stats, len(val_chunks), train_path)
+ds.print_run_stats(run_stats, chunk_stats, 0, train_path)
 
-# Write stats JSON for aggregation
+# Write stats JSON
 stats_path = output_dir / 'stats.json'
 stats_json = {
     'run_stats':   run_stats,
     'chunk_stats': {k: v for k, v in chunk_stats.items() if k != 'features_per_chunk'},
-    'val_chunks':  len(val_chunks),
-    'val_ratio':   args.val_ratio,
 }
 with open(stats_path, 'w') as f:
     json.dump(stats_json, f, indent=2)
 
 print(f"\n{'='*60}")
 print('Done!')
-print()
-print('Next steps:')
-print('  Train with: bin/finet --train training.bin --val validation.bin')
 print(f"{'='*60}")

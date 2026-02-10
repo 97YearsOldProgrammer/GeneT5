@@ -18,8 +18,7 @@ bin/distributed.sh \
     "$TRAIN_DATA" "$VAL_DATA" "$OUTPUT_DIR" "$MODEL_PATH" \
     --epochs 4 \
     --lr 1e-4 \
-    --token_budget 36400 \
-    --max_batch_size 8 \
+    --batch_size 8 \
     --grad_accum 64 \
     --weight_decay 0.01 \
     --warmup_ratio 0.03 \

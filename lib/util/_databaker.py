@@ -192,7 +192,7 @@ def find_genome_files(species_dir):
 #################################
 
 
-def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_dir, token_file=None, tokenizer_path=None, n_workers=1, val_ratio=0.05, compress=None, canonical_only=False):
+def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_dir, token_file=None, tokenizer_path=None, n_workers=1, compress=None, canonical_only=False):
     """Run parse_data.py for a single species"""
 
     cmd = [
@@ -202,7 +202,6 @@ def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_di
         str(output_dir),
         "--limit", str(limit),
         "--n_workers", str(n_workers),
-        "--val_ratio", str(val_ratio),
     ]
 
     if token_file:
@@ -286,13 +285,13 @@ def process_species(args):
     """Worker function for parallel species processing"""
 
     # Handle variable-length args tuples
-    if len(args) == 11:
-        species_name, raw_dir, baked_dir, log_dir, limit, token_file, tokenizer_path, n_workers, val_ratio, compress, canonical_only = args
-    elif len(args) == 10:
-        species_name, raw_dir, baked_dir, log_dir, limit, token_file, tokenizer_path, n_workers, val_ratio, compress = args
+    if len(args) == 10:
+        species_name, raw_dir, baked_dir, log_dir, limit, token_file, tokenizer_path, n_workers, compress, canonical_only = args
+    elif len(args) == 9:
+        species_name, raw_dir, baked_dir, log_dir, limit, token_file, tokenizer_path, n_workers, compress = args
         canonical_only = False
     else:
-        species_name, raw_dir, baked_dir, log_dir, limit, token_file, tokenizer_path, n_workers, val_ratio = args
+        species_name, raw_dir, baked_dir, log_dir, limit, token_file, tokenizer_path, n_workers = args
         compress       = None
         canonical_only = False
 
@@ -331,7 +330,7 @@ def process_species(args):
         pass
 
     result = run_parse_data(
-        species_name, fasta_file, gff_file, output_dir, limit, log_dir, token_file, tokenizer_path, n_workers, val_ratio, compress, canonical_only
+        species_name, fasta_file, gff_file, output_dir, limit, log_dir, token_file, tokenizer_path, n_workers, compress, canonical_only
     )
 
     # Clean up decompressed files
