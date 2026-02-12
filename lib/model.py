@@ -157,6 +157,29 @@ class GeneT5(nn.Module):
         return outputs
 
     @torch.no_grad()
+    def generate_from_hidden(
+        self,
+        encoder_hidden,
+        max_length   = 100,
+        temperature  = 1.0,
+        top_k        = 50,
+        top_p        = 0.9,
+        bos_token_id = 1,
+        eos_token_id = 2,
+        pad_token_id = 0
+    ):
+        """Autoregressive generation from pre-computed encoder hidden states"""
+
+        self.train(False)
+        device = encoder_hidden.device
+        batch  = encoder_hidden.size(0)
+
+        return self._generate_loop(
+            encoder_hidden, batch, device, max_length,
+            temperature, top_k, top_p, bos_token_id, eos_token_id, pad_token_id
+        )
+
+    @torch.no_grad()
     def generate(
         self,
         encoder_input_ids,
@@ -176,7 +199,17 @@ class GeneT5(nn.Module):
 
         encoder_hidden = self.encode(encoder_input_ids)
 
-        # Start with BOS
+        return self._generate_loop(
+            encoder_hidden, batch, device, max_length,
+            temperature, top_k, top_p, bos_token_id, eos_token_id, pad_token_id
+        )
+
+    def _generate_loop(
+        self, encoder_hidden, batch, device, max_length,
+        temperature, top_k, top_p, bos_token_id, eos_token_id, pad_token_id
+    ):
+        """Shared autoregressive generation loop"""
+
         generated = torch.full((batch, 1), bos_token_id, dtype=torch.long, device=device)
         finished  = torch.zeros(batch, dtype=torch.bool, device=device)
 

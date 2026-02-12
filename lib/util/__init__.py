@@ -52,3 +52,19 @@ from lib.util._eval_hook import (
     CheckpointEvaluator,
     EvalLogger,
 )
+
+from lib.util._reward import (
+    exon_f1,
+    gene_f1,
+    composite_reward,
+    batch_rewards,
+)
+
+from lib.util._grpo import (
+    GRPODataset,
+    grpo_collate,
+    compute_log_probs,
+    compute_advantages,
+    grpo_loss,
+    prepare_decoder_inputs,
+)

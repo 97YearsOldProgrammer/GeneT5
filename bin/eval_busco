@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+
+import argparse
+import pathlib
+import json
+import sys
+import concurrent.futures
+
+import eval as ev
+
+
+parser = argparse.ArgumentParser(
+    description='Evaluate genome/protein assemblies using BUSCO')
+parser.add_argument('input', type=str, nargs='+', metavar='<input>',
+    help='One or more input files (FASTA genome/proteins/transcriptome)')
+parser.add_argument('--lineage', '-l', type=str, required=True,
+    metavar='<lineage>', help='BUSCO lineage dataset (e.g., mammalia_odb10)')
+parser.add_argument('--mode', '-m', type=str, default='genome',
+    choices=['genome', 'proteins', 'transcriptome'],
+    help='Analysis mode [%(default)s]')
+parser.add_argument('--output', '-o', type=str, default=None,
+    metavar='<file>', help='Output JSON report file')
+parser.add_argument('--output_dir', type=str, default='busco_output',
+    metavar='<dir>', help='BUSCO output directory [%(default)s]')
+parser.add_argument('--cpu', '-c', type=int, default=4,
+    metavar='<int>', help='CPUs per BUSCO run [%(default)i]')
+parser.add_argument('--parallel', type=int, default=1,
+    metavar='<int>', help='Parallel BUSCO runs [%(default)i]')
+parser.add_argument('--quiet', '-q', action='store_true',
+    help='Suppress BUSCO output')
+
+args = parser.parse_args()
+
+input_paths = [pathlib.Path(p) for p in args.input]
+output_dir  = pathlib.Path(args.output_dir)
+
+for inp in input_paths:
+    if not inp.exists():
+        print(f"ERROR: Input file not found: {inp}")
+        sys.exit(1)
+
+print(f"\n{' BUSCO Evaluation ':=^60}")
+print(f"  Input files: {len(input_paths)}")
+print(f"  Lineage:     {args.lineage}")
+print(f"  Mode:        {args.mode}")
+print(f"  CPUs/run:    {args.cpu}")
+print(f"  Output dir:  {output_dir}")
+
+print(f"\n{' Checking BUSCO ':=^60}")
+
+if not ev.check_busco_installed():
+    print("  ERROR: BUSCO is not installed!")
+    print("  Install with: conda install -c bioconda busco")
+    sys.exit(1)
+
+print("  BUSCO is available")
+
+output_dir.mkdir(parents=True, exist_ok=True)
+
+
+def evaluate_file(input_path):
+    """Run BUSCO on a single input file"""
+
+    try:
+        result = ev.run_busco(
+            input_file = str(input_path),
+            lineage    = args.lineage,
+            mode       = args.mode,
+            output_dir = str(output_dir),
+            cpu        = args.cpu,
+            quiet      = args.quiet,
+        )
+        result['file']    = str(input_path.name)
+        result['success'] = True
+        return result
+    except Exception as e:
+        return {
+            'file':    str(input_path.name),
+            'success': False,
+            'error':   str(e),
+        }
+
+
+print(f"\n{' Running BUSCO ':=^60}")
+
+all_results = []
+
+if args.parallel > 1 and len(input_paths) > 1:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=args.parallel) as executor:
+        futures = {executor.submit(evaluate_file, p): p for p in input_paths}
+
+        for future in concurrent.futures.as_completed(futures):
+            inp = futures[future]
+            try:
+                result = future.result()
+                all_results.append(result)
+                if result['success']:
+                    print(f"  {inp.name}: C={result['complete']:.1%}")
+                else:
+                    print(f"  {inp.name}: ERROR - {result.get('error', 'Unknown')}")
+            except Exception as e:
+                print(f"  {inp.name}: ERROR - {e}")
+                all_results.append({'file': str(inp.name), 'success': False, 'error': str(e)})
+else:
+    for inp in input_paths:
+        print(f"  Processing {inp.name}...")
+        result = evaluate_file(inp)
+        all_results.append(result)
+        if result['success']:
+            print(f"    Complete: {result['complete']:.1%}")
+        else:
+            print(f"    ERROR: {result.get('error', 'Unknown')}")
+
+print(f"\n{' Results ':=^60}")
+
+for result in all_results:
+    fname = result['file']
+    print(f"\n  {fname}")
+    print(f"  {'-' * (len(fname) + 2)}")
+
+    if not result.get('success', False):
+        print(f"    ERROR: {result.get('error', 'Unknown error')}")
+        continue
+
+    complete    = result['complete']
+    single_copy = result['single_copy']
+    duplicated  = result['duplicated']
+    fragmented  = result['fragmented']
+    missing     = result['missing']
+    total       = result['total']
+    lineage     = result['lineage']
+
+    print(f"    Lineage:     {lineage}")
+    print(f"    Complete:    {complete:6.1%}  (S={single_copy:.1%}, D={duplicated:.1%})")
+    print(f"    Fragmented:  {fragmented:6.1%}")
+    print(f"    Missing:     {missing:6.1%}")
+    print(f"    Total BUSCOs: {total}")
+
+if len(all_results) > 1:
+    print(f"\n{' Summary ':=^60}")
+
+    complete_scores = [r['complete'] for r in all_results if r.get('success')]
+
+    if complete_scores:
+        avg_complete = sum(complete_scores) / len(complete_scores)
+        min_complete = min(complete_scores)
+        max_complete = max(complete_scores)
+        print(f"  Complete: avg={avg_complete:.1%}  min={min_complete:.1%}  max={max_complete:.1%}  n={len(complete_scores)}")
+
+    success_count = sum(1 for r in all_results if r.get('success'))
+    failed_count  = len(all_results) - success_count
+    print(f"  Success: {success_count}  Failed: {failed_count}")
+
+if args.output:
+    output_path = pathlib.Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    report = {
+        'lineage':  args.lineage,
+        'mode':     args.mode,
+        'results':  all_results,
+    }
+
+    with open(output_path, 'w') as f:
+        json.dump(report, f, indent=2)
+
+    print(f"\n  Report written: {output_path}")
+
+print(f"\n{'='*60}")
+print('Done!')
+print(f"{'='*60}")
