@@ -21,13 +21,19 @@ class TrainLogger:
     Prints human-readable lines to stdout. Rank-0 only.
     """
 
-    def __init__(self, output_dir, filename="training_log.csv"):
+    def __init__(self, output_dir, filename="training_log.csv", resume=False):
 
         self.log_path   = Path(output_dir) / filename
         self.start_time = time.time()
-        self._file      = open(self.log_path, 'w', newline='')
-        self._writer    = csv.DictWriter(self._file, fieldnames=STEP_FIELDS)
-        self._writer.writeheader()
+
+        if resume and self.log_path.exists():
+            self._file   = open(self.log_path, 'a', newline='')
+            self._writer = csv.DictWriter(self._file, fieldnames=STEP_FIELDS)
+        else:
+            self._file   = open(self.log_path, 'w', newline='')
+            self._writer = csv.DictWriter(self._file, fieldnames=STEP_FIELDS)
+            self._writer.writeheader()
+
         self._file.flush()
 
     def _memory_stats(self):
@@ -123,7 +129,7 @@ class TrainLogger:
         self.close()
 
 
-def create_train_logger(output_dir, filename="training_log.csv"):
-    """Create a training logger that writes to output_dir/filename"""
+def create_train_logger(output_dir, filename="training_log.csv", resume=False):
+    """Create a training logger, appends if resuming from checkpoint"""
 
-    return TrainLogger(output_dir, filename)
+    return TrainLogger(output_dir, filename, resume=resume)

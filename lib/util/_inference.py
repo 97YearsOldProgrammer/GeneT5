@@ -5,7 +5,6 @@ import pathlib as pl
 from dataclasses import dataclass, field
 
 import torch
-import torch.nn.functional as F
 
 import lib.model        as model_lib
 import lib.util._output as output_lib
@@ -134,21 +133,88 @@ class GeneT5Inference:
         tokenizer = cls._load_tokenizer(tokenizer_path)
 
         return cls(model=model, tokenizer=tokenizer, device=target_device, dtype=target_dtype, include_introns=include_introns)
-    
+
+    @classmethod
+    def from_checkpoint(cls, checkpoint_path, model_config_path, tokenizer_path,
+                        device=None, dtype=None, include_introns=False):
+        """Load model from a training checkpoint .pt file"""
+
+        import lib.tokenizer as tk_lib
+
+        target_device = device or auto_detect_device()
+        target_dtype  = dtype or select_dtype(target_device)
+
+        # Load model config
+        with open(model_config_path, 'r') as f:
+            config = json.load(f)
+
+        model = model_lib.GeneT5(
+            embed_dim            = config["embed_dim"],
+            encoder_num_layers   = config["encoder_num_layers"],
+            encoder_num_heads    = config["encoder_num_heads"],
+            encoder_ff_dim       = config["encoder_ff_dim"],
+            decoder_num_layers   = config["decoder_num_layers"],
+            decoder_num_heads    = config["decoder_num_heads"],
+            decoder_ff_dim       = config["decoder_ff_dim"],
+            decoder_dropout      = config["decoder_dropout"],
+            decoder_use_alibi    = config["decoder_use_alibi"],
+            decoder_use_moe      = config["decoder_use_moe"],
+            decoder_num_experts  = config.get("decoder_num_experts", 8),
+            decoder_moe_top_k    = config.get("decoder_moe_top_k", 2),
+            decoder_num_kv_heads = config.get("decoder_num_kv_heads"),
+            vocab_size           = config["vocab_size"],
+            tie_weights          = config["tie_weights"],
+            encoder_window_size  = config.get("encoder_window_size", 512),
+            decoder_block_size   = config.get("decoder_block_size", 16),
+            decoder_window_size  = config.get("decoder_window_size", 32),
+        )
+
+        ckpt = torch.load(checkpoint_path, map_location='cpu')
+        model.load_state_dict(ckpt['model_state_dict'])
+        model = model.to(device=target_device, dtype=target_dtype)
+
+        tokenizer = tk_lib.GeneTokenizer(pl.Path(tokenizer_path))
+
+        return cls(model=model, tokenizer=tokenizer, device=target_device, dtype=target_dtype, include_introns=include_introns)
+
+    @classmethod
+    def from_model(cls, model, tokenizer, device=None, dtype=None, include_introns=False):
+        """Wrap an already-loaded model for inference (for in-training eval)"""
+
+        target_device = device or auto_detect_device()
+        target_dtype  = dtype or select_dtype(target_device)
+
+        instance                = object.__new__(cls)
+        instance.device         = target_device
+        instance.dtype          = target_dtype
+        instance.model          = model
+        instance.tokenizer      = tokenizer
+        instance.include_introns = include_introns
+        instance.parser         = output_lib.ModelOutputParser(strict=False)
+        instance.converter      = output_lib.GFFConverter(include_introns=include_introns)
+
+        return instance
+
     @staticmethod
     def _load_tokenizer(tokenizer_path):
-        """Load tokenizer from path - supports multiple tokenizer types"""
-        
+        """Load tokenizer from path - prefers GeneTokenizer, falls back to alternatives"""
+
+        try:
+            import lib.tokenizer as tk_lib
+            return tk_lib.GeneTokenizer(tokenizer_path)
+        except Exception:
+            pass
+
         try:
             import transformers as tf
             return tf.AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
         except Exception:
             pass
-        
+
         vocab_path = tokenizer_path / "vocab.json"
         if vocab_path.exists():
             return SimpleTokenizer.from_vocab(vocab_path)
-        
+
         raise ValueError(f"Could not load tokenizer from {tokenizer_path}")
     
     def encode(self, sequences, max_length=2048):

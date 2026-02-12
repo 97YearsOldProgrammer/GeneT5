@@ -90,6 +90,10 @@ def main():
         help='apply MXFP8 quantization to dense Linear layers (Blackwell only)')
     parser.add_argument('--compile', action='store_true',
         help='enable torch.compile on encoder and decoder')
+    parser.add_argument('--eval_data', required=False, type=str, default=None,
+        metavar='<file>', help='path to eval JSON for post-checkpoint F1 evaluation')
+    parser.add_argument('--eval_samples', required=False, type=int, default=20,
+        metavar='<int>', help='number of samples per eval run [%(default)i]')
 
     args = parser.parse_args()
 
@@ -377,8 +381,17 @@ def main():
     # Training metrics logger (CSV + stdout, rank 0 only)
     train_logger = None
     if is_main:
-        train_logger = util.create_train_logger(output_dir)
+        train_logger = util.create_train_logger(output_dir, resume=args.checkpoint is not None)
         print(f"  Training log: {train_logger.log_path}")
+
+    # Eval hook (rank 0 only)
+    evaluator   = None
+    eval_logger = None
+    if args.eval_data and is_main:
+        evaluator   = util.CheckpointEvaluator(args.eval_data, tokenizer, num_samples=args.eval_samples)
+        eval_logger = util.EvalLogger(output_dir)
+        print(f"  Eval data: {args.eval_data} ({len(evaluator.samples)} samples)")
+        print(f"  Eval log: {eval_logger.log_path}")
 
     for epoch in range(start_epoch, args.epochs):
         if is_main:
@@ -542,6 +555,15 @@ def main():
         if train_logger:
             train_logger.log_epoch(epoch + 1, train_loss, val_loss, scheduler.get_last_lr()[0])
 
+        # Post-epoch eval (rank 0 only, runs inference on held-out species)
+        if evaluator and is_main:
+            print(f"  Running eval on {len(evaluator.samples)} held-out samples...")
+            eval_model   = train_util.unwrap_model(model)
+            eval_metrics = evaluator.evaluate(eval_model, device, dtype)
+            eval_logger.log(epoch + 1, global_step, eval_metrics)
+            print(f"  Eval: exon_F1={eval_metrics['exon_f1']:.4f}  gene_F1={eval_metrics['gene_f1']:.4f}  "
+                  f"({eval_metrics['num_predicted']} predicted, {eval_metrics['eval_sec']}s)")
+
         # checkpointing (rank 0 saves, all ranks wait)
         save_model = train_util.unwrap_model(model)
 
@@ -591,11 +613,13 @@ def main():
 
         train_util.barrier()
     
-    # Stop memory watcher and close logger
+    # Stop memory watcher and close loggers
     if mem_watcher:
         mem_watcher.stop()
     if train_logger:
         train_logger.close()
+    if eval_logger:
+        eval_logger.close()
 
     # save final (rank 0 only)
     if is_main:

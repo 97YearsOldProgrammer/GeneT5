@@ -47,3 +47,8 @@ from lib.util._logger import (
     TrainLogger,
     create_train_logger,
 )
+
+from lib.util._eval_hook import (
+    CheckpointEvaluator,
+    EvalLogger,
+)
