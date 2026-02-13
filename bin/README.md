@@ -57,6 +57,11 @@ PYTHONPATH=. python bin/subset_packed \
     --fraction 0.05
 ```
 
+**Mid-trainning Eval**
+
+```python
+python bin/prep_eval ../raw/S.scrofa/ -o ../baked/GeneT5/eval/S.scrofa_eval.json
+```
 
 ---
 

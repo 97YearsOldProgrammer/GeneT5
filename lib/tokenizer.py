@@ -15,13 +15,9 @@ FORMAT   = ["[ATT]", "[HIT]", "+", "-", r"[\t]", r"[\n]"]
 NUMBERS  = [str(i) for i in range(1000)]
 NMASK    = ["N" * i for i in range(1, 7)]
 FEATURES = ["exon"]
-BIOTYPES = [
-    "protein_coding", "lncrna", "pseudogene",
-    "trna", "rrna", "snorna", "snrna", "mirna",
-]
 HINTS    = ["intron_hc", "intron_lc"]
 
-GFF_TOKENS = SPECIAL + FORMAT + NUMBERS + NMASK + FEATURES + BIOTYPES + HINTS
+GFF_TOKENS = SPECIAL + FORMAT + NUMBERS + NMASK + FEATURES + HINTS
 
 
 #######################

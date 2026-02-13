@@ -259,7 +259,7 @@ class BinaryChunk:
             fstart  = f.get("start", 0)
             fend    = f.get("end", 0)
             fstrand = f.get("strand", "+")
-            biotype = f.get("biotype", "protein_coding")
+            fphase  = f.get("phase", ".")
 
             gene_id       = f.get("gene_id", "")
             transcript_id = f.get("transcript_id", "")
@@ -281,8 +281,8 @@ class BinaryChunk:
             else:
                 trailing = ""
 
-            # Format: {start}[\t]{end}{strand}{biotype}{gene_idx}[[\t]{cds_coord}][\n]
-            target_text += rf"{fstart}[\t]{fend}{fstrand}{biotype}{gene_idx_str}{trailing}[\n]"
+            # Format: {start}[\t]{end}{strand}{phase}[\t]{gene_idx}[[\t]{cds_coord}][\n]
+            target_text += rf"{fstart}[\t]{fend}{fstrand}{fphase}[\t]{gene_idx_str}{trailing}[\n]"
 
         target_text += "<eos>"
 

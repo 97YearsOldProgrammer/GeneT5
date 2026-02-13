@@ -1,6 +1,8 @@
 import gzip
 import re
 import os
+import random
+import pathlib
 from collections import defaultdict
 
 
@@ -367,3 +369,145 @@ def extract_biotypes(features):
                 biotypes.add(bt.lower())
 
     return biotypes
+
+
+#########################
+#####  File Utils   #####
+#########################
+
+
+def find_genome_files(species_dir):
+    """Find FASTA and GFF files in species directory"""
+
+    species_dir = pathlib.Path(species_dir)
+    fna_path    = None
+    gff_path    = None
+
+    for f in species_dir.iterdir():
+        name = f.name.lower()
+        if name.endswith(('.fna', '.fna.gz', '.fa', '.fa.gz', '.fasta', '.fasta.gz')):
+            fna_path = f
+        elif name.endswith(('.gff', '.gff.gz', '.gff3', '.gff3.gz')):
+            gff_path = f
+
+    if not fna_path:
+        raise FileNotFoundError(f"No FASTA file found in {species_dir}")
+    if not gff_path:
+        raise FileNotFoundError(f"No GFF file found in {species_dir}")
+
+    return fna_path, gff_path
+
+
+########################
+#####  Eval Prep   #####
+########################
+
+
+def extract_coding_genes(gene_index):
+    """Filter gene index to protein-coding genes with exons"""
+
+    coding_genes = {}
+
+    for gene_id, gene_data in gene_index.items():
+        attrs   = gene_data.get("attributes", {})
+        biotype = attrs.get("gene_biotype", attrs.get("biotype", "")).lower()
+
+        if biotype != "protein_coding":
+            continue
+
+        exons = [f for f in gene_data.get("features", []) if f["type"].lower() == "exon"]
+        if not exons:
+            continue
+
+        coding_genes[gene_id] = gene_data
+
+    return coding_genes
+
+
+def build_eval_sample(gene_id, gene_data, sequences, window_size):
+    """Build a single eval sample with genomic window around a gene"""
+
+    seqid  = gene_data["seqid"]
+    strand = gene_data["strand"]
+
+    if seqid not in sequences:
+        return None
+
+    seq_len    = len(sequences[seqid])
+    gene_start = gene_data["start"]
+    gene_end   = gene_data["end"]
+    gene_len   = gene_end - gene_start + 1
+
+    if gene_len > window_size:
+        return None
+
+    # Center gene in window
+    padding      = (window_size - gene_len) // 2
+    window_start = max(1, gene_start - padding)
+    window_end   = min(seq_len, window_start + window_size - 1)
+    window_start = max(1, window_end - window_size + 1)
+
+    # Extract sequence (1-based GFF coords -> 0-based python slice)
+    sequence = sequences[seqid][window_start - 1:window_end]
+
+    if len(sequence) < 1000:
+        return None
+
+    # Build reference features relative to window
+    ref_features = []
+    for feat in gene_data.get("features", []):
+        if feat["type"].lower() != "exon":
+            continue
+
+        feat_start = feat["start"] - window_start
+        feat_end   = feat["end"] - window_start
+
+        if feat_start < 0 or feat_end >= len(sequence):
+            continue
+
+        ref_features.append({
+            "start":   feat_start,
+            "end":     feat_end,
+            "strand":  strand,
+            "type":    "exon",
+            "phase":   feat.get("phase", "."),
+        })
+
+    if not ref_features:
+        return None
+
+    return {
+        "sequence":     sequence,
+        "ref_features": sorted(ref_features, key=lambda f: f["start"]),
+        "seqid":        seqid,
+        "gene_id":      gene_id,
+        "window_start": window_start,
+        "window_end":   window_end,
+        "strand":       strand,
+        "num_exons":    len(ref_features),
+    }
+
+
+def select_diverse_samples(samples, n):
+    """Select samples from diverse chromosomes via round-robin"""
+
+    by_chr = {}
+    for s in samples:
+        seqid = s["seqid"]
+        if seqid not in by_chr:
+            by_chr[seqid] = []
+        by_chr[seqid].append(s)
+
+    selected  = []
+    chr_names = sorted(by_chr.keys())
+
+    idx = 0
+    while len(selected) < n and any(by_chr[c] for c in chr_names):
+        c = chr_names[idx % len(chr_names)]
+        if by_chr[c]:
+            sample = random.choice(by_chr[c])
+            by_chr[c].remove(sample)
+            selected.append(sample)
+        idx += 1
+
+    return selected[:n]

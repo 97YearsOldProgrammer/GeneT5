@@ -7,6 +7,10 @@ from lib.dataset.wrapper import (
     filter_canonical_transcripts,
     extract_feature_types,
     extract_biotypes,
+    find_genome_files,
+    extract_coding_genes,
+    build_eval_sample,
+    select_diverse_samples,
 
     # Chunking
     dynamic_chunking,

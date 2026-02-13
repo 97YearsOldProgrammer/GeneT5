@@ -5,195 +5,70 @@ import json
 import random
 import pathlib
 
-import lib.dataset._parser as parser
+import lib.dataset as ds
 
 
-WINDOW_SIZE = 20000
+parser = argparse.ArgumentParser(description='Prepare GRPO training data from multiple species')
+parser.add_argument('species_dirs', nargs='+', type=str, metavar='<dir>',
+    help='one or more species directories with fna.gz + gff.gz')
+parser.add_argument('-o', '--output', type=str, required=True,
+    metavar='<file>', help='output JSON file path')
+parser.add_argument('-n', '--num_samples', type=int, default=5000,
+    metavar='<int>', help='total number of GRPO samples [%(default)i]')
+parser.add_argument('-w', '--window_size', type=int, default=20000,
+    metavar='<int>', help='genomic window size [%(default)i]')
+parser.add_argument('-s', '--seed', type=int, default=42,
+    metavar='<int>', help='random seed [%(default)i]')
 
+args = parser.parse_args()
+random.seed(args.seed)
 
-def find_genome_files(species_dir):
-    """Find FASTA and GFF files in species directory"""
+all_samples = []
 
-    species_dir = pathlib.Path(species_dir)
-    fna_path    = None
-    gff_path    = None
+for species_path in args.species_dirs:
+    species_dir = pathlib.Path(species_path)
+    if not species_dir.is_dir():
+        print(f"SKIP: {species_path} (not a directory)")
+        continue
 
-    for f in species_dir.iterdir():
-        name = f.name.lower()
-        if 'genomic' in name and name.endswith(('.fna', '.fna.gz', '.fa', '.fa.gz', '.fasta', '.fasta.gz')):
-            fna_path = f
-        elif 'genomic' in name and name.endswith(('.gff', '.gff.gz', '.gff3', '.gff3.gz')):
-            gff_path = f
+    print(f"\nProcessing {species_dir.name}...")
 
-    if not fna_path:
-        raise FileNotFoundError(f"No FASTA file found in {species_dir}")
-    if not gff_path:
-        raise FileNotFoundError(f"No GFF file found in {species_dir}")
-
-    return fna_path, gff_path
-
-
-def extract_protein_coding_genes(gene_index):
-    """Filter gene index to protein-coding genes with exons"""
-
-    coding_genes = {}
-
-    for gene_id, gene_data in gene_index.items():
-        attrs   = gene_data.get("attributes", {})
-        biotype = attrs.get("gene_biotype", attrs.get("biotype", "")).lower()
-
-        if biotype != "protein_coding":
-            continue
-
-        exons = [f for f in gene_data.get("features", []) if f["type"].lower() == "exon"]
-        if not exons:
-            continue
-
-        coding_genes[gene_id] = gene_data
-
-    return coding_genes
-
-
-def build_eval_sample(gene_id, gene_data, sequences, window_size):
-    """Build a single eval sample with genomic window around a gene"""
-
-    seqid  = gene_data["seqid"]
-    strand = gene_data["strand"]
-
-    if seqid not in sequences:
-        return None
-
-    seq_len    = len(sequences[seqid])
-    gene_start = gene_data["start"]
-    gene_end   = gene_data["end"]
-    gene_len   = gene_end - gene_start + 1
-
-    if gene_len > window_size:
-        return None
-
-    padding      = (window_size - gene_len) // 2
-    window_start = max(1, gene_start - padding)
-    window_end   = min(seq_len, window_start + window_size - 1)
-    window_start = max(1, window_end - window_size + 1)
-
-    sequence = sequences[seqid][window_start - 1:window_end]
-
-    if len(sequence) < 1000:
-        return None
-
-    ref_features = []
-    for feat in gene_data.get("features", []):
-        if feat["type"].lower() != "exon":
-            continue
-
-        feat_start = feat["start"] - window_start
-        feat_end   = feat["end"] - window_start
-
-        if feat_start < 0 or feat_end >= len(sequence):
-            continue
-
-        attrs   = feat.get("attributes", {})
-        biotype = attrs.get("biotype", attrs.get("transcript_biotype", "protein_coding")).lower()
-
-        ref_features.append({
-            "start":    feat_start,
-            "end":      feat_end,
-            "strand":   strand,
-            "biotype":  biotype,
-            "type":     "exon",
-            "gene_idx": 0,
-        })
-
-    if not ref_features:
-        return None
-
-    return {
-        "sequence":     sequence,
-        "ref_features": sorted(ref_features, key=lambda f: f["start"]),
-        "seqid":        seqid,
-        "gene_id":      gene_id,
-        "window_start": window_start,
-        "window_end":   window_end,
-        "strand":       strand,
-        "num_exons":    len(ref_features),
-    }
-
-
-def process_species(species_dir, window_size):
-    """Process a single species directory into eval samples"""
-
-    fna_path, gff_path = find_genome_files(species_dir)
-
-    sequences  = parser.parse_fasta(fna_path)
-    features   = parser.parse_gff(gff_path)
-    gene_index = parser.build_gene_index(features)
-    gene_index = parser.filter_canonical_transcripts(gene_index)
-
-    coding_genes = extract_protein_coding_genes(gene_index)
+    fna_path, gff_path = ds.find_genome_files(species_dir)
+    sequences          = ds.parse_fasta(fna_path)
+    features           = ds.parse_gff(gff_path)
+    gene_index         = ds.build_gene_index(features)
+    gene_index         = ds.filter_canonical_transcripts(gene_index)
+    coding_genes       = ds.extract_coding_genes(gene_index)
 
     samples = []
     for gene_id, gene_data in coding_genes.items():
-        sample = build_eval_sample(gene_id, gene_data, sequences, window_size)
+        sample = ds.build_eval_sample(gene_id, gene_data, sequences, args.window_size)
         if sample:
             sample["species"] = species_dir.name
             samples.append(sample)
 
-    return samples
+    print(f"  {len(samples)} valid samples")
+    all_samples.extend(samples)
 
+print(f"\nTotal samples across all species: {len(all_samples)}")
 
-def main():
+# Shuffle and select
+random.shuffle(all_samples)
+selected = all_samples[:args.num_samples]
 
-    ap = argparse.ArgumentParser(description='Prepare GRPO training data from multiple species')
-    ap.add_argument('species_dirs', nargs='+', type=str, metavar='<dir>',
-        help='one or more species directories with genomic.fna.gz + genomic.gff.gz')
-    ap.add_argument('-o', '--output', type=str, required=True,
-        metavar='<file>', help='output JSON file path')
-    ap.add_argument('-n', '--num_samples', type=int, default=5000,
-        metavar='<int>', help='total number of GRPO samples [%(default)i]')
-    ap.add_argument('-w', '--window_size', type=int, default=WINDOW_SIZE,
-        metavar='<int>', help='genomic window size [%(default)i]')
-    ap.add_argument('-s', '--seed', type=int, default=42,
-        metavar='<int>', help='random seed [%(default)i]')
+# Write output
+output_path = pathlib.Path(args.output)
+output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    args = ap.parse_args()
-    random.seed(args.seed)
+with open(output_path, 'w') as f:
+    json.dump(selected, f)
 
-    all_samples = []
+size_mb = output_path.stat().st_size / 1024 / 1024
+print(f"\nSaved: {output_path} ({size_mb:.1f} MB)")
 
-    for species_path in args.species_dirs:
-        species_dir = pathlib.Path(species_path)
-        if not species_dir.is_dir():
-            print(f"SKIP: {species_path} (not a directory)")
-            continue
-
-        print(f"\nProcessing {species_dir.name}...")
-        samples = process_species(species_dir, args.window_size)
-        print(f"  {len(samples)} valid samples")
-        all_samples.extend(samples)
-
-    print(f"\nTotal samples across all species: {len(all_samples)}")
-
-    # Shuffle and select
-    random.shuffle(all_samples)
-    selected = all_samples[:args.num_samples]
-
-    # Write output
-    output_path = pathlib.Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(output_path, 'w') as f:
-        json.dump(selected, f)
-
-    size_mb = output_path.stat().st_size / 1024 / 1024
-    print(f"\nSaved: {output_path} ({size_mb:.1f} MB)")
-
-    # Summary
-    species_set = set(s.get("species", "unknown") for s in selected)
-    total_exons = sum(s["num_exons"] for s in selected)
-    print(f"  Samples:  {len(selected)}")
-    print(f"  Species:  {len(species_set)} ({', '.join(sorted(species_set))})")
-    print(f"  Exons:    {total_exons}")
-
-
-if __name__ == '__main__':
-    main()
+# Summary
+species_set = set(s.get("species", "unknown") for s in selected)
+total_exons = sum(s["num_exons"] for s in selected)
+print(f"  Samples:  {len(selected)}")
+print(f"  Species:  {len(species_set)} ({', '.join(sorted(species_set))})")
+print(f"  Exons:    {total_exons}")

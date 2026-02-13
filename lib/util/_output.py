@@ -57,32 +57,18 @@ class ParsedFeature:
 class ModelOutputParser:
     """Parser for GeneT5 model output format (compressed: no type prefix)"""
 
-    # Compressed format: {start}[\t]{end}{strand}{phase}{biotype}{gene_idx}[[\t]{cds_coord}]
-    # Non-UTR: 100[\t]200+.protein_coding1
-    # UTR:     100[\t]200+0protein_coding1[\t]150
+    # Format: {start}[\t]{end}{strand}{phase}[\t]{gene_idx}[[\t]{cds_coord}]
+    # Non-UTR: 100[\t]200+.[\t]1
+    # UTR:     300[\t]450+0[\t]1[\t]320
     FEATURE_PATTERN = re.compile(
         r'^(?P<start>\d+)'
         r'\[\\t\]'
         r'(?P<end>\d+)'
         r'(?P<strand>[+\-])'
         r'(?P<phase>[.\d])'
-        r'(?P<biotype>[a-zA-Z_]+)'
+        r'\[\\t\]'
         r'(?P<gene_idx>\d+)'
-        r'(?:\.(?P<transcript_idx>\d+))?'
         r'(?:\[\\t\](?P<cds_coord>\d+))?$'
-    )
-
-    # Legacy format with type prefix (for backwards compatibility)
-    FEATURE_PATTERN_LEGACY = re.compile(
-        r'^(?P<type>[a-zA-Z_]+)'
-        r'(?P<start>\d+)'
-        r'(?:\[\\t\]|\t|\s+)'
-        r'(?P<end>\d+)'
-        r'(?P<strand>[+\-])'
-        r'(?P<phase>[.\d])'
-        r'(?P<biotype>[a-zA-Z_]+)'
-        r'(?P<gene_idx>\d+)'
-        r'(?:\.(?P<transcript_idx>\d+))?$'
     )
 
     BOS_TOKEN = "<bos>"
@@ -101,7 +87,6 @@ class ModelOutputParser:
         if not line or line in (self.BOS_TOKEN, self.EOS_TOKEN, "<BOS>", "<EOS>"):
             return None
 
-        # Try compressed format first (no type prefix)
         match = self.FEATURE_PATTERN.match(line)
         if match:
             groups = match.groupdict()
@@ -111,25 +96,8 @@ class ModelOutputParser:
                 end            = int(groups["end"]),
                 strand         = groups["strand"],
                 phase          = groups["phase"],
-                biotype        = groups["biotype"],
+                biotype        = ".",
                 gene_idx       = int(groups["gene_idx"]),
-                transcript_idx = int(groups["transcript_idx"]) if groups.get("transcript_idx") else None,
-                raw_line       = line,
-            )
-
-        # Try legacy format (with type prefix)
-        match = self.FEATURE_PATTERN_LEGACY.match(line)
-        if match:
-            groups = match.groupdict()
-            return ParsedFeature(
-                feature_type   = groups["type"].lower(),
-                start          = int(groups["start"]),
-                end            = int(groups["end"]),
-                strand         = groups["strand"],
-                phase          = groups["phase"],
-                biotype        = groups["biotype"],
-                gene_idx       = int(groups["gene_idx"]),
-                transcript_idx = int(groups["transcript_idx"]) if groups.get("transcript_idx") else None,
                 raw_line       = line,
             )
 
@@ -238,7 +206,7 @@ class GFFConverter:
                     end            = intron_end,
                     strand         = curr_exon.strand,
                     phase          = ".",
-                    biotype        = curr_exon.biotype,
+                    biotype        = ".",
                     gene_idx       = gene_idx,
                     transcript_idx = transcript_idx,
                     raw_line       = "",
@@ -262,11 +230,7 @@ class GFFConverter:
             "ID":      feature_id,
             "Parent":  transcript_id,
             "gene_id": gene_id,
-            "biotype": feature.biotype,
         }
-        
-        if feature.transcript_idx is not None:
-            attributes["transcript_id"] = transcript_id
         
         return GFFFeature(
             seqid      = self.seqid,
@@ -300,12 +264,15 @@ class GFFConverter:
             transcripts         = gene_features[gene_idx]
             all_features_in_gene = [f for t in transcripts.values() for f in t]
             
-            gene_start   = min(f.start for f in all_features_in_gene)
-            gene_end     = max(f.end for f in all_features_in_gene)
-            gene_strand  = all_features_in_gene[0].strand
-            gene_biotype = all_features_in_gene[0].biotype
-            gene_id      = self._make_gene_id(gene_idx)
-            
+            gene_start  = min(f.start for f in all_features_in_gene)
+            gene_end    = max(f.end for f in all_features_in_gene)
+            gene_strand = all_features_in_gene[0].strand
+            gene_id     = self._make_gene_id(gene_idx)
+
+            # Infer gene type from CDS presence across all transcripts
+            has_cds     = any(f.phase in ("0", "1", "2") for f in all_features_in_gene)
+            gene_biotype = "protein_coding" if has_cds else "transcript"
+
             gff_features.append(GFFFeature(
                 seqid      = self.seqid,
                 source     = self.source,
@@ -317,17 +284,21 @@ class GFFConverter:
                 phase      = ".",
                 attributes = {"ID": gene_id, "biotype": gene_biotype},
             ))
-            
+
             for transcript_idx in sorted(transcripts.keys(), key=lambda x: x or 0):
                 transcript_features = transcripts[transcript_idx]
                 trans_start         = min(f.start for f in transcript_features)
                 trans_end           = max(f.end for f in transcript_features)
                 transcript_id       = self._make_transcript_id(gene_idx, transcript_idx)
-                
+
+                # Infer transcript type from CDS presence
+                trans_has_cds = any(f.phase in ("0", "1", "2") for f in transcript_features)
+                trans_type    = "mRNA" if trans_has_cds else "transcript"
+
                 gff_features.append(GFFFeature(
                     seqid      = self.seqid,
                     source     = self.source,
-                    type       = transcript_features[0].biotype,
+                    type       = trans_type,
                     start      = trans_start + self.offset,
                     end        = trans_end + self.offset,
                     score      = self.score,

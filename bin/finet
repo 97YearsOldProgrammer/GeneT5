@@ -26,7 +26,7 @@ import lib.util.train   as train_util
 DEFAULTS = {
     'batch_size':     8,
     'lr':             1e-4,
-    'epochs':         4,
+    'epochs':         3,
     'weight_decay':   0.1,
     'warmup_ratio':   0.03,
     'grad_accum':     64,

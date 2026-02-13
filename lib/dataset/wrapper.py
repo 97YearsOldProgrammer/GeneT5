@@ -16,6 +16,10 @@ build_gene_index               = parser.build_gene_index
 filter_canonical_transcripts   = parser.filter_canonical_transcripts
 extract_feature_types          = parser.extract_feature_types
 extract_biotypes               = parser.extract_biotypes
+find_genome_files              = parser.find_genome_files
+extract_coding_genes           = parser.extract_coding_genes
+build_eval_sample              = parser.build_eval_sample
+select_diverse_samples         = parser.select_diverse_samples
 
 
 #####################
