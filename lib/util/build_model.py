@@ -16,11 +16,10 @@ from lib.tokenizer import GeneTokenizer
 
 
 ENCODER_DEFAULTS = {
-    "window_size": -1,
+    "window_size": 1024,
 }
 
 DECODER_DEFAULTS = {
-    "block_size":   64,
     "window_size":  256,
     "dropout":      0.1,
     "use_alibi":    True,
@@ -43,7 +42,6 @@ def build_gt5(
     # Encoder sliding window
     encoder_window_size = ENCODER_DEFAULTS["window_size"],
     # Decoder sparse attention
-    decoder_block_size  = DECODER_DEFAULTS["block_size"],
     decoder_window_size = DECODER_DEFAULTS["window_size"],
     # Decoder architecture
     decoder_num_layers  = None,  # defaults to encoder
@@ -83,8 +81,6 @@ def build_gt5(
     """
     
     # Handle None values - fall back to defaults
-    if decoder_block_size is None:
-        decoder_block_size = DECODER_DEFAULTS["block_size"]
     if decoder_window_size is None:
         decoder_window_size = DECODER_DEFAULTS["window_size"]
     if init_embed_std is None:
@@ -127,7 +123,7 @@ def build_gt5(
     print(f"\n    DNABERT-2: hidden={embed_dim}, layers={num_layers}, heads={num_heads}")
     print(f"    Decoder:   layers={decoder_num_layers}, heads={decoder_num_heads}, kv_heads={decoder_num_kv_heads}, moe={decoder_use_moe}")
     print(f"    Encoder: window={encoder_window_size}")
-    print(f"    Decoder Sparse: block={decoder_block_size}, window={decoder_window_size}")
+    print(f"    Decoder: window={decoder_window_size}")
 
     # Load raw state dict (no model construction needed)
     print(f"\n[2] Loading DNABERT-2 weights")
@@ -206,7 +202,6 @@ def build_gt5(
         num_experts  = decoder_num_experts,
         moe_top_k    = decoder_moe_top_k,
         num_kv_heads = decoder_num_kv_heads,
-        block_size   = decoder_block_size,
         window_size  = decoder_window_size,
     )
     
@@ -285,7 +280,6 @@ def build_gt5(
         "vocab_size":           vocab_size,
         "tie_weights":          tie_weights,
         "encoder_window_size":  encoder_window_size,
-        "decoder_block_size":   decoder_block_size,
         "decoder_window_size":  decoder_window_size,
     }
     

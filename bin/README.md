@@ -29,9 +29,8 @@ PYTHONPATH=. python bin/init_model.py \
     --init_ffn_std 0.02 \
     --init_attn_std 0.02 \
     --init_moe_router_std 0.006 \
-    --encoder_window_size 512 \
-    --decoder_block_size 16 \
-    --decoder_window_size 32 \
+    --encoder_window_size 1024 \
+    --decoder_window_size 256 \
     2>&1 | tee ../logs/init.log
 ```
 

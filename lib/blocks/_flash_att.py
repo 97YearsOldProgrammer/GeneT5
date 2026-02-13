@@ -1,12 +1,15 @@
-from __future__ import annotations
-
 import math
 from dataclasses import dataclass
 
-import torch    as th
+import torch
 import torch.nn as nn
 
 from flash_attn import flash_attn_func
+
+
+#####################
+####   CONFIG    ####
+#####################
 
 
 @dataclass
@@ -15,7 +18,7 @@ class SparseAttentionConfig:
     num_heads:    int   = 12
     num_kv_heads: int   = None
     head_dim:     int   = None
-    window_size:  int   = 512      # total window (left + right)
+    window_size:  int   = 512
     dropout:      float = 0.0
     use_alibi:    bool  = True
 
@@ -27,12 +30,13 @@ class SparseAttentionConfig:
             self.head_dim = self.embed_dim // self.num_heads
 
 
-class SparseAttention(nn.Module):
-    """Sliding window attention using flash_attn
+#####################
+####  ATTENTION  ####
+#####################
 
-    Uses flash_attn's native window_size parameter for O(n) sparse attention.
-    Supports GQA (grouped query attention) and ALiBi positional encoding.
-    """
+
+class SparseAttention(nn.Module):
+    """Sliding window attention using flash_attn with GQA and ALiBi"""
 
     def __init__(self, config, is_causal=False):
 
@@ -69,31 +73,24 @@ class SparseAttention(nn.Module):
 
         def get_slopes(n):
             if n == 1:
-                return th.tensor([1.0])
+                return torch.tensor([1.0])
             base = 2 ** (-2 ** -(math.log2(n) - 3))
-            return th.tensor([base ** i for i in range(1, n + 1)])
+            return torch.tensor([base ** i for i in range(1, n + 1)])
 
         if math.log2(num_heads).is_integer():
             return get_slopes(num_heads)
         else:
             closest_power = 2 ** math.floor(math.log2(num_heads))
-            return th.cat([
+            return torch.cat([
                 get_slopes(closest_power),
                 get_slopes(2 * closest_power)[0::2][:num_heads - closest_power]
             ])
 
-    def forward(self, hidden_states, attention_mask=None, segment_ids=None):
-        """Forward pass with sliding window attention
-
-        Args:
-            hidden_states: [B, L, D] input tensor
-            attention_mask: ignored (flash_attn uses window_size instead)
-            segment_ids: ignored (not supported by flash_attn)
-        """
+    def forward(self, hidden_states, attention_mask=None):
+        """Forward pass with sliding window attention"""
 
         B, L, D = hidden_states.shape
 
-        # Project to Q, K, V - flash_attn expects [B, L, H, head_dim]
         q = self.q(hidden_states).view(B, L, self.num_heads, self.head_dim)
         k = self.k(hidden_states).view(B, L, self.num_kv_heads, self.head_dim)
         v = self.v(hidden_states).view(B, L, self.num_kv_heads, self.head_dim)
@@ -105,14 +102,14 @@ class SparseAttention(nn.Module):
             v = v.unsqueeze(3).expand(B, L, self.num_kv_heads, self.heads_per_group, self.head_dim)
             v = v.reshape(B, L, self.num_heads, self.head_dim).contiguous()
 
-        # Window size: (left, right) - full attention when <= 0
         if self.window_size <= 0:
             window_size = (-1, -1)
+        elif self.is_causal:
+            window_size = (self.window_size, 0)
         else:
             half_window = self.window_size // 2
             window_size = (half_window, half_window)
 
-        # ALiBi slopes must be fp32
         alibi = self.alibi_slopes.float() if self.alibi_slopes is not None else None
 
         out = flash_attn_func(

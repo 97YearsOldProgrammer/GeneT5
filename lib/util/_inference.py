@@ -164,9 +164,8 @@ class GeneT5Inference:
             decoder_num_kv_heads = config.get("decoder_num_kv_heads"),
             vocab_size           = config["vocab_size"],
             tie_weights          = config["tie_weights"],
-            encoder_window_size  = config.get("encoder_window_size", 512),
-            decoder_block_size   = config.get("decoder_block_size", 16),
-            decoder_window_size  = config.get("decoder_window_size", 32),
+            encoder_window_size  = config.get("encoder_window_size", 1024),
+            decoder_window_size  = config.get("decoder_window_size", 256),
         )
 
         ckpt = torch.load(checkpoint_path, map_location='cpu')

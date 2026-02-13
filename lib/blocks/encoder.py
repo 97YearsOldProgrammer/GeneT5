@@ -1,16 +1,12 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.utils.checkpoint as ckpt
-import math
+import torch.nn                 as nn
+import torch.utils.checkpoint   as ckpt
 
-from lib.blocks._component import LayerNorm, FeedForward
-from lib.blocks._spareatt  import SparseAttention, SparseAttentionConfig
+from lib.blocks._component  import LayerNorm, FeedForward
+from lib.blocks._flash_att  import SparseAttention, SparseAttentionConfig
 
 
-#################
-#### Encoder ####
-#################
+####  ENCODER  ####
 
 
 class EncoderBlock(nn.Module):
@@ -44,7 +40,7 @@ class EncoderBlock(nn.Module):
         self.norm2   = LayerNorm(embed_dim)
         self.dropout = nn.Dropout(dropout)
     
-    def forward(self, hidden_states, attention_mask=None, position_bias=None):
+    def forward(self, hidden_states, attention_mask=None):
 
         normed             = self.norm1(hidden_states)
         attn_output, _     = self.self_attn(normed, attention_mask)
@@ -54,7 +50,7 @@ class EncoderBlock(nn.Module):
         ff_output          = self.ff(normed)
         hidden_states      = hidden_states + self.dropout(ff_output)
 
-        return hidden_states, None
+        return hidden_states
 
 
 class Encoder(nn.Module):
@@ -102,15 +98,14 @@ class Encoder(nn.Module):
 
         for layer in self.layers:
             if self._gradient_checkpointing and self.training:
-                hidden_states, _ = ckpt.checkpoint(
+                hidden_states = ckpt.checkpoint(
                     layer,
                     hidden_states,
                     attention_mask,
-                    None,
                     use_reentrant=False,
                 )
             else:
-                hidden_states, _ = layer(hidden_states, attention_mask)
+                hidden_states = layer(hidden_states, attention_mask)
 
         hidden_states = self.final_norm(hidden_states)
         hidden_states = self.dropout(hidden_states)

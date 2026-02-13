@@ -1,6 +1,6 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn             as nn
+import torch.nn.functional  as F
 import json
 
 from pathlib    import Path
@@ -28,9 +28,8 @@ class GeneT5(nn.Module):
         decoder_num_kv_heads = None,
         vocab_size           = 4096,
         tie_weights          = True,
-        encoder_window_size  = 512,
-        decoder_block_size   = 256,
-        decoder_window_size  = 32,
+        encoder_window_size  = 1024,
+        decoder_window_size  = 256,
     ):
         super().__init__()
 
@@ -41,7 +40,6 @@ class GeneT5(nn.Module):
             decoder_num_kv_heads = max(1, decoder_num_heads // 4)
 
         self.encoder_window_size = encoder_window_size
-        self.decoder_block_size  = decoder_block_size
         self.decoder_window_size = decoder_window_size
 
         # Encoder embedding
@@ -73,7 +71,6 @@ class GeneT5(nn.Module):
             num_experts  = decoder_num_experts,
             moe_top_k    = decoder_moe_top_k,
             num_kv_heads = decoder_num_kv_heads,
-            block_size   = decoder_block_size,
             window_size  = decoder_window_size,
         )
 
@@ -87,6 +84,9 @@ class GeneT5(nn.Module):
         # Weight tying
         if tie_weights:
             self.lm_head.weight = self.decoder_embed.weight
+
+        # Loss function (reused across forward calls)
+        self.loss_fct = LigerCrossEntropyLoss(ignore_index=-100)
 
     def encode(self, encoder_input_ids):
         """Encode input sequence"""
@@ -104,8 +104,6 @@ class GeneT5(nn.Module):
         labels                 = None,
         decoder_attention_mask = None,
         encoder_hidden_states  = None,
-        past_key_values        = None,
-        use_cache              = False
     ):
         # Encode (or use cached encoder output)
         if encoder_hidden_states is None:
@@ -117,9 +115,7 @@ class GeneT5(nn.Module):
             decoder_attention_mask = decoder_attention_mask.long()
 
         # Replace invalid indices with pad token (0) for embedding lookup
-        decoder_input_ids_safe                                    = decoder_input_ids.clone()
-        decoder_input_ids_safe[decoder_input_ids_safe < 0]        = 0
-        decoder_input_ids_safe[decoder_input_ids_safe >= self.vocab_size] = 0
+        decoder_input_ids_safe = decoder_input_ids.clamp(0, self.vocab_size - 1)
 
         # Embed decoder inputs
         decoder_embeds = self.decoder_embed(decoder_input_ids_safe)
@@ -139,8 +135,7 @@ class GeneT5(nn.Module):
         # Compute loss (Liger fused kernel: 2x faster)
         loss = None
         if labels is not None:
-            loss_fct = LigerCrossEntropyLoss(ignore_index=-100)
-            loss     = loss_fct(logits.reshape(-1, self.vocab_size), labels.reshape(-1))
+            loss = self.loss_fct(logits.reshape(-1, self.vocab_size), labels.reshape(-1))
             if moe_loss is not None:
                 loss = loss + moe_loss
 
@@ -150,9 +145,6 @@ class GeneT5(nn.Module):
             "moe_loss":       moe_loss,
             "encoder_hidden": encoder_hidden_states,
         }
-
-        if use_cache:
-            outputs["past_key_values"] = None
 
         return outputs
 
@@ -170,14 +162,18 @@ class GeneT5(nn.Module):
     ):
         """Autoregressive generation from pre-computed encoder hidden states"""
 
-        self.train(False)
+        was_training = self.training
+        self.eval()
         device = encoder_hidden.device
         batch  = encoder_hidden.size(0)
 
-        return self._generate_loop(
-            encoder_hidden, batch, device, max_length,
-            temperature, top_k, top_p, bos_token_id, eos_token_id, pad_token_id
-        )
+        try:
+            return self._generate_loop(
+                encoder_hidden, batch, device, max_length,
+                temperature, top_k, top_p, bos_token_id, eos_token_id, pad_token_id
+            )
+        finally:
+            self.train(was_training)
 
     @torch.no_grad()
     def generate(
@@ -193,16 +189,20 @@ class GeneT5(nn.Module):
     ):
         """Autoregressive generation"""
 
-        self.train(False)
+        was_training = self.training
+        self.eval()
         device = encoder_input_ids.device
         batch  = encoder_input_ids.size(0)
 
         encoder_hidden = self.encode(encoder_input_ids)
 
-        return self._generate_loop(
-            encoder_hidden, batch, device, max_length,
-            temperature, top_k, top_p, bos_token_id, eos_token_id, pad_token_id
-        )
+        try:
+            return self._generate_loop(
+                encoder_hidden, batch, device, max_length,
+                temperature, top_k, top_p, bos_token_id, eos_token_id, pad_token_id
+            )
+        finally:
+            self.train(was_training)
 
     def _generate_loop(
         self, encoder_hidden, batch, device, max_length,
@@ -340,9 +340,8 @@ class GeneT5(nn.Module):
             decoder_num_kv_heads = config.get("decoder_num_kv_heads"),
             vocab_size           = config["vocab_size"],
             tie_weights          = config["tie_weights"],
-            encoder_window_size  = config.get("encoder_window_size", 512),
-            decoder_block_size   = config.get("decoder_block_size", 16),
-            decoder_window_size  = config.get("decoder_window_size", 32),
+            encoder_window_size  = config.get("encoder_window_size", 1024),
+            decoder_window_size  = config.get("decoder_window_size", 256),
         )
 
         model.load(path / "pytorch_model.bin")

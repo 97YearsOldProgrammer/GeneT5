@@ -1,18 +1,14 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.utils.checkpoint as ckpt
-import math
+import torch.nn                 as nn
+import torch.utils.checkpoint   as ckpt
 
-from lib.blocks._component  import LayerNorm, FeedForward
-from lib.blocks._spareatt   import SparseAttention, SparseAttentionConfig
-from lib.blocks._blockcross import BlockCrossAttention, BlockCrossAttentionConfig
-from lib.blocks._moe        import MoE, MoEConfig
+from lib.blocks._component      import LayerNorm, FeedForward
+from lib.blocks._flash_att      import SparseAttention, SparseAttentionConfig
+from lib.blocks._blockcross     import BlockCrossAttention, BlockCrossAttentionConfig
+from lib.blocks._moe            import MoE, MoEConfig
 
 
-#################
-#### Decoder ####
-#################
+####  DECODER  ####
 
 
 class DecoderBlock(nn.Module):
@@ -31,8 +27,7 @@ class DecoderBlock(nn.Module):
         moe_load_balance = 0.01,
         moe_router_z     = 0.001,
         num_kv_heads     = None,
-        block_size       = 256,      # for cross-attention only
-        window_size      = 32,       # for self-attention sliding window
+        window_size      = 256,
     ):
         super().__init__()
 
@@ -52,12 +47,11 @@ class DecoderBlock(nn.Module):
         self.self_attn = SparseAttention(config=sparse_config, is_causal=True)
         self.norm1     = LayerNorm(embed_dim)
 
-        # Cross-attention: BlockCrossAttention (block-wise, same block_size as self-attn)
+        # Cross-attention: BlockCrossAttention (16-token blocks)
         cross_config = BlockCrossAttentionConfig(
             embed_dim    = embed_dim,
             num_heads    = num_heads,
             num_kv_heads = num_kv_heads,
-            block_size   = block_size,
             dropout      = attn_dropout,
         )
         self.cross_attn = BlockCrossAttention(config=cross_config)
@@ -82,12 +76,11 @@ class DecoderBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
     
     def forward(
-        self, 
-        hidden_states, 
-        encoder_hidden_states, 
-        attention_mask         = None, 
-        encoder_attention_mask = None, 
-        position_bias          = None
+        self,
+        hidden_states,
+        encoder_hidden_states,
+        attention_mask         = None,
+        encoder_attention_mask = None,
     ):
         # Self-attention
         normed = self.norm1(hidden_states)
@@ -109,11 +102,11 @@ class DecoderBlock(nn.Module):
         if self.use_moe:
             ff_output, moe_aux_loss = self.ff(normed)
             hidden_states           = hidden_states + self.dropout(ff_output)
-            return hidden_states, None, moe_aux_loss
+            return hidden_states, moe_aux_loss
         else:
             ff_output     = self.ff(normed)
             hidden_states = hidden_states + self.dropout(ff_output)
-            return hidden_states, None, None
+            return hidden_states, None
 
 
 class Decoder(nn.Module):
@@ -133,8 +126,7 @@ class Decoder(nn.Module):
         moe_load_balance = 0.01,
         moe_router_z     = 0.001,
         num_kv_heads     = None,
-        block_size       = 256,      # for cross-attention only
-        window_size      = 32,       # for self-attention sliding window
+        window_size      = 256,
     ):
         super().__init__()
 
@@ -158,7 +150,6 @@ class Decoder(nn.Module):
                 moe_load_balance = moe_load_balance,
                 moe_router_z     = moe_router_z,
                 num_kv_heads     = num_kv_heads,
-                block_size       = block_size,
                 window_size      = window_size,
             )
             for _ in range(num_layers)
@@ -186,17 +177,16 @@ class Decoder(nn.Module):
 
         for layer in self.layers:
             if self._gradient_checkpointing and self.training:
-                hidden_states, _, moe_aux_loss = ckpt.checkpoint(
+                hidden_states, moe_aux_loss = ckpt.checkpoint(
                     layer,
                     hidden_states,
                     encoder_hidden_states,
                     attention_mask,
                     encoder_attention_mask,
-                    None,
                     use_reentrant=False,
                 )
             else:
-                hidden_states, _, moe_aux_loss = layer(
+                hidden_states, moe_aux_loss = layer(
                     hidden_states,
                     encoder_hidden_states  = encoder_hidden_states,
                     attention_mask         = attention_mask,
