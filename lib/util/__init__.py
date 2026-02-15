@@ -64,5 +64,5 @@ from lib.util._grpo import (
     compute_log_probs,
     compute_advantages,
     grpo_loss,
-    prepare_decoder_inputs,
+    prepare_grpo_inputs,
 )

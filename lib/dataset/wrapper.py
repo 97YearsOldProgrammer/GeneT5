@@ -53,6 +53,7 @@ filter_n_heavy_chunks   = chunking.filter_n_heavy_chunks
 
 
 BinaryTrainDataset     = dataload.BinaryTrainDataset
+PrefixLMCollator       = dataload.PrefixLMCollator
 DynamicPaddingCollator = dataload.DynamicPaddingCollator
 
 

@@ -142,26 +142,22 @@ class GeneT5Inference:
         target_device = device or auto_detect_device()
         target_dtype  = dtype or select_dtype(target_device)
 
-        # Load model config
         with open(model_config_path, 'r') as f:
             config = json.load(f)
 
         model = model_lib.GeneT5(
-            embed_dim            = config["embed_dim"],
-            encoder_num_layers   = config["encoder_num_layers"],
-            encoder_num_heads    = config["encoder_num_heads"],
-            encoder_ff_dim       = config["encoder_ff_dim"],
-            decoder_num_layers   = config["decoder_num_layers"],
-            decoder_num_heads    = config["decoder_num_heads"],
-            decoder_ff_dim       = config["decoder_ff_dim"],
-            decoder_dropout      = config["decoder_dropout"],
-            decoder_use_alibi    = config["decoder_use_alibi"],
-            decoder_use_moe      = config["decoder_use_moe"],
-            decoder_num_experts  = config.get("decoder_num_experts", 8),
-            decoder_moe_top_k    = config.get("decoder_moe_top_k", 2),
-            decoder_num_kv_heads = config.get("decoder_num_kv_heads"),
-            vocab_size           = config["vocab_size"],
-            tie_weights          = config["tie_weights"],
+            embed_dim    = config["embed_dim"],
+            num_layers   = config["num_layers"],
+            num_heads    = config["num_heads"],
+            ff_dim       = config["ff_dim"],
+            dropout      = config.get("dropout", 0.1),
+            use_alibi    = config.get("use_alibi", True),
+            use_moe      = config.get("use_moe", True),
+            num_experts  = config.get("num_experts", 8),
+            moe_top_k    = config.get("moe_top_k", 2),
+            num_kv_heads = config.get("num_kv_heads"),
+            vocab_size   = config["vocab_size"],
+            tie_weights  = config["tie_weights"],
         )
 
         ckpt = torch.load(checkpoint_path, map_location='cpu')
@@ -211,26 +207,27 @@ class GeneT5Inference:
         raise ValueError(f"Could not load tokenizer from {tokenizer_path}")
     
     def encode(self, sequences, max_length=2048):
-        """Encode input sequences"""
-        
-        if hasattr(self.tokenizer, 'batch_encode_plus'):
-            encoded = self.tokenizer.batch_encode_plus(
-                sequences,
-                padding        = "max_length",
-                truncation     = True,
-                max_length     = max_length,
-                return_tensors = "pt",
-            )
-            return {
-                "input_ids":      encoded["input_ids"].to(self.device),
-                "attention_mask": encoded["attention_mask"].to(self.device),
-            }
-        else:
-            batch = self.tokenizer.encode_batch(sequences, max_length=max_length)
-            return {
-                "input_ids":      batch["input_ids"].to(self.device),
-                "attention_mask": batch["attention_mask"].to(self.device),
-            }
+        """Encode input sequences and append bos as prefix for generation"""
+
+        bos_id     = self.tokenizer.bos_token_id
+        all_ids    = []
+
+        for seq in sequences:
+            if hasattr(self.tokenizer, 'encode'):
+                ids = self.tokenizer.encode(seq, add_special_tokens=False)
+            else:
+                ids = self.tokenizer(seq, add_special_tokens=False)["input_ids"]
+            ids = ids[:max_length - 1] + [bos_id]
+            all_ids.append(ids)
+
+        max_len = max(len(ids) for ids in all_ids)
+        pad_id  = self.tokenizer.pad_token_id
+
+        padded = []
+        for ids in all_ids:
+            padded.append(ids + [pad_id] * (max_len - len(ids)))
+
+        return torch.tensor(padded, dtype=torch.long, device=self.device)
     
     def decode(self, token_ids):
         """Decode token IDs to text"""
@@ -241,21 +238,20 @@ class GeneT5Inference:
             return self.tokenizer.decode_batch(token_ids)
     
     @torch.no_grad()
-    def generate(self, encoder_input_ids, config=None):
-        """Generate output sequences"""
+    def generate(self, prefix_ids, config=None):
+        """Generate output sequences from prefix"""
 
         config = config or GenerationConfig()
         self.model.train(False)
 
         return self.model.generate(
-            encoder_input_ids = encoder_input_ids,
-            max_length        = config.max_length,
-            temperature       = config.temperature,
-            top_k             = config.top_k,
-            top_p             = config.top_p,
-            bos_token_id      = config.bos_token_id,
-            eos_token_id      = config.eos_token_id,
-            pad_token_id      = config.pad_token_id,
+            prefix_ids   = prefix_ids,
+            max_length   = config.max_length,
+            temperature  = config.temperature,
+            top_k        = config.top_k,
+            top_p        = config.top_p,
+            eos_token_id = config.eos_token_id,
+            pad_token_id = config.pad_token_id,
         )
     
     def predict(self, sequences, seqids=None, output_dir=None, source="GeneT5",
@@ -280,12 +276,12 @@ class GeneT5Inference:
             batch_ids  = seqids[batch_start:batch_end]
             batch_offs = offsets[batch_start:batch_end]
 
-            encoded = self.encode(batch_seqs, max_length=max_input_length)
+            prefix_ids = self.encode(batch_seqs, max_length=max_input_length)
 
             with torch.amp.autocast(self.device.type, dtype=self.dtype):
                 generated = self.generate(
-                    encoder_input_ids = encoded["input_ids"],
-                    config            = gen_config,
+                    prefix_ids = prefix_ids,
+                    config     = gen_config,
                 )
 
             decoded_outputs = self.decode(generated)

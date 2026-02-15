@@ -91,32 +91,31 @@ class GRPOLogger:
             self._file.close()
 
 
-def generate_group(model, encoder_hidden, group_size, tokenizer, args):
-    """Generate G outputs per prompt from cached encoder hidden states"""
+def generate_group(model, prefix_ids, group_size, tokenizer, args):
+    """Generate G outputs per prompt from prefix_ids"""
 
-    batch_size = encoder_hidden.size(0)
-    device     = encoder_hidden.device
+    batch_size = prefix_ids.size(0)
 
-    # Expand encoder hidden: [B, L, D] -> [B*G, L, D]
-    expanded = encoder_hidden.unsqueeze(1).expand(
-        batch_size, group_size, -1, -1
-    ).reshape(batch_size * group_size, encoder_hidden.size(1), encoder_hidden.size(2))
+    # Expand prefix_ids: [B, L] -> [B*G, L]
+    expanded = prefix_ids.unsqueeze(1).expand(
+        batch_size, group_size, -1
+    ).reshape(batch_size * group_size, -1)
 
-    generated = model.generate_from_hidden(
-        encoder_hidden = expanded,
-        max_length     = args.max_gen_length,
-        temperature    = args.temperature,
-        top_k          = args.top_k,
-        top_p          = args.top_p,
-        bos_token_id   = tokenizer.bos_token_id,
-        eos_token_id   = tokenizer.eos_token_id,
-        pad_token_id   = tokenizer.pad_token_id,
+    generated = model.generate(
+        prefix_ids   = expanded,
+        max_length   = args.max_gen_length,
+        temperature  = args.temperature,
+        top_k        = args.top_k,
+        top_p        = args.top_p,
+        eos_token_id = tokenizer.eos_token_id,
+        pad_token_id = tokenizer.pad_token_id,
     )
 
-    return generated
+    return generated, expanded
 
 
-def score_generations(generated, ref_features_list, sequences, group_size, tokenizer, args):
+def score_generations(generated, prefix_len, ref_features_list, sequences,
+                      group_size, tokenizer, args):
     """Score generated sequences against references"""
 
     batch_size = len(ref_features_list)
@@ -125,7 +124,7 @@ def score_generations(generated, ref_features_list, sequences, group_size, token
     for i in range(batch_size):
         for g in range(group_size):
             idx        = i * group_size + g
-            output_ids = generated[idx].tolist()
+            output_ids = generated[idx, prefix_len:].tolist()
             pred_text  = tokenizer.decode(output_ids)
 
             r = reward.composite_reward(
@@ -135,16 +134,6 @@ def score_generations(generated, ref_features_list, sequences, group_size, token
             rewards.append(r)
 
     return torch.tensor(rewards, dtype=torch.float32)
-
-
-def expand_input_ids(input_ids, group_size):
-    """Expand input_ids for group: [B, L] -> [B*G, L]"""
-
-    batch_size = input_ids.size(0)
-
-    return input_ids.unsqueeze(1).expand(
-        batch_size, group_size, -1
-    ).reshape(batch_size * group_size, -1)
 
 
 def main():
@@ -191,7 +180,7 @@ def main():
     parser.add_argument('--log_every', type=int, default=1,
         metavar='<int>', help='log every N steps [%(default)i]')
     parser.add_argument('--compile', action='store_true',
-        help='enable torch.compile on encoder and decoder')
+        help='enable torch.compile on decoder')
     parser.add_argument('--eval_data', type=str, default=None,
         metavar='<file>', help='eval JSON for periodic F1 evaluation')
     parser.add_argument('--eval_samples', type=int, default=20,
@@ -240,7 +229,6 @@ def main():
     policy = mdl.GeneT5.from_pretrained(
         pathlib.Path(args.model_path), device='cpu', dtype=torch.bfloat16
     )
-    policy.freeze_encoder()
 
     # Load reference model (frozen copy)
     if is_main:
@@ -258,16 +246,14 @@ def main():
         if is_main:
             print("\nCompiling model regions...")
         compile_opts = {"mode": "default", "dynamic": None}
-        policy.encoder    = torch.compile(policy.encoder, **compile_opts)
         policy.decoder    = torch.compile(policy.decoder, **compile_opts)
-        ref_model.encoder = torch.compile(ref_model.encoder, **compile_opts)
         ref_model.decoder = torch.compile(ref_model.decoder, **compile_opts)
         if is_main:
-            print("  Compiled: encoder, decoder (policy + reference)")
+            print("  Compiled: decoder (policy + reference)")
 
-    # Wrap policy with DDP (find_unused_parameters=True because encoder is frozen)
+    # Wrap policy with DDP
     policy = train_util.wrap_model_distributed(
-        policy, device, find_unused_params=True, static_graph=False
+        policy, device, find_unused_params=False, static_graph=True
     )
 
     if is_dist:
@@ -278,7 +264,6 @@ def main():
     stats      = raw_policy.get_param_stats()
     if is_main:
         print(f"  Policy trainable: {stats['total_trainable']:,}")
-        print(f"  Policy frozen:    {stats['total_frozen']:,}")
 
     # Load dataset
     if is_main:
@@ -367,6 +352,7 @@ def main():
     dtype        = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     global_step  = 0
     accum_step   = 0
+    bos_id       = tokenizer.bos_token_id
 
     if dist_sampler:
         dist_sampler.set_epoch(0)
@@ -380,24 +366,28 @@ def main():
         ref_features = batch["ref_features"]
         sequences    = batch["sequences"]
 
+        # Build prefix_ids: input DNA tokens + bos separator
+        bos_col    = torch.full((input_ids.size(0), 1), bos_id, dtype=torch.long, device=device)
+        prefix_ids = torch.cat([input_ids, bos_col], dim=1)
+
         # ========== Phase 1: Generate (no_grad) ==========
         gen_start = time.time()
         policy.eval()
 
         with torch.no_grad():
             with torch.amp.autocast('cuda', dtype=dtype):
-                encoder_hidden = raw_policy.encode(input_ids)
-
-                generated = generate_group(
-                    raw_policy, encoder_hidden,
+                generated, expanded_prefix = generate_group(
+                    raw_policy, prefix_ids,
                     args.group_size, tokenizer, args
                 )
 
-        gen_sec = time.time() - gen_start
+        gen_sec    = time.time() - gen_start
+        prefix_len = prefix_ids.size(1)
 
         # ========== Phase 2: Score (CPU) ==========
         rewards_tensor = score_generations(
-            generated, ref_features, sequences, args.group_size, tokenizer, args
+            generated, prefix_len, ref_features, sequences,
+            args.group_size, tokenizer, args
         )
 
         # ========== Phase 3: Advantages ==========
@@ -409,15 +399,11 @@ def main():
         policy.train()
 
         # Prepare teacher-forcing inputs from generated sequences
-        decoder_input_ids, labels, decoder_attention_mask = grpo.prepare_decoder_inputs(
-            generated, tokenizer
+        tf_input_ids, labels = grpo.prepare_grpo_inputs(
+            expanded_prefix, generated, tokenizer.pad_token_id
         )
-        decoder_input_ids     = decoder_input_ids.to(device)
-        labels                = labels.to(device)
-        decoder_attention_mask = decoder_attention_mask.to(device)
-
-        # Expand input_ids for group
-        expanded_input_ids = expand_input_ids(input_ids, args.group_size)
+        tf_input_ids = tf_input_ids.to(device)
+        labels       = labels.to(device)
 
         # Gradient sync only on accumulation boundary
         is_sync_step = (accum_step + 1) % args.grad_accum == 0
@@ -427,17 +413,13 @@ def main():
             with torch.amp.autocast('cuda', dtype=dtype):
                 # Policy log probs
                 policy_log_probs, mask, moe_loss = grpo.compute_log_probs(
-                    policy, expanded_input_ids,
-                    decoder_input_ids, labels,
-                    decoder_attention_mask, raw_policy.vocab_size,
+                    policy, tf_input_ids, labels, raw_policy.vocab_size,
                 )
 
                 # Reference log probs
                 with torch.no_grad():
                     ref_log_probs, _, _ = grpo.compute_log_probs(
-                        ref_model, expanded_input_ids,
-                        decoder_input_ids, labels,
-                        decoder_attention_mask, ref_model.vocab_size,
+                        ref_model, tf_input_ids, labels, ref_model.vocab_size,
                     )
 
                 # GRPO loss
@@ -525,9 +507,9 @@ def main():
                     )
 
         # Cleanup
-        del (input_ids, generated, rewards_tensor, advantages,
-             decoder_input_ids, labels, decoder_attention_mask,
-             expanded_input_ids, policy_log_probs, ref_log_probs, mask, loss)
+        del (input_ids, prefix_ids, generated, expanded_prefix, rewards_tensor,
+             advantages, tf_input_ids, labels, policy_log_probs, ref_log_probs,
+             mask, loss)
 
         if is_dist:
             train_util.barrier()

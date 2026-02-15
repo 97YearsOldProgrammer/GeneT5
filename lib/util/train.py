@@ -199,33 +199,31 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, grad_accum=1, m
 
 
 def train_epoch_seq2seq(model, dataloader, optimizer, scheduler, device, grad_accum=1, max_grad_norm=1.0):
-    """Train for one epoch - seq2seq with BF16 mixed precision and distributed support"""
+    """Train for one epoch with BF16 mixed precision and distributed support"""
     model.train()
     total_loss = 0
-    
-    # BF16 for training (model stays FP32, compute in BF16)
+
     dtype  = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     scaler = torch.amp.GradScaler('cuda', enabled=(dtype == torch.float16))
-    
+
     optimizer.zero_grad()
-    
+
     for step, batch in enumerate(dataloader):
         batch = {k: v.to(device) for k, v in batch.items()}
-        
+
         with torch.amp.autocast('cuda', dtype=dtype):
             outputs = model(
-                encoder_input_ids = batch["input_ids"],
-                decoder_input_ids = batch["labels"][:, :-1],
-                labels            = batch["labels"][:, 1:],
+                input_ids = batch["input_ids"],
+                labels    = batch["labels"],
             )
-            
+
             loss = outputs["loss"] / grad_accum
-        
+
         if dtype == torch.float16:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        
+
         if (step + 1) % grad_accum == 0:
             if dtype == torch.float16:
                 scaler.unscale_(optimizer)
@@ -237,17 +235,16 @@ def train_epoch_seq2seq(model, dataloader, optimizer, scheduler, device, grad_ac
                 optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
-        
+
         total_loss += loss.item() * grad_accum
-    
+
     avg_loss = total_loss / len(dataloader)
-    
-    # Average loss across processes in distributed training
+
     if dist.is_initialized():
         loss_tensor = torch.tensor([avg_loss], device=device)
         all_reduce_mean(loss_tensor)
         avg_loss = loss_tensor.item()
-    
+
     return avg_loss
 
 
@@ -262,56 +259,42 @@ def train_epoch_seq2seq_distributed(
     scaler        = None,
     use_amp       = True,
 ):
-    """
-    Train for one epoch with full distributed support for DGX Spark.
-    
-    Optimized for multi-node training:
-    - Gradient synchronization via NCCL
-    - Proper handling of MoE load balancing loss
-    - Mixed precision with configurable scaler
-    """
-    
+    """Train for one epoch with full distributed support for DGX Spark"""
+
     model.train()
     total_loss     = 0.0
     total_moe_loss = 0.0
     num_batches    = 0
-    
-    # Determine dtype and create scaler if needed
+
     dtype = torch.bfloat16 if (torch.cuda.is_bf16_supported() and use_amp) else torch.float32
     if scaler is None and dtype == torch.float16:
         scaler = torch.amp.GradScaler('cuda')
-    
+
     optimizer.zero_grad(set_to_none=True)
-    
+
     for step, batch in enumerate(dataloader):
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-        
-        # Forward pass with mixed precision
+
         with torch.amp.autocast('cuda', dtype=dtype, enabled=use_amp):
             outputs = model(
-                encoder_input_ids = batch["input_ids"],
-                decoder_input_ids = batch["labels"][:, :-1],
-                labels            = batch["labels"][:, 1:],
+                input_ids = batch["input_ids"],
+                labels    = batch["labels"],
             )
-            
-            # Handle both dict and object outputs
+
             if isinstance(outputs, dict):
                 loss     = outputs["loss"]
                 moe_loss = outputs.get("moe_loss", 0.0)
             else:
                 loss     = outputs.loss
                 moe_loss = getattr(outputs, 'moe_loss', 0.0)
-            
-            # Scale loss for gradient accumulation
+
             scaled_loss = loss / grad_accum
-        
-        # Backward pass
+
         if scaler is not None:
             scaler.scale(scaled_loss).backward()
         else:
             scaled_loss.backward()
-        
-        # Optimizer step with gradient accumulation
+
         if (step + 1) % grad_accum == 0:
             if scaler is not None:
                 scaler.unscale_(optimizer)
@@ -321,27 +304,24 @@ def train_epoch_seq2seq_distributed(
             else:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
-            
+
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
-        
-        # Accumulate losses
+
         total_loss     += loss.detach().item()
         total_moe_loss += moe_loss if isinstance(moe_loss, (int, float)) else moe_loss.item()
         num_batches    += 1
-    
-    # Compute averages
+
     avg_loss     = total_loss / max(num_batches, 1)
     avg_moe_loss = total_moe_loss / max(num_batches, 1)
-    
-    # Synchronize metrics across all processes
+
     if dist.is_initialized():
         metrics      = torch.tensor([avg_loss, avg_moe_loss, num_batches], device=device)
         dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
         world_size   = get_world_size()
         avg_loss     = metrics[0].item() / world_size
         avg_moe_loss = metrics[1].item() / world_size
-    
+
     return avg_loss, avg_moe_loss
 
 
@@ -390,64 +370,61 @@ def evaluate(model, dataloader, device):
 
 
 def evaluate_seq2seq(model, dataloader, device):
-    """Evaluate seq2seq model with BF16 and distributed support."""
+    """Evaluate model with BF16 and distributed support"""
     model.eval()
     total_loss  = 0
     num_batches = 0
-    
+
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    
+
     with torch.no_grad():
         for batch in dataloader:
             batch = {k: v.to(device) for k, v in batch.items()}
-            
+
             with torch.amp.autocast('cuda', dtype=dtype):
                 outputs = model(
-                    encoder_input_ids = batch["input_ids"],
-                    decoder_input_ids = batch["labels"][:, :-1],
-                    labels            = batch["labels"][:, 1:],
+                    input_ids = batch["input_ids"],
+                    labels    = batch["labels"],
                 )
-            
+
             if isinstance(outputs, dict):
                 total_loss += outputs["loss"].item()
             else:
                 total_loss += outputs.loss.item()
             num_batches += 1
-    
+
     avg_loss = total_loss / max(num_batches, 1)
-    
-    # Synchronize in distributed training
+
     if dist.is_initialized():
         loss_tensor = torch.tensor([avg_loss, num_batches], device=device)
         dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
         world_size = get_world_size()
         avg_loss   = loss_tensor[0].item() / world_size
-    
+
     model.train()
     return avg_loss
 
 
 def evaluate_seq2seq_distributed(model, dataloader, device, use_amp=True):
-    """Evaluate seq2seq model with full distributed support for DGX Spark"""
-    
+    """Evaluate model with full distributed support for DGX Spark"""
+
     model.eval()
     total_loss     = 0.0
     total_moe_loss = 0.0
     num_batches    = 0
-    
+
     dtype = torch.bfloat16 if (torch.cuda.is_bf16_supported() and use_amp) else torch.float32
-    
+
     with torch.no_grad():
         for batch in dataloader:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-            
+
             with torch.amp.autocast('cuda', dtype=dtype, enabled=use_amp):
                 outputs = model(
-                    encoder_input_ids = batch["input_ids"],
-                    decoder_input_ids = batch["labels"][:, :-1],
-                    labels            = batch["labels"][:, 1:],
+                    input_ids = batch["input_ids"],
+                    labels    = batch["labels"],
                 )
-            
+
             if isinstance(outputs, dict):
                 total_loss     += outputs["loss"].item()
                 total_moe_loss += outputs.get("moe_loss", 0.0)
@@ -455,20 +432,19 @@ def evaluate_seq2seq_distributed(model, dataloader, device, use_amp=True):
                     total_moe_loss = total_moe_loss.item()
             else:
                 total_loss += outputs.loss.item()
-            
+
             num_batches += 1
-    
+
     avg_loss     = total_loss / max(num_batches, 1)
     avg_moe_loss = total_moe_loss / max(num_batches, 1)
-    
-    # Synchronize across all processes
+
     if dist.is_initialized():
         metrics    = torch.tensor([avg_loss, avg_moe_loss, num_batches], device=device)
         dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
         world_size = get_world_size()
         avg_loss     = metrics[0].item() / world_size
         avg_moe_loss = metrics[1].item() / world_size
-    
+
     model.train()
     return avg_loss, avg_moe_loss
 

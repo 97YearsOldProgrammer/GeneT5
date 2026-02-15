@@ -28,6 +28,7 @@ from lib.dataset.wrapper import (
 
     # Dataload
     BinaryTrainDataset,
+    PrefixLMCollator,
     DynamicPaddingCollator,
 
     # Util

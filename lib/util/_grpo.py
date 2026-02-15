@@ -51,22 +51,19 @@ def grpo_collate(batch, pad_id=0):
     }
 
 
-def compute_log_probs(model, encoder_input_ids, decoder_input_ids, labels,
-                      decoder_attention_mask, vocab_size):
+def compute_log_probs(model, input_ids, labels, vocab_size):
     """Compute per-token log probabilities via teacher-forced forward pass"""
 
     outputs = model(
-        encoder_input_ids     = encoder_input_ids,
-        decoder_input_ids     = decoder_input_ids,
-        labels                = None,
-        decoder_attention_mask = decoder_attention_mask,
+        input_ids = input_ids,
+        labels    = None,
     )
 
     logits    = outputs["logits"]
     log_probs = F.log_softmax(logits, dim=-1)
 
     # Gather log probs at label positions
-    token_log_probs = log_probs.gather(2, labels.unsqueeze(2)).squeeze(2)
+    token_log_probs = log_probs.gather(2, labels.clamp(min=0).unsqueeze(2)).squeeze(2)
 
     # Mask padding
     mask            = (labels != -100).float()
@@ -116,19 +113,28 @@ def grpo_loss(policy_log_probs, ref_log_probs, advantages, mask, beta=0.05):
     return total, policy_loss.item(), kl_loss.item(), seq_kl.mean().item()
 
 
-def prepare_decoder_inputs(generated, tokenizer):
-    """Convert generated sequences to teacher-forcing format for log prob computation"""
+def prepare_grpo_inputs(prefix_ids, generated, pad_id, label_pad=-100):
+    """Build teacher-forcing inputs from prefix + generated for log prob computation
 
-    pad_id = tokenizer.pad_token_id
+    prefix_ids: [B*G, prefix_len] — input DNA tokens + bos
+    generated:  [B*G, prefix_len + gen_len] — full generated sequence (prefix + output)
 
-    # decoder_input_ids = generated[:, :-1], labels = generated[:, 1:]
-    decoder_input_ids = generated[:, :-1].clone()
-    labels            = generated[:, 1:].clone()
+    Returns input_ids [B*G, seq_len-1], labels [B*G, seq_len-1] with prefix masked
+    """
+
+    seq_len    = generated.size(1)
+    prefix_len = prefix_ids.size(1)
+
+    # Model input: all tokens except last (teacher forcing)
+    input_ids = generated[:, :-1].clone()
+
+    # Labels: shifted by 1 (next-token prediction)
+    labels = generated[:, 1:].clone()
+
+    # Mask prefix region in labels (loss only on generated output)
+    labels[:, :prefix_len - 1] = label_pad
 
     # Mask padding in labels
-    labels[labels == pad_id] = -100
+    labels[labels == pad_id] = label_pad
 
-    # Attention mask
-    decoder_attention_mask = (decoder_input_ids != pad_id).long()
-
-    return decoder_input_ids, labels, decoder_attention_mask
+    return input_ids, labels

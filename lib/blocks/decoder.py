@@ -4,7 +4,6 @@ import torch.utils.checkpoint   as ckpt
 
 from lib.blocks._component      import LayerNorm, FeedForward
 from lib.blocks._flash_att      import FlashAttention, FlashAttentionConfig
-from lib.blocks._blockcross     import CrossAttention, CrossAttentionConfig
 from lib.blocks._moe            import MoE, MoEConfig
 
 
@@ -32,10 +31,7 @@ class DecoderBlock(nn.Module):
 
         self.use_moe = use_moe
 
-        if num_kv_heads is None:
-            num_kv_heads = max(1, num_heads // 4)
-
-        # Self-attention: FlashAttention (full, causal)
+        # Self-attention: FlashAttention (causal)
         flash_config = FlashAttentionConfig(
             embed_dim = embed_dim,
             num_heads = num_heads,
@@ -44,16 +40,6 @@ class DecoderBlock(nn.Module):
         )
         self.self_attn = FlashAttention(config=flash_config, is_causal=True)
         self.norm1     = LayerNorm(embed_dim)
-
-        # Cross-attention: CrossAttention (flash_attn, GQA)
-        cross_config = CrossAttentionConfig(
-            embed_dim    = embed_dim,
-            num_heads    = num_heads,
-            num_kv_heads = num_kv_heads,
-            dropout      = attn_dropout,
-        )
-        self.cross_attn = CrossAttention(config=cross_config)
-        self.norm2      = LayerNorm(embed_dim)
 
         # Feed-forward: MoE or standard
         if use_moe:
@@ -70,32 +56,18 @@ class DecoderBlock(nn.Module):
         else:
             self.ff = FeedForward(embed_dim, ff_dim, dropout)
 
-        self.norm3   = LayerNorm(embed_dim)
+        self.norm2   = LayerNorm(embed_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(
-        self,
-        hidden_states,
-        encoder_hidden_states,
-        attention_mask         = None,
-        encoder_attention_mask = None,
-    ):
-        # Self-attention
-        normed = self.norm1(hidden_states)
-        attn_output, _ = self.self_attn(normed, attention_mask)
-        hidden_states  = hidden_states + self.dropout(attn_output)
+    def forward(self, hidden_states, attention_mask=None):
 
-        # Cross-attention
-        normed = self.norm2(hidden_states)
-        cross_output, _ = self.cross_attn(
-            normed,
-            encoder_hidden_states,
-            encoder_attention_mask
-        )
-        hidden_states = hidden_states + self.dropout(cross_output)
+        # Self-attention
+        normed             = self.norm1(hidden_states)
+        attn_output, _     = self.self_attn(normed, attention_mask)
+        hidden_states      = hidden_states + self.dropout(attn_output)
 
         # Feed-forward
-        normed = self.norm3(hidden_states)
+        normed = self.norm2(hidden_states)
 
         if self.use_moe:
             ff_output, moe_aux_loss = self.ff(normed)
@@ -130,9 +102,6 @@ class Decoder(nn.Module):
         self.use_moe   = use_moe
         self.use_alibi = use_alibi
 
-        if num_kv_heads is None:
-            num_kv_heads = max(1, num_heads // 4)
-
         self.layers = nn.ModuleList([
             DecoderBlock(
                 embed_dim        = embed_dim,
@@ -162,13 +131,8 @@ class Decoder(nn.Module):
     def gradient_checkpointing_disable(self):
         self._gradient_checkpointing = False
 
-    def forward(
-        self,
-        hidden_states,
-        encoder_hidden_states,
-        attention_mask         = None,
-        encoder_attention_mask = None
-    ):
+    def forward(self, hidden_states, attention_mask=None):
+
         total_moe_loss = 0.0 if self.use_moe else None
 
         for layer in self.layers:
@@ -176,17 +140,13 @@ class Decoder(nn.Module):
                 hidden_states, moe_aux_loss = ckpt.checkpoint(
                     layer,
                     hidden_states,
-                    encoder_hidden_states,
                     attention_mask,
-                    encoder_attention_mask,
                     use_reentrant=False,
                 )
             else:
                 hidden_states, moe_aux_loss = layer(
                     hidden_states,
-                    encoder_hidden_states  = encoder_hidden_states,
-                    attention_mask         = attention_mask,
-                    encoder_attention_mask = encoder_attention_mask,
+                    attention_mask = attention_mask,
                 )
 
             if self.use_moe and moe_aux_loss is not None:
@@ -196,29 +156,3 @@ class Decoder(nn.Module):
         hidden_states = self.dropout(hidden_states)
 
         return hidden_states, total_moe_loss
-
-    def get_kv_cache_info(self, batch_size, seq_len, encoder_seq_len):
-        """Return KV cache memory usage info in bytes"""
-
-        if len(self.layers) == 0:
-            return {}
-
-        layer      = self.layers[0]
-        num_layers = len(self.layers)
-
-        # FlashAttention: standard KV cache
-        num_heads = layer.self_attn.num_heads
-        head_dim  = layer.self_attn.head_dim
-        self_kv   = batch_size * seq_len * num_heads * head_dim * 2 * 2
-
-        # CrossAttention: KV cache based on encoder length
-        num_kv_heads = layer.cross_attn.num_kv_heads
-        cross_kv     = batch_size * encoder_seq_len * num_kv_heads * head_dim * 2 * 2
-
-        return {
-            "self_attn_per_layer":  self_kv,
-            "cross_attn_per_layer": cross_kv,
-            "total_self":           self_kv * num_layers,
-            "total_cross":          cross_kv * num_layers,
-            "total_kv_cache":       (self_kv + cross_kv) * num_layers,
-        }

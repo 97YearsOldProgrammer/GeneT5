@@ -36,7 +36,7 @@ DEFAULTS = {
 
 
 def main():
-    
+
     parser = argparse.ArgumentParser(description='Fine-tune GeneT5')
     parser.add_argument('train_bin', type=str, metavar='<train>',
         help='training binary file')
@@ -89,7 +89,7 @@ def main():
     parser.add_argument('--mxfp8', action='store_true',
         help='apply MXFP8 quantization to dense Linear layers (Blackwell only)')
     parser.add_argument('--compile', action='store_true',
-        help='enable torch.compile on encoder and decoder')
+        help='enable torch.compile on decoder')
     parser.add_argument('--eval_data', required=False, type=str, default=None,
         metavar='<file>', help='path to eval JSON for post-checkpoint F1 evaluation')
     parser.add_argument('--eval_samples', required=False, type=int, default=20,
@@ -119,7 +119,7 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
         torch.set_float32_matmul_precision('high')
-    
+
     output_dir = pathlib.Path(args.output_dir)
     if is_main:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -143,10 +143,9 @@ def main():
         if is_main:
             print("\nCompiling model regions...")
         compile_opts = {"mode": "default", "dynamic": None}
-        model.encoder = torch.compile(model.encoder, **compile_opts)
         model.decoder = torch.compile(model.decoder, **compile_opts)
         if is_main:
-            print("  Compiled: encoder, decoder")
+            print("  Compiled: decoder")
             print("  First ~3 batches will be slow (compilation warmup)")
 
     model = train_util.wrap_model_distributed(model, device,
@@ -161,7 +160,6 @@ def main():
     stats     = raw_model.get_param_stats()
     if is_main:
         print(f"  Trainable: {stats['total_trainable']:,}")
-        print(f"  Frozen:    {stats['total_frozen']:,}")
 
     # apply MXFP8 quantization to dense Linear layers
     if args.mxfp8:
@@ -174,8 +172,6 @@ def main():
             if not isinstance(mod, torch.nn.Linear):
                 return False
             if mod.in_features % 32 != 0 or mod.out_features % 32 != 0:
-                return False
-            if 'cross_attn.q' in fqn or 'cross_attn.o' in fqn:
                 return False
             return True
 
@@ -203,11 +199,11 @@ def main():
             train_util.cleanup_distributed()
         return
 
-    # setup dataloaders
+    # setup dataloaders with PrefixLMCollator
     if is_main:
         print(f"\nSetting up dataloaders...")
 
-    collator = ds.DynamicPaddingCollator(tokenizer.pad_token_id, -100)
+    collator = ds.PrefixLMCollator(tokenizer.pad_token_id, -100)
 
     # Distributed sampler for multi-node training
     dist_sampler     = None
@@ -240,7 +236,7 @@ def main():
         pin_memory         = not args.no_pin_memory,
         persistent_workers = persistent,
     )
-    
+
     if is_main:
         print(f"  Train batches: {len(train_loader)}")
         print(f"  Val batches:   {len(val_loader)}")
@@ -282,23 +278,23 @@ def main():
             weight_decay = args.weight_decay,
             fused        = True,
         )
-    
+
     total_steps  = len(train_loader) * args.epochs // args.grad_accum
     warmup_steps = int(total_steps * args.warmup_ratio)
-    
+
     scheduler = tf.get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-    
+
     if is_main:
         if is_dist:
             print(f"  Base LR:      {args.lr}")
             print(f"  Scaled LR:    {effective_lr} (x{train_util.get_world_size()} nodes)")
         print(f"  Total steps:  {total_steps}")
         print(f"  Warmup steps: {warmup_steps}")
-    
+
     # handle checkpoint
     start_epoch   = 0
     best_val_loss = float('inf')
-    
+
     if args.checkpoint:
         checkpoint = torch.load(args.checkpoint, map_location=device)
 
@@ -316,7 +312,7 @@ def main():
 
         if is_main:
             print(f"  Loaded checkpoint from {args.checkpoint} (epoch {start_epoch})")
-    
+
     # save config
     if is_main:
         config = {
@@ -339,7 +335,7 @@ def main():
 
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
-    # Setup label smoothing loss if enabled (use Liger fused kernel for memory efficiency)
+    # Setup label smoothing loss if enabled
     if args.label_smoothing > 0:
         loss_fct = LigerCrossEntropyLoss(ignore_index=-100, label_smoothing=args.label_smoothing)
         if is_main:
@@ -349,8 +345,6 @@ def main():
 
     # Enable gradient checkpointing if requested
     if args.gradient_checkpointing:
-        if hasattr(raw_model.encoder, 'gradient_checkpointing_enable'):
-            raw_model.encoder.gradient_checkpointing_enable()
         if hasattr(raw_model.decoder, 'gradient_checkpointing_enable'):
             raw_model.decoder.gradient_checkpointing_enable()
         if is_main:
@@ -370,15 +364,15 @@ def main():
         print("  torch.compile warmup: first 3-5 batches will be 10-60x slower")
 
     patience_counter = 0
-    global_step = 0  # Track optimizer steps across epochs
+    global_step = 0
 
-    # Start memory watcher if enabled (rank 0 only, output dir may be read-only on workers)
+    # Start memory watcher if enabled
     mem_watcher = None
     if args.memwatch and is_main:
         mem_watcher = util.create_memory_watcher(output_dir, prefix="memory")
         mem_watcher.start()
 
-    # Training metrics logger (CSV + stdout, rank 0 only)
+    # Training metrics logger
     train_logger = None
     if is_main:
         train_logger = util.create_train_logger(output_dir, resume=args.checkpoint is not None)
@@ -420,16 +414,6 @@ def main():
         for step, batch in enumerate(train_loader):
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
 
-            # Prepare decoder inputs with proper attention mask
-            decoder_input_ids = batch['labels'][:, :-1].clone()
-            labels = batch['labels'][:, 1:]
-
-            # Create decoder attention mask (1 for valid tokens, 0 for padding)
-            decoder_attention_mask = (decoder_input_ids != -100).long()
-
-            # Replace -100 with pad_token_id (can't pass -100 to embedding layer)
-            decoder_input_ids[decoder_input_ids == -100] = tokenizer.pad_token_id
-
             # Only sync gradients on accumulation boundary
             is_sync_step = (step + 1) % args.grad_accum == 0
             sync_context = nullcontext() if (not is_dist or is_sync_step) else model.no_sync()
@@ -437,16 +421,14 @@ def main():
             with sync_context:
                 with torch.amp.autocast('cuda', dtype=dtype):
                     outputs = model(
-                        encoder_input_ids      = batch['input_ids'],
-                        decoder_input_ids      = decoder_input_ids,
-                        labels                 = labels if loss_fct is None else None,
-                        decoder_attention_mask = decoder_attention_mask,
+                        input_ids = batch['input_ids'],
+                        labels    = batch['labels'] if loss_fct is None else None,
                     )
 
                     # Use label smoothing loss if enabled
                     if loss_fct is not None:
                         logits = outputs['logits']
-                        loss = loss_fct(logits.reshape(-1, raw_model.vocab_size), labels.reshape(-1))
+                        loss   = loss_fct(logits.reshape(-1, raw_model.vocab_size), batch['labels'].reshape(-1))
                         if outputs.get('moe_loss') is not None:
                             loss = loss + outputs['moe_loss']
                         del logits
@@ -455,12 +437,12 @@ def main():
 
                     loss = loss / args.grad_accum
 
-                # Save loss value before backward (for logging)
+                # Save loss value before backward
                 loss_val = loss.item() * args.grad_accum
 
                 loss.backward()
 
-            del outputs, loss, batch, decoder_input_ids, labels, decoder_attention_mask
+            del outputs, loss, batch
 
             if (step + 1) % args.grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -484,13 +466,13 @@ def main():
                     torch.save(checkpoint, save_path)
                     print(f"  [Step {global_step}] Saved checkpoint: {save_path.name}")
 
-                # Periodic cache clearing to reduce memory fragmentation
+                # Periodic cache clearing
                 if args.empty_cache_steps and global_step % args.empty_cache_steps == 0:
                     torch.cuda.empty_cache()
 
             total_train_loss += loss_val
 
-            # Progress logging every N% (rank 0 only)
+            # Progress logging every N%
             current_pct = (step + 1) * 100 // num_batches
             if train_logger and current_pct >= last_logged_pct + args.log_every_pct:
                 last_logged_pct = (current_pct // args.log_every_pct) * args.log_every_pct
@@ -525,24 +507,16 @@ def main():
             for batch in val_loader:
                 batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
 
-                # Prepare decoder inputs with proper attention mask
-                decoder_input_ids = batch['labels'][:, :-1].clone()
-                labels = batch['labels'][:, 1:]
-                decoder_attention_mask = (decoder_input_ids != -100).long()
-                decoder_input_ids[decoder_input_ids == -100] = tokenizer.pad_token_id
-
                 with torch.amp.autocast('cuda', dtype=dtype):
                     outputs = model(
-                        encoder_input_ids      = batch['input_ids'],
-                        decoder_input_ids      = decoder_input_ids,
-                        labels                 = labels,
-                        decoder_attention_mask = decoder_attention_mask,
+                        input_ids = batch['input_ids'],
+                        labels    = batch['labels'],
                     )
 
                 total_val_loss += outputs['loss'].item()
                 num_batches    += 1
 
-                del outputs, batch, decoder_input_ids, labels, decoder_attention_mask
+                del outputs, batch
 
         val_loss = total_val_loss / max(num_batches, 1)
 
@@ -555,7 +529,7 @@ def main():
         if train_logger:
             train_logger.log_epoch(epoch + 1, train_loss, val_loss, scheduler.get_last_lr()[0])
 
-        # Post-epoch eval (rank 0 only, runs inference on held-out species)
+        # Post-epoch eval (rank 0 only)
         if evaluator and is_main:
             print(f"  Running eval on {len(evaluator.samples)} held-out samples...")
             eval_model   = train_util.unwrap_model(model)
@@ -612,7 +586,7 @@ def main():
             torch.save(checkpoint, save_path)
 
         train_util.barrier()
-    
+
     # Stop memory watcher and close loggers
     if mem_watcher:
         mem_watcher.stop()

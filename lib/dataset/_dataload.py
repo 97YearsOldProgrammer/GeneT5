@@ -128,10 +128,12 @@ class BinaryTrainDataset:
         input_ids  = self.tokenizer.encode(sample["input_text"], add_special_tokens=False)
         target_ids = self.tokenizer.encode(sample["target_text"], add_special_tokens=False)
 
+        # Concatenate: input + target for causal LM
+        full_ids = input_ids + target_ids
+
         return {
-            "input_ids":      input_ids,
-            "attention_mask": [1] * len(input_ids),
-            "labels":         target_ids,
+            "input_ids":  full_ids,
+            "prefix_len": len(input_ids),
         }
 
     def get_batch_tokenized(self, indices):
@@ -146,10 +148,12 @@ class BinaryTrainDataset:
 
         results = []
         for i in range(len(indices)):
+            inp_ids = input_enc["input_ids"][i]
+            tgt_ids = target_enc["input_ids"][i]
+            full    = inp_ids + tgt_ids
             results.append({
-                "input_ids":      input_enc["input_ids"][i],
-                "attention_mask": [1] * len(input_enc["input_ids"][i]),
-                "labels":         target_enc["input_ids"][i],
+                "input_ids":  full,
+                "prefix_len": len(inp_ids),
             })
 
         return results
@@ -160,8 +164,45 @@ class BinaryTrainDataset:
 #####################
 
 
+class PrefixLMCollator:
+    """Collator for prefix-LM training: mask loss on input prefix, compute on output only"""
+
+    def __init__(self, pad_token_id, label_pad=-100):
+
+        self.pad_token_id = pad_token_id
+        self.label_pad    = label_pad
+
+    def __call__(self, batch):
+
+        max_len = max(len(b["input_ids"]) for b in batch)
+
+        all_input_ids = []
+        all_labels    = []
+
+        for b in batch:
+            ids        = b["input_ids"]
+            prefix_len = b["prefix_len"]
+            pad_len    = max_len - len(ids)
+
+            # Model input: all tokens except last (teacher forcing)
+            padded_ids = ids + [self.pad_token_id] * pad_len
+            all_input_ids.append(padded_ids[:-1])
+
+            # Labels: shifted right, prefix masked with -100
+            shifted = ids[1:] + [self.pad_token_id]
+            labels  = [self.label_pad] * (prefix_len - 1) + shifted[prefix_len - 1:]
+            labels  = labels + [self.label_pad] * pad_len
+            labels  = labels[:max_len - 1]
+            all_labels.append(labels)
+
+        return {
+            "input_ids": torch.tensor(all_input_ids, dtype=torch.long),
+            "labels":    torch.tensor(all_labels, dtype=torch.long),
+        }
+
+
 class DynamicPaddingCollator:
-    """Collator that pads batches dynamically"""
+    """Collator that pads batches dynamically (kept for backward compat)"""
 
     def __init__(self, pad_token_id, label_pad=-100):
 
@@ -171,7 +212,7 @@ class DynamicPaddingCollator:
     def __call__(self, batch):
 
         max_input_len  = max(len(b["input_ids"]) for b in batch)
-        max_target_len = max(len(b["labels"]) for b in batch) if batch[0]["labels"] else 0
+        max_target_len = max(len(b["labels"]) for b in batch) if "labels" in batch[0] else 0
 
         input_ids      = []
         attention_mask = []
@@ -182,7 +223,7 @@ class DynamicPaddingCollator:
             pad_len = max_input_len - inp_len
 
             input_ids.append(b["input_ids"] + [self.pad_token_id] * pad_len)
-            attention_mask.append(b["attention_mask"] + [0] * pad_len)
+            attention_mask.append(b.get("attention_mask", [1] * inp_len) + [0] * pad_len)
 
             if max_target_len > 0:
                 lbl_len = len(b["labels"])
@@ -198,5 +239,3 @@ class DynamicPaddingCollator:
             result["labels"] = torch.tensor(labels, dtype=torch.long)
 
         return result
-
-

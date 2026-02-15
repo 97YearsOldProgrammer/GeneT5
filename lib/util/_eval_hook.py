@@ -49,25 +49,25 @@ class CheckpointEvaluator:
             sequence     = sample["sequence"]
             ref_features = sample["ref_features"]
 
-            # Encode input DNA sequence
-            encoded   = self.tokenizer.encode(sequence)
-            input_ids = torch.tensor([encoded], dtype=torch.long, device=device)
+            # Encode input DNA + append bos as prefix
+            encoded    = self.tokenizer.encode(sequence, add_special_tokens=False)
+            prefix_ids = encoded + [bos_id]
+            prefix_ids = torch.tensor([prefix_ids], dtype=torch.long, device=device)
 
-            # Generate
+            # Generate from prefix
             with torch.amp.autocast(device.type, dtype=dtype):
                 generated = model.generate(
-                    encoder_input_ids = input_ids,
-                    max_length        = self.max_length,
-                    temperature       = self.temperature,
-                    top_k             = self.top_k,
-                    top_p             = self.top_p,
-                    bos_token_id      = bos_id,
-                    eos_token_id      = eos_id,
-                    pad_token_id      = pad_id,
+                    prefix_ids   = prefix_ids,
+                    max_length   = self.max_length,
+                    temperature  = self.temperature,
+                    top_k        = self.top_k,
+                    top_p        = self.top_p,
+                    eos_token_id = eos_id,
+                    pad_token_id = pad_id,
                 )
 
-            # Decode output tokens to text
-            output_ids = generated[0].tolist()
+            # Decode only the generated portion (after prefix)
+            output_ids = generated[0, prefix_ids.size(1):].tolist()
             raw_output = self.tokenizer.decode(output_ids)
 
             # Clean and parse
