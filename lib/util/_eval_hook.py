@@ -71,38 +71,38 @@ class CheckpointEvaluator:
             raw_output = self.tokenizer.decode(output_ids)
 
             # Clean and parse
-            cleaned         = self._clean_output(raw_output)
-            parsed_seqs     = self.parser.parse_sequence(cleaned)
-            parsed_features = parsed_seqs[0] if parsed_seqs else []
+            cleaned      = self._clean_output(raw_output)
+            parsed_genes = self.parser.parse_sequence(cleaned)
 
-            # Extract predicted exon coords
-            pred_exon_coords = set()
-            pred_gene_map    = {}
-            for pf in parsed_features:
-                if pf.feature_type == "exon":
-                    pred_exon_coords.add((pf.start, pf.end))
-                    gkey = pf.gene_idx
-                    if gkey not in pred_gene_map:
-                        pred_gene_map[gkey] = set()
-                    pred_gene_map[gkey].add((pf.start, pf.end))
+            # Extract predicted exon DNA strings
+            pred_exon_dna = set()
+            pred_gene_map = {}
+            for gi, gene in enumerate(parsed_genes):
+                for exon_seq in gene.exons:
+                    pred_exon_dna.add(exon_seq)
+                if gene.exons:
+                    pred_gene_map[gi] = set(gene.exons)
 
-            # Extract reference exon coords (gene_idx from prep_eval JSON)
-            ref_exon_coords = set()
-            ref_gene_map    = {}
+            # Extract reference exon DNA from sequence + ref_features
+            ref_exon_dna = set()
+            ref_gene_map = {}
             for rf in ref_features:
-                ref_exon_coords.add((rf["start"], rf["end"]))
-                gkey = rf.get("gene_idx", 0)
+                if rf.get("type", "exon").lower() != "exon":
+                    continue
+                dna  = sequence[rf["start"]:rf["end"]]
+                ref_exon_dna.add(dna)
+                gkey = rf.get("gene_idx", rf.get("gene_id", 0))
                 if gkey not in ref_gene_map:
                     ref_gene_map[gkey] = set()
-                ref_gene_map[gkey].add((rf["start"], rf["end"]))
+                ref_gene_map[gkey].add(dna)
 
-            total_predicted += len(pred_exon_coords)
-            total_ref       += len(ref_exon_coords)
+            total_predicted += len(pred_exon_dna)
+            total_ref       += len(ref_exon_dna)
 
-            all_pred_exons.append(pred_exon_coords)
-            all_ref_exons.append(ref_exon_coords)
+            all_pred_exons.append(pred_exon_dna)
+            all_ref_exons.append(ref_exon_dna)
 
-            # Gene signatures: frozenset of exon coords per gene (Counter handles dupes)
+            # Gene signatures: frozenset of exon DNA strings per gene
             pred_gene_sigs = Counter(frozenset(exons) for exons in pred_gene_map.values() if exons)
             ref_gene_sigs  = Counter(frozenset(exons) for exons in ref_gene_map.values() if exons)
 
@@ -182,6 +182,9 @@ class CheckpointEvaluator:
         output = output.replace("<EOS>", "<eos>")
         output = output.replace("[BOS]", "<bos>")
         output = output.replace("[EOS]", "<eos>")
+        output = output.replace("[+]", "<+>")
+        output = output.replace("[-]", "<->")
+        output = output.replace("[exon]", "<exon>")
         return output
 
 

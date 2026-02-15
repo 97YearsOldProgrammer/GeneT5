@@ -23,14 +23,12 @@ from lib.util._inference import (
 )
 
 from lib.util._output import (
-    GFFFeature,
-    ParsedFeature,
+    ParsedGene,
     ModelOutputParser,
-    GFFConverter,
     parse_model_output,
+    locate_exon_in_input,
+    genes_to_gff3,
     write_gff3,
-    model_output_to_gff3,
-    process_batch_outputs,
 )
 
 from lib.util._time import (

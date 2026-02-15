@@ -1,19 +1,10 @@
-from .encoder import (
-    Encoder
-)
-
-from .decoder import (
-    Decoder
-)
-
-from ._blockcross import (
-    BlockCrossAttention,
-    BlockCrossAttentionConfig,
-)
+from .encoder import Encoder
+from .decoder import Decoder
+from ._blockcross import CrossAttention, CrossAttentionConfig
 
 __all__ = [
     "Encoder",
     "Decoder",
-    "BlockCrossAttention",
-    "BlockCrossAttentionConfig",
+    "CrossAttention",
+    "CrossAttentionConfig",
 ]

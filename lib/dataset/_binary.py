@@ -194,99 +194,44 @@ class BinaryChunk:
             target_ids    = target_ids,
         )
 
-    def _build_gene_transcript_indices(self):
-        """Build gene and transcript index mappings for features"""
-
-        gene_indices       = {}
-        transcript_indices = {}
-        gene_counter       = 1
-
-        sorted_features = sorted(self.features, key=lambda x: x.get("start", 0))
-
-        for f in sorted_features:
-            gene_id       = f.get("gene_id", "")
-            transcript_id = f.get("transcript_id", "")
-
-            if gene_id and gene_id not in gene_indices:
-                gene_indices[gene_id]       = gene_counter
-                transcript_indices[gene_id] = {}
-                gene_counter               += 1
-
-            if gene_id and transcript_id:
-                if transcript_id not in transcript_indices[gene_id]:
-                    t_idx = len(transcript_indices[gene_id]) + 1
-                    transcript_indices[gene_id][transcript_id] = t_idx
-
-        return gene_indices, transcript_indices
-
-    def _format_gene_idx(self, gene_id, transcript_id, gene_indices, transcript_indices):
-        """Format gene index (one transcript per gene, no sub-indices)"""
-
-        gene_idx = gene_indices.get(gene_id, 1)
-        return str(gene_idx)
-
     def get_input_text(self):
-        """Format chunk as input text for tokenization"""
+        """Format chunk as input text with optional intron hint DNA"""
 
         input_text = self.sequence
 
         if self.has_hints and self.hints:
-            input_text += r"[\n][HIT]"
+            input_text += "<hints>"
             for h in sorted(self.hints, key=lambda x: x.get("start", 0)):
-                htype   = h.get("type", "exon").lower()
-                hstart  = h.get("start", 0)
-                hend    = h.get("end", 0)
-                hstrand = h.get("strand", "+")
-                input_text += rf"[\n]{htype}{hstart}[\t]{hend}{hstrand}"
+                htype = h.get("type", "intron_hc")
+                tag   = "<hc>" if "hc" in htype else "<lc>"
+                input_text += tag + self.sequence[h["start"]:h["end"]]
 
         return input_text
 
     def get_target_text(self):
-        """Format chunk as target text for tokenization (compressed format)"""
+        """Format target as exon DNA sequences grouped by gene"""
 
-        gene_indices, transcript_indices = self._build_gene_transcript_indices()
-
-        target_text     = "<bos>"
         sorted_features = sorted(self.features, key=lambda x: x.get("start", 0))
 
+        genes = {}
         for f in sorted_features:
-            ftype = f.get("type", "exon").lower()
-
-            # Only emit exon features (CDS boundaries encoded as trailing coords)
-            if ftype != "exon":
+            if f.get("type", "").lower() != "exon":
                 continue
+            gid = f.get("gene_id", "unknown")
+            if gid not in genes:
+                genes[gid] = {"strand": f.get("strand", "+"), "exons": [], "pos": f["start"]}
+            genes[gid]["exons"].append(f)
 
-            fstart  = f.get("start", 0)
-            fend    = f.get("end", 0)
-            fstrand = f.get("strand", "+")
-            fphase  = f.get("phase", ".")
+        target = "<bos>"
+        for gid, g in sorted(genes.items(), key=lambda x: x[1]["pos"]):
+            target += "<+>" if g["strand"] == "+" else "<->"
+            for i, exon in enumerate(sorted(g["exons"], key=lambda e: e["start"])):
+                if i > 0:
+                    target += "<exon>"
+                target += self.sequence[exon["start"]:exon["end"]]
+        target += "<eos>"
 
-            gene_id       = f.get("gene_id", "")
-            transcript_id = f.get("transcript_id", "")
-
-            gene_idx_str = self._format_gene_idx(
-                gene_id, transcript_id, gene_indices, transcript_indices
-            )
-
-            # Trailing CDS boundary coords (encodes UTR implicitly)
-            # 5' end: cds_start (where CDS begins)
-            # 3' end: cds_end   (where CDS ends)
-            cds_start = f.get("cds_start")
-            cds_end   = f.get("cds_end")
-
-            if cds_start is not None and cds_start > fstart:
-                trailing = rf"[\t]{cds_start}"
-            elif cds_end is not None and cds_end < fend:
-                trailing = rf"[\t]{cds_end}"
-            else:
-                trailing = ""
-
-            # Format: {start}[\t]{end}{strand}{phase}[\t]{gene_idx}[[\t]{cds_coord}][\n]
-            target_text += rf"{fstart}[\t]{fend}{fstrand}{fphase}[\t]{gene_idx_str}{trailing}[\n]"
-
-        target_text += "<eos>"
-
-        return target_text
+        return target
 
     def estimate_input_tokens(self, tokenizer=None):
         """Estimate input token count for this chunk"""

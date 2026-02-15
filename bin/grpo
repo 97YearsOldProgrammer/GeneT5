@@ -116,7 +116,7 @@ def generate_group(model, encoder_hidden, group_size, tokenizer, args):
     return generated
 
 
-def score_generations(generated, ref_features_list, group_size, tokenizer, args):
+def score_generations(generated, ref_features_list, sequences, group_size, tokenizer, args):
     """Score generated sequences against references"""
 
     batch_size = len(ref_features_list)
@@ -129,7 +129,7 @@ def score_generations(generated, ref_features_list, group_size, tokenizer, args)
             pred_text  = tokenizer.decode(output_ids)
 
             r = reward.composite_reward(
-                pred_text, ref_features_list[i],
+                pred_text, ref_features_list[i], sequences[i],
                 exon_weight=args.exon_weight, gene_weight=args.gene_weight
             )
             rewards.append(r)
@@ -378,6 +378,7 @@ def main():
 
         input_ids    = batch["input_ids"].to(device)
         ref_features = batch["ref_features"]
+        sequences    = batch["sequences"]
 
         # ========== Phase 1: Generate (no_grad) ==========
         gen_start = time.time()
@@ -396,7 +397,7 @@ def main():
 
         # ========== Phase 2: Score (CPU) ==========
         rewards_tensor = score_generations(
-            generated, ref_features, args.group_size, tokenizer, args
+            generated, ref_features, sequences, args.group_size, tokenizer, args
         )
 
         # ========== Phase 3: Advantages ==========

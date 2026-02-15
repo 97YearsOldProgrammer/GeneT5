@@ -28,8 +28,6 @@ class GeneT5(nn.Module):
         decoder_num_kv_heads = None,
         vocab_size           = 4096,
         tie_weights          = True,
-        encoder_window_size  = 1024,
-        decoder_window_size  = 256,
     ):
         super().__init__()
 
@@ -39,14 +37,11 @@ class GeneT5(nn.Module):
         if decoder_num_kv_heads is None:
             decoder_num_kv_heads = max(1, decoder_num_heads // 4)
 
-        self.encoder_window_size = encoder_window_size
-        self.decoder_window_size = decoder_window_size
-
         # Encoder embedding
         self.encoder_embed         = nn.Embedding(vocab_size, embed_dim)
         self.encoder_embed_dropout = nn.Dropout(decoder_dropout)
 
-        # Encoder (flash_attn sliding window)
+        # Encoder (full flash attention)
         self.encoder = Encoder(
             num_layers   = encoder_num_layers,
             embed_dim    = embed_dim,
@@ -55,10 +50,9 @@ class GeneT5(nn.Module):
             dropout      = decoder_dropout,
             attn_dropout = decoder_dropout,
             use_alibi    = True,
-            window_size  = encoder_window_size,
         )
 
-        # Decoder
+        # Decoder (full flash self-attn + flash cross-attn + MoE)
         self.decoder = Decoder(
             num_layers   = decoder_num_layers,
             embed_dim    = embed_dim,
@@ -71,7 +65,6 @@ class GeneT5(nn.Module):
             num_experts  = decoder_num_experts,
             moe_top_k    = decoder_moe_top_k,
             num_kv_heads = decoder_num_kv_heads,
-            window_size  = decoder_window_size,
         )
 
         # Decoder embeddings
@@ -340,8 +333,6 @@ class GeneT5(nn.Module):
             decoder_num_kv_heads = config.get("decoder_num_kv_heads"),
             vocab_size           = config["vocab_size"],
             tie_weights          = config["tie_weights"],
-            encoder_window_size  = config.get("encoder_window_size", 1024),
-            decoder_window_size  = config.get("decoder_window_size", 256),
         )
 
         model.load(path / "pytorch_model.bin")

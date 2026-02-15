@@ -13,12 +13,11 @@ from flash_attn import flash_attn_func
 
 
 @dataclass
-class SparseAttentionConfig:
+class FlashAttentionConfig:
     embed_dim:    int   = 768
     num_heads:    int   = 12
     num_kv_heads: int   = None
     head_dim:     int   = None
-    window_size:  int   = 512
     dropout:      float = 0.0
     use_alibi:    bool  = True
 
@@ -35,23 +34,21 @@ class SparseAttentionConfig:
 #####################
 
 
-class SparseAttention(nn.Module):
-    """Sliding window attention using flash_attn with GQA and ALiBi"""
+class FlashAttention(nn.Module):
+    """Full attention using flash_attn with GQA and ALiBi"""
 
     def __init__(self, config, is_causal=False):
 
         super().__init__()
 
-        self.config          = config
-        self.is_causal       = is_causal
-        self.embed_dim       = config.embed_dim
-        self.num_heads       = config.num_heads
-        self.num_kv_heads    = config.num_kv_heads
-        self.head_dim        = config.head_dim
-        self.kv_dim          = config.head_dim * config.num_kv_heads
-        self.window_size     = config.window_size
-        self.softmax_scale   = 1.0 / math.sqrt(self.head_dim)
-        self.heads_per_group = config.num_heads // config.num_kv_heads
+        self.config        = config
+        self.is_causal     = is_causal
+        self.embed_dim     = config.embed_dim
+        self.num_heads     = config.num_heads
+        self.num_kv_heads  = config.num_kv_heads
+        self.head_dim      = config.head_dim
+        self.kv_dim        = config.head_dim * config.num_kv_heads
+        self.softmax_scale = 1.0 / math.sqrt(self.head_dim)
 
         assert config.num_heads % config.num_kv_heads == 0
 
@@ -87,28 +84,13 @@ class SparseAttention(nn.Module):
             ])
 
     def forward(self, hidden_states, attention_mask=None):
-        """Forward pass with sliding window attention"""
+        """Forward pass with full flash attention"""
 
         B, L, D = hidden_states.shape
 
         q = self.q(hidden_states).view(B, L, self.num_heads, self.head_dim)
         k = self.k(hidden_states).view(B, L, self.num_kv_heads, self.head_dim)
         v = self.v(hidden_states).view(B, L, self.num_kv_heads, self.head_dim)
-
-        # GQA expansion: [B, L, kv_heads, D] -> [B, L, heads, D]
-        if self.heads_per_group > 1:
-            k = k.unsqueeze(3).expand(B, L, self.num_kv_heads, self.heads_per_group, self.head_dim)
-            k = k.reshape(B, L, self.num_heads, self.head_dim).contiguous()
-            v = v.unsqueeze(3).expand(B, L, self.num_kv_heads, self.heads_per_group, self.head_dim)
-            v = v.reshape(B, L, self.num_heads, self.head_dim).contiguous()
-
-        if self.window_size <= 0:
-            window_size = (-1, -1)
-        elif self.is_causal:
-            window_size = (self.window_size, 0)
-        else:
-            half_window = self.window_size // 2
-            window_size = (half_window, half_window)
 
         alibi = self.alibi_slopes.float() if self.alibi_slopes is not None else None
 
@@ -117,7 +99,7 @@ class SparseAttention(nn.Module):
             dropout_p     = self.dropout.p if self.training else 0.0,
             softmax_scale = self.softmax_scale,
             causal        = self.is_causal,
-            window_size   = window_size,
+            window_size   = (-1, -1),
             alibi_slopes  = alibi,
         )
 

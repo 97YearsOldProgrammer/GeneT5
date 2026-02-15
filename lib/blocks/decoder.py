@@ -3,8 +3,8 @@ import torch.nn                 as nn
 import torch.utils.checkpoint   as ckpt
 
 from lib.blocks._component      import LayerNorm, FeedForward
-from lib.blocks._flash_att      import SparseAttention, SparseAttentionConfig
-from lib.blocks._blockcross     import BlockCrossAttention, BlockCrossAttentionConfig
+from lib.blocks._flash_att      import FlashAttention, FlashAttentionConfig
+from lib.blocks._blockcross     import CrossAttention, CrossAttentionConfig
 from lib.blocks._moe            import MoE, MoEConfig
 
 
@@ -27,7 +27,6 @@ class DecoderBlock(nn.Module):
         moe_load_balance = 0.01,
         moe_router_z     = 0.001,
         num_kv_heads     = None,
-        window_size      = 256,
     ):
         super().__init__()
 
@@ -36,27 +35,26 @@ class DecoderBlock(nn.Module):
         if num_kv_heads is None:
             num_kv_heads = max(1, num_heads // 4)
 
-        # Self-attention: SparseAttention (sliding window, causal)
-        sparse_config = SparseAttentionConfig(
-            embed_dim   = embed_dim,
-            num_heads   = num_heads,
-            window_size = window_size,
-            dropout     = attn_dropout,
-            use_alibi   = use_alibi,
+        # Self-attention: FlashAttention (full, causal)
+        flash_config = FlashAttentionConfig(
+            embed_dim = embed_dim,
+            num_heads = num_heads,
+            dropout   = attn_dropout,
+            use_alibi = use_alibi,
         )
-        self.self_attn = SparseAttention(config=sparse_config, is_causal=True)
+        self.self_attn = FlashAttention(config=flash_config, is_causal=True)
         self.norm1     = LayerNorm(embed_dim)
 
-        # Cross-attention: BlockCrossAttention (16-token blocks)
-        cross_config = BlockCrossAttentionConfig(
+        # Cross-attention: CrossAttention (flash_attn, GQA)
+        cross_config = CrossAttentionConfig(
             embed_dim    = embed_dim,
             num_heads    = num_heads,
             num_kv_heads = num_kv_heads,
             dropout      = attn_dropout,
         )
-        self.cross_attn = BlockCrossAttention(config=cross_config)
+        self.cross_attn = CrossAttention(config=cross_config)
         self.norm2      = LayerNorm(embed_dim)
-        
+
         # Feed-forward: MoE or standard
         if use_moe:
             moe_config = MoEConfig(
@@ -71,10 +69,10 @@ class DecoderBlock(nn.Module):
             self.ff = MoE(config=moe_config)
         else:
             self.ff = FeedForward(embed_dim, ff_dim, dropout)
-        
+
         self.norm3   = LayerNorm(embed_dim)
         self.dropout = nn.Dropout(dropout)
-    
+
     def forward(
         self,
         hidden_states,
@@ -86,8 +84,8 @@ class DecoderBlock(nn.Module):
         normed = self.norm1(hidden_states)
         attn_output, _ = self.self_attn(normed, attention_mask)
         hidden_states  = hidden_states + self.dropout(attn_output)
-        
-        # Cross-attention (block-wise)
+
+        # Cross-attention
         normed = self.norm2(hidden_states)
         cross_output, _ = self.cross_attn(
             normed,
@@ -95,10 +93,10 @@ class DecoderBlock(nn.Module):
             encoder_attention_mask
         )
         hidden_states = hidden_states + self.dropout(cross_output)
-        
+
         # Feed-forward
         normed = self.norm3(hidden_states)
-        
+
         if self.use_moe:
             ff_output, moe_aux_loss = self.ff(normed)
             hidden_states           = hidden_states + self.dropout(ff_output)
@@ -126,7 +124,6 @@ class Decoder(nn.Module):
         moe_load_balance = 0.01,
         moe_router_z     = 0.001,
         num_kv_heads     = None,
-        window_size      = 256,
     ):
         super().__init__()
 
@@ -150,11 +147,10 @@ class Decoder(nn.Module):
                 moe_load_balance = moe_load_balance,
                 moe_router_z     = moe_router_z,
                 num_kv_heads     = num_kv_heads,
-                window_size      = window_size,
             )
             for _ in range(num_layers)
         ])
-        
+
         self.final_norm = LayerNorm(embed_dim)
         self.dropout    = nn.Dropout(dropout)
 
@@ -200,7 +196,7 @@ class Decoder(nn.Module):
         hidden_states = self.dropout(hidden_states)
 
         return hidden_states, total_moe_loss
-    
+
     def get_kv_cache_info(self, batch_size, seq_len, encoder_seq_len):
         """Return KV cache memory usage info in bytes"""
 
@@ -210,27 +206,19 @@ class Decoder(nn.Module):
         layer      = self.layers[0]
         num_layers = len(self.layers)
 
-        # SparseAttention: standard KV cache
+        # FlashAttention: standard KV cache
         num_heads = layer.self_attn.num_heads
         head_dim  = layer.self_attn.head_dim
-        self_kv   = batch_size * seq_len * num_heads * head_dim * 2 * 2  # K+V, float16
+        self_kv   = batch_size * seq_len * num_heads * head_dim * 2 * 2
 
-        # BlockCrossAttention: KV cache based on encoder length (shared across decoder blocks)
+        # CrossAttention: KV cache based on encoder length
         num_kv_heads = layer.cross_attn.num_kv_heads
         cross_kv     = batch_size * encoder_seq_len * num_kv_heads * head_dim * 2 * 2
-
-        # Memory info for block cross-attention
-        block_size   = layer.cross_attn.block_size
-        block_count  = (seq_len + block_size - 1) // block_size
-        cross_scores = block_count * encoder_seq_len * num_heads * 2  # attention scores
 
         return {
             "self_attn_per_layer":  self_kv,
             "cross_attn_per_layer": cross_kv,
-            "cross_scores_per_layer": cross_scores,
             "total_self":           self_kv * num_layers,
             "total_cross":          cross_kv * num_layers,
             "total_kv_cache":       (self_kv + cross_kv) * num_layers,
-            "block_count":          block_count,
-            "reduction_vs_dense":   seq_len / block_count,
         }

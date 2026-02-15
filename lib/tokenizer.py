@@ -10,14 +10,12 @@ DNABERT_PATH = "zhihan1996/DNABERT-2-117M"
 #############################
 
 
-SPECIAL  = ["<bos>", "<eos>"]
-FORMAT   = ["[ATT]", "[HIT]", "+", "-", r"[\t]", r"[\n]"]
-NUMBERS  = [str(i) for i in range(1000)]
-NMASK    = ["N" * i for i in range(1, 7)]
-FEATURES = ["exon"]
-HINTS    = ["intron_hc", "intron_lc"]
+SPECIAL   = ["<bos>", "<eos>"]
+STRUCTURE = ["<exon>", "<+>", "<->"]
+HINT      = ["<hints>", "<hc>", "<lc>"]
+NMASK     = ["N" * i for i in range(1, 7)]
 
-GFF_TOKENS = SPECIAL + FORMAT + NUMBERS + NMASK + FEATURES + HINTS
+GFF_TOKENS = SPECIAL + STRUCTURE + HINT + NMASK
 
 
 #######################

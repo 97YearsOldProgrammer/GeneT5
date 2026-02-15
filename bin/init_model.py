@@ -9,10 +9,6 @@ parser.add_argument("--save_dir", type=str, default="./checkpoints/genet5_init",
     help="Directory to save the initialized model weights and config.")
 parser.add_argument("--dnabert_path", type=str, default="zhihan1996/DNABERT-2-117M",
     help="HuggingFace model ID or local path to DNABERT-2.")
-parser.add_argument("--encoder_window_size", type=int, default=1024,
-    help="Sliding window size for encoder attention. -1 for full attention.")
-parser.add_argument("--decoder_window_size", type=int, default=256,
-    help="Left context window for decoder self-attention.")
 parser.add_argument("--decoder_layers", type=int, default=None,
     help="Number of decoder layers. Defaults to matching encoder.")
 parser.add_argument("--decoder_heads", type=int, default=None,
@@ -53,8 +49,6 @@ print(f"\n{' GeneT5 Initialization ':=^60}")
 saved_path = build_gt5(
     dnabert_model_name        = args.dnabert_path,
     save_dir                  = args.save_dir,
-    encoder_window_size       = args.encoder_window_size,
-    decoder_window_size       = args.decoder_window_size,
     decoder_num_layers        = args.decoder_layers,
     decoder_num_heads         = args.decoder_heads,
     decoder_num_kv_heads      = args.decoder_kv_heads,

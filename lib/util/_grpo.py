@@ -26,6 +26,7 @@ class GRPODataset(data_utils.Dataset):
         return {
             "input_ids":    encoded,
             "ref_features": sample["ref_features"],
+            "sequence":     sequence,
             "sample_idx":   idx,
         }
 
@@ -41,10 +42,12 @@ def grpo_collate(batch, pad_id=0):
         padded[i, :ids.size(0)] = ids
 
     ref_features = [b["ref_features"] for b in batch]
+    sequences    = [b["sequence"] for b in batch]
 
     return {
         "input_ids":    padded,
         "ref_features": ref_features,
+        "sequences":    sequences,
     }
 
 

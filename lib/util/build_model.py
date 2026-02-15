@@ -15,12 +15,7 @@ from lib.tokenizer import GeneTokenizer
 #####################
 
 
-ENCODER_DEFAULTS = {
-    "window_size": 1024,
-}
-
 DECODER_DEFAULTS = {
-    "window_size":  256,
     "dropout":      0.1,
     "use_alibi":    True,
     "use_moe":      True,
@@ -39,10 +34,6 @@ INIT_DEFAULTS = {
 def build_gt5(
     dnabert_model_name  = "zhihan1996/DNABERT-2-117M",
     save_dir            = "./checkpoints/genet5_init",
-    # Encoder sliding window
-    encoder_window_size = ENCODER_DEFAULTS["window_size"],
-    # Decoder sparse attention
-    decoder_window_size = DECODER_DEFAULTS["window_size"],
     # Decoder architecture
     decoder_num_layers  = None,  # defaults to encoder
     decoder_num_heads   = None,  # defaults to encoder
@@ -81,8 +72,6 @@ def build_gt5(
     """
     
     # Handle None values - fall back to defaults
-    if decoder_window_size is None:
-        decoder_window_size = DECODER_DEFAULTS["window_size"]
     if init_embed_std is None:
         init_embed_std = init_std
     if init_ffn_std is None:
@@ -122,8 +111,6 @@ def build_gt5(
 
     print(f"\n    DNABERT-2: hidden={embed_dim}, layers={num_layers}, heads={num_heads}")
     print(f"    Decoder:   layers={decoder_num_layers}, heads={decoder_num_heads}, kv_heads={decoder_num_kv_heads}, moe={decoder_use_moe}")
-    print(f"    Encoder: window={encoder_window_size}")
-    print(f"    Decoder: window={decoder_window_size}")
 
     # Load raw state dict (no model construction needed)
     print(f"\n[2] Loading DNABERT-2 weights")
@@ -152,7 +139,6 @@ def build_gt5(
         dropout      = dna_config.hidden_dropout_prob,
         attn_dropout = dna_config.attention_probs_dropout_prob,
         use_alibi    = True,
-        window_size  = encoder_window_size,
     )
 
     # Transfer Encoder Weights from raw state dict
@@ -202,7 +188,6 @@ def build_gt5(
         num_experts  = decoder_num_experts,
         moe_top_k    = decoder_moe_top_k,
         num_kv_heads = decoder_num_kv_heads,
-        window_size  = decoder_window_size,
     )
     
     # Transfer Decoder Self-Attention from Encoder
@@ -279,8 +264,6 @@ def build_gt5(
         "decoder_moe_top_k":    decoder_moe_top_k,
         "vocab_size":           vocab_size,
         "tie_weights":          tie_weights,
-        "encoder_window_size":  encoder_window_size,
-        "decoder_window_size":  decoder_window_size,
     }
     
     with open(save_path / "config.json", "w") as f:

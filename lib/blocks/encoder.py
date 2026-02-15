@@ -3,7 +3,7 @@ import torch.nn                 as nn
 import torch.utils.checkpoint   as ckpt
 
 from lib.blocks._component  import LayerNorm, FeedForward
-from lib.blocks._flash_att  import SparseAttention, SparseAttentionConfig
+from lib.blocks._flash_att  import FlashAttention, FlashAttentionConfig
 
 
 ####  ENCODER  ####
@@ -19,27 +19,25 @@ class EncoderBlock(nn.Module):
         dropout      = 0.0,
         attn_dropout = 0.0,
         use_alibi    = True,
-        window_size  = 512,
     ):
         super().__init__()
 
-        sparse_config = SparseAttentionConfig(
-            embed_dim   = embed_dim,
-            num_heads   = num_heads,
-            window_size = window_size,
-            dropout     = attn_dropout,
-            use_alibi   = use_alibi
+        flash_config = FlashAttentionConfig(
+            embed_dim = embed_dim,
+            num_heads = num_heads,
+            dropout   = attn_dropout,
+            use_alibi = use_alibi
         )
-        self.self_attn = SparseAttention(
-            config    = sparse_config,
+        self.self_attn = FlashAttention(
+            config    = flash_config,
             is_causal = False
         )
-        
+
         self.norm1   = LayerNorm(embed_dim)
         self.ff      = FeedForward(embed_dim, ff_dim, dropout)
         self.norm2   = LayerNorm(embed_dim)
         self.dropout = nn.Dropout(dropout)
-    
+
     def forward(self, hidden_states, attention_mask=None):
 
         normed             = self.norm1(hidden_states)
@@ -64,7 +62,6 @@ class Encoder(nn.Module):
         dropout      = 0.0,
         attn_dropout = 0.0,
         use_alibi    = True,
-        window_size  = 512,
     ):
         super().__init__()
 
@@ -78,11 +75,10 @@ class Encoder(nn.Module):
                 dropout      = dropout,
                 attn_dropout = attn_dropout,
                 use_alibi    = use_alibi,
-                window_size  = window_size,
             )
             for _ in range(num_layers)
         ])
-        
+
         self.final_norm = LayerNorm(embed_dim)
         self.dropout    = nn.Dropout(dropout)
 

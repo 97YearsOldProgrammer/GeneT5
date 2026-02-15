@@ -231,18 +231,45 @@ build_torchrun_cmd() {
 if [[ -n "$WORKER_IP" ]]; then
     # Ensure worker container is running
     SSH_CMD="ssh -F /dev/null -o StrictHostKeyChecking=no -o IdentityFile=~/.ssh/id_ed25519_spark -o IdentitiesOnly=yes ${WORKER_USER}@${WORKER_IP}"
-    WORKER_RUNNING=$(${SSH_CMD} "docker inspect -f '{{.State.Running}}' ${CONTAINER} 2>/dev/null" || echo "false")
-    if [[ "$WORKER_RUNNING" != "true" ]]; then
-        echo "[worker] Container not running, starting in daemon mode..."
-        ${SSH_CMD} "cd /home/cg666/Code/GeneT5 && bash start-worker.sh --daemon"
-        echo "[worker] Waiting for container setup (pip install)..."
-        for i in $(seq 1 30); do
-            if ${SSH_CMD} "docker exec ${CONTAINER} python -c 'import liger_kernel' 2>/dev/null"; then
-                break
-            fi
-            sleep 2
-        done
+    WORKER_STATE=$(${SSH_CMD} "docker inspect -f '{{.State.Status}}' ${CONTAINER} 2>/dev/null" || echo "missing")
+
+    case "$WORKER_STATE" in
+        running)
+            echo "[worker] Container already running"
+            ;;
+        exited|created)
+            echo "[worker] Container stopped, restarting (packages intact)..."
+            ${SSH_CMD} "docker start ${CONTAINER}"
+            ;;
+        *)
+            echo "[worker] No container found, creating fresh (will pip install)..."
+            ${SSH_CMD} "cd /home/cg666/Code/GeneT5 && bash start-worker.sh --daemon"
+            echo "[worker] Waiting for pip install..."
+            for i in $(seq 1 30); do
+                if ${SSH_CMD} "docker exec ${CONTAINER} python -c 'import liger_kernel' 2>/dev/null"; then
+                    break
+                fi
+                if [[ $i -eq 30 ]]; then
+                    echo "[worker] ERROR: pip install timed out after 60s"
+                    exit 1
+                fi
+                sleep 2
+            done
+            ;;
+    esac
+
+    # Auto-patch NGC triton cluster_dims bug on both nodes (idempotent)
+    TRITON_FILE="/usr/local/lib/python3.12/dist-packages/torch/_inductor/runtime/triton_heuristics.py"
+    PATCH_MARKER='getattr(binary.metadata, "cluster_dims"'
+    PATCH_CMD="grep -q '${PATCH_MARKER}' ${TRITON_FILE} 2>/dev/null || \
+        sed -i 's|(binary.metadata.num_ctas, \*binary.metadata.cluster_dims)|(binary.metadata.num_ctas, *(getattr(binary.metadata, \"cluster_dims\", None) or getattr(binary.metadata, \"clusterDims\", (1, 1, 1))))|' ${TRITON_FILE}"
+
+    # Patch worker
+    if ! ${SSH_CMD} "docker exec ${CONTAINER} bash -c '${PATCH_CMD}'" 2>/dev/null; then
+        echo "[worker] WARNING: triton patch failed (non-fatal)"
     fi
+    # Patch master
+    eval "$PATCH_CMD" 2>/dev/null || true
 
     # Build env string for docker exec (skip per-node vars — worker detects its own)
     ENV_STR=""
@@ -269,22 +296,46 @@ if [[ -n "$WORKER_IP" ]]; then
     WORKER_PID=""
 
     # Kill both sides on exit, Ctrl+C, or if either side dies
-    kill_remote_torchrun() {
+    kill_local_tree() {
+        # Kill the entire process group: torchrun + all child python workers
+        [ -n "$MASTER_PID" ] && kill -- -$MASTER_PID 2>/dev/null || true
+        # Also pkill by pattern in case process group kill missed anything
+        pkill -f 'torchrun.*finet' 2>/dev/null || true
+        pkill -f 'python.*bin/finet' 2>/dev/null || true
+    }
+
+    kill_remote_tree() {
         ssh -F /dev/null -o StrictHostKeyChecking=no \
             -o IdentityFile=~/.ssh/id_ed25519_spark -o IdentitiesOnly=yes \
             "${WORKER_USER}@${WORKER_IP}" \
-            "docker exec ${CONTAINER} pkill -f 'torchrun.*finet'" 2>/dev/null || true
+            "docker exec ${CONTAINER} bash -c 'pkill -f torchrun.*finet; pkill -f python.*bin/finet'" 2>/dev/null || true
+    }
+
+    force_kill() {
+        # Escalate to SIGKILL if anything survived
+        sleep 2
+        pkill -9 -f 'torchrun.*finet' 2>/dev/null || true
+        pkill -9 -f 'python.*bin/finet' 2>/dev/null || true
+        ssh -F /dev/null -o StrictHostKeyChecking=no \
+            -o IdentityFile=~/.ssh/id_ed25519_spark -o IdentitiesOnly=yes \
+            "${WORKER_USER}@${WORKER_IP}" \
+            "docker exec ${CONTAINER} bash -c 'pkill -9 -f torchrun.*finet; pkill -9 -f python.*bin/finet'" 2>/dev/null || true
     }
 
     cleanup() {
         trap - EXIT INT TERM
         echo ""
         echo "[cleanup] Shutting down both nodes..."
-        [ -n "$MASTER_PID" ] && kill $MASTER_PID 2>/dev/null
-        [ -n "$WORKER_PID" ] && kill $WORKER_PID 2>/dev/null
-        kill_remote_torchrun
+        kill_local_tree
+        kill_remote_tree
         wait $MASTER_PID 2>/dev/null
         wait $WORKER_PID 2>/dev/null
+        # Force kill stragglers
+        if pgrep -f 'python.*bin/finet' >/dev/null 2>&1; then
+            echo "[cleanup] Stragglers detected, sending SIGKILL..."
+            force_kill
+        fi
+        echo "[cleanup] Done"
     }
     trap cleanup EXIT INT TERM
 
@@ -300,11 +351,13 @@ if [[ -n "$WORKER_IP" ]]; then
     # Give worker a head start to open the rendezvous port listener
     sleep 3
 
-    # Launch master locally (background)
+    # Launch master locally (background, in own process group for clean kill)
     echo "[master] Launching locally..."
     echo ""
+    set -m
     eval "$(build_torchrun_cmd 0)" &
     MASTER_PID=$!
+    set +m
 
     # Wait for first process to finish
     MASTER_EXIT=0
@@ -316,15 +369,20 @@ if [[ -n "$WORKER_IP" ]]; then
         wait $MASTER_PID 2>/dev/null; MASTER_EXIT=$?
         echo ""
         echo "[master] Exited (code=$MASTER_EXIT), stopping worker..."
-        kill $WORKER_PID 2>/dev/null
-        kill_remote_torchrun
+        kill_remote_tree
         wait $WORKER_PID 2>/dev/null; WORKER_EXIT=$?
     elif ! kill -0 $WORKER_PID 2>/dev/null; then
         wait $WORKER_PID 2>/dev/null; WORKER_EXIT=$?
         echo ""
         echo "[worker] Exited (code=$WORKER_EXIT), stopping master..."
-        kill $MASTER_PID 2>/dev/null
+        kill_local_tree
         wait $MASTER_PID 2>/dev/null; MASTER_EXIT=$?
+    fi
+
+    # Final sweep — nuke anything still alive
+    if pgrep -f 'python.*bin/finet' >/dev/null 2>&1; then
+        echo "[cleanup] Stragglers detected, sending SIGKILL..."
+        force_kill
     fi
 
     # Disable trap — we already cleaned up
