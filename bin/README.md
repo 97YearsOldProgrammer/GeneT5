@@ -40,13 +40,93 @@ PYTHONPATH=. python bin/init_model.py \
 
 ### Data Baking
 
-Prepare multi-species training data from raw GFF/FASTA
+Prepare multi-species training data from raw GFF/FASTA. Species are **auto-discovered** from the raw directory (any subdir containing `fna.gz` + `gff.gz`). No hardcoded species list — the raw dir IS the species list. Canonical transcript filtering and fast tokenizer (Rust backend) are always on.
+
+**Single-node bake**
 
 ```bash
-bash bin/bake.sh --worker 192.168.100.11 --tokenizer ../model/GeneT5/ --output_dir ../baked/GeneT5/w20k_ts51_v2/ --window_size 20000 --species_parallel 4 --canonical_only --val_species B.taurus,S.lycopersicum --val_windows 2000
+PYTHONPATH=. python bin/bake_data ../raw \
+    --tokenizer ../model/GeneT5/ \
+    --output_dir ../baked/GeneT5/w20k_v3/ \
+    --window_size 20000 \
+    --species_parallel 4 \
+    --val_species B.taurus,S.lycopersicum \
+    --val_windows 2000 \
+    2>&1 | tee ../logs/baker/w20k_v3.log
 ```
 
-Validation comes exclusively from held-out species, capped at `--val_windows` (default 3000). Training species produce zero validation data.
+**Distributed bake (2x DGX Spark)**
+
+Greedy bin-packing distributes species across nodes by genome size. Node 0 handles held-out species and eval generation.
+
+```bash
+# Node 0 (master — also handles eval + held-out species)
+PYTHONPATH=. python bin/bake_data ../raw \
+    --tokenizer ../model/GeneT5/ \
+    --output_dir ../baked/GeneT5/w20k_v3/ \
+    --window_size 20000 \
+    --species_parallel 4 \
+    --val_species B.taurus,S.lycopersicum \
+    --nnodes 2 --node_rank 0 \
+    2>&1 | tee ../logs/baker/w20k_v3_node0.log
+
+# Node 1 (worker)
+PYTHONPATH=. python bin/bake_data ../raw \
+    --tokenizer ../model/GeneT5/ \
+    --output_dir ../baked/GeneT5/w20k_v3/ \
+    --window_size 20000 \
+    --species_parallel 4 \
+    --nnodes 2 --node_rank 1 \
+    2>&1 | tee ../logs/baker/w20k_v3_node1.log
+```
+
+**4-node bake** (scale to more machines)
+
+```bash
+# Each node gets a balanced slice of species by genome size
+for RANK in 0 1 2 3; do
+    PYTHONPATH=. python bin/bake_data ../raw \
+        --tokenizer ../model/GeneT5/ \
+        --output_dir ../baked/GeneT5/w20k_v3/ \
+        --species_parallel 4 \
+        --val_species B.taurus,S.lycopersicum \
+        --nnodes 4 --node_rank $RANK \
+        2>&1 | tee ../logs/baker/w20k_v3_node${RANK}.log &
+done
+wait
+```
+
+**Output structure** (flat, all species together)
+
+```
+../baked/GeneT5/w20k_v3/
+  H.sapiens/training.bin        # per-species bin
+  H.sapiens/gene_index.json     # sidecar (avoids GFF re-parse for eval)
+  M.musculus/training.bin
+  B.taurus/training.bin         # held-out species (same dir)
+  ...
+  training.bin                  # merged training
+  validation.bin                # merged validation (held-out only)
+  eval.json                     # eval samples from held-out species
+  bake_config.json              # records which species are val/eval
+```
+
+**CLI flags**
+
+| Flag | Default | Purpose |
+| :--- | :------ | :------ |
+| `--val_species` | none | Comma-separated held-out species for validation |
+| `--val_windows` | 3000 | Max validation windows from held-out species |
+| `--window_size` | 20000 | Sliding window size in bp |
+| `--species_parallel` | 3 | Species processed in parallel |
+| `--n_workers` | auto | Workers per species for chunking |
+| `--compress` | none | `zlib` or `zstd` compression |
+| `--nnodes` | 1 | Total baking nodes |
+| `--node_rank` | 0 | This node's rank (0-indexed) |
+| `--eval_samples` | 50 | Eval samples per held-out species |
+| `--train` / `--eval` | both | Bake training or eval only |
+
+Validation comes exclusively from held-out species, capped at `--val_windows`. Training species produce zero validation data.
 
 **Subsetting** (for dev/test with smaller data)
 
@@ -57,9 +137,23 @@ PYTHONPATH=. python bin/subset_packed \
     --fraction 0.05
 ```
 
-**Mid-trainning Eval**
+**One-click distributed bake (2x DGX Spark)**
 
-```python
+```bash
+bin/bake.sh --worker 192.168.100.11 \
+    --tokenizer ../model/GeneT5/init \
+    --output_dir ../baked/GeneT5/w20k_s51_v2 \
+    --window_size 20000 \
+    --species_parallel 3 \
+    --val_species B.taurus,S.lycopersicum \
+    --eval_samples 50 \
+    --seed 42 \
+    ../raw
+```
+
+**Mid-training Eval**
+
+```bash
 python bin/prep_eval ../raw/S.scrofa/ -o ../baked/GeneT5/eval/S.scrofa_eval.json
 ```
 

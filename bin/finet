@@ -38,10 +38,8 @@ DEFAULTS = {
 def main():
 
     parser = argparse.ArgumentParser(description='Fine-tune GeneT5')
-    parser.add_argument('train_bin', type=str, metavar='<train>',
-        help='training binary file')
-    parser.add_argument('val_bin', type=str, metavar='<val>',
-        help='validation binary file')
+    parser.add_argument('data_dir', type=str, metavar='<data>',
+        help='baked data directory (auto-discovers training.bin, validation.bin, eval.json)')
     parser.add_argument('output_dir', type=str, metavar='<o>',
         help='output directory')
     parser.add_argument('model_path', type=str, metavar='<model>',
@@ -90,8 +88,8 @@ def main():
         help='apply MXFP8 quantization to dense Linear layers (Blackwell only)')
     parser.add_argument('--compile', action='store_true',
         help='enable torch.compile on decoder')
-    parser.add_argument('--eval_data', required=False, type=str, default=None,
-        metavar='<file>', help='path to eval JSON for post-checkpoint F1 evaluation')
+    parser.add_argument('--no_eval', action='store_true',
+        help='skip generative F1 evaluation even if eval.json exists')
     parser.add_argument('--eval_samples', required=False, type=int, default=20,
         metavar='<int>', help='number of samples per eval run [%(default)i]')
 
@@ -119,6 +117,23 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
         torch.set_float32_matmul_precision('high')
+
+    # Auto-discover data files from bake output directory
+    data_dir   = pathlib.Path(args.data_dir)
+    train_bin  = data_dir / "training.bin"
+    val_bin    = data_dir / "validation.bin"
+    eval_json  = data_dir / "eval.json"
+
+    if not train_bin.exists():
+        if is_main:
+            print(f"\nERROR: {train_bin} not found")
+            print(f"       Run bin/bake_data first to produce training data")
+        if is_dist:
+            train_util.cleanup_distributed()
+        return
+
+    has_val  = val_bin.exists()
+    has_eval = eval_json.exists() and not args.no_eval
 
     output_dir = pathlib.Path(args.output_dir)
     if is_main:
@@ -183,18 +198,30 @@ def main():
     # load datasets
     if is_main:
         print(f"\nLoading datasets...")
+        print(f"  Data dir: {data_dir}")
 
-    train_dataset = ds.BinaryTrainDataset(args.train_bin, tokenizer, args.seed)
-    val_dataset   = ds.BinaryTrainDataset(args.val_bin, tokenizer, args.seed)
+    train_dataset = ds.BinaryTrainDataset(str(train_bin), tokenizer, args.seed)
+
+    val_dataset = None
+    if has_val:
+        val_dataset = ds.BinaryTrainDataset(str(val_bin), tokenizer, args.seed)
 
     if is_main:
         print(f"  Train: {len(train_dataset):,}")
-        print(f"  Val:   {len(val_dataset):,}")
+        if val_dataset:
+            print(f"  Val:   {len(val_dataset):,}")
+        else:
+            print(f"  Val:   none (no validation.bin)")
+        if has_eval:
+            print(f"  Eval:  {eval_json}")
+        else:
+            reason = "skipped (--no_eval)" if args.no_eval else "none (no eval.json)"
+            print(f"  Eval:  {reason}")
 
     if len(train_dataset) == 0:
         if is_main:
             print(f"\nERROR: Training dataset is empty!")
-            print(f"       Please check: {args.train_bin}")
+            print(f"       Please check: {train_bin}")
         if is_dist:
             train_util.cleanup_distributed()
         return
@@ -209,8 +236,9 @@ def main():
     dist_sampler     = None
     val_dist_sampler = None
     if is_dist:
-        dist_sampler     = data_utils.distributed.DistributedSampler(train_dataset, shuffle=True)
-        val_dist_sampler = data_utils.distributed.DistributedSampler(val_dataset, shuffle=False)
+        dist_sampler = data_utils.distributed.DistributedSampler(train_dataset, shuffle=True)
+        if val_dataset:
+            val_dist_sampler = data_utils.distributed.DistributedSampler(val_dataset, shuffle=False)
 
     persistent = args.num_workers > 0
 
@@ -226,20 +254,25 @@ def main():
         persistent_workers = persistent,
     )
 
-    val_loader = data_utils.DataLoader(
-        val_dataset,
-        batch_size         = args.batch_size,
-        shuffle            = False,
-        sampler            = val_dist_sampler,
-        collate_fn         = collator,
-        num_workers        = args.num_workers,
-        pin_memory         = not args.no_pin_memory,
-        persistent_workers = persistent,
-    )
+    val_loader = None
+    if val_dataset:
+        val_loader = data_utils.DataLoader(
+            val_dataset,
+            batch_size         = args.batch_size,
+            shuffle            = False,
+            sampler            = val_dist_sampler,
+            collate_fn         = collator,
+            num_workers        = args.num_workers,
+            pin_memory         = not args.no_pin_memory,
+            persistent_workers = persistent,
+        )
 
     if is_main:
         print(f"  Train batches: {len(train_loader)}")
-        print(f"  Val batches:   {len(val_loader)}")
+        if val_loader:
+            print(f"  Val batches:   {len(val_loader)}")
+        else:
+            print(f"  Val batches:   none")
 
     # setup optimizer
     if is_main:
@@ -319,7 +352,8 @@ def main():
             **vars(args),
             'vocab_size':    len(tokenizer),
             'train_samples': len(train_dataset),
-            'val_samples':   len(val_dataset),
+            'val_samples':   len(val_dataset) if val_dataset else 0,
+            'has_eval':      has_eval,
             'world_size':    train_util.get_world_size(),
             'effective_lr':  effective_lr,
         }
@@ -381,10 +415,10 @@ def main():
     # Eval hook (rank 0 only)
     evaluator   = None
     eval_logger = None
-    if args.eval_data and is_main:
-        evaluator   = util.CheckpointEvaluator(args.eval_data, tokenizer, num_samples=args.eval_samples)
+    if has_eval and is_main:
+        evaluator   = util.CheckpointEvaluator(str(eval_json), tokenizer, num_samples=args.eval_samples)
         eval_logger = util.EvalLogger(output_dir)
-        print(f"  Eval data: {args.eval_data} ({len(evaluator.samples)} samples)")
+        print(f"  Eval data: {eval_json} ({len(evaluator.samples)} samples)")
         print(f"  Eval log: {eval_logger.log_path}")
 
     for epoch in range(start_epoch, args.epochs):
@@ -398,6 +432,8 @@ def main():
         if val_dist_sampler:
             val_dist_sampler.set_epoch(epoch)
         train_dataset.set_epoch(epoch)
+        if val_dataset:
+            val_dataset.set_epoch(epoch)
 
         # train epoch
         model.train()
@@ -499,32 +535,35 @@ def main():
             train_loss = loss_tensor.item()
 
         # evaluate
-        model.eval()
-        total_val_loss = 0
-        num_batches    = 0
+        val_loss = float('inf')
 
-        with torch.no_grad():
-            for batch in val_loader:
-                batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+        if val_loader:
+            model.eval()
+            total_val_loss = 0
+            num_batches    = 0
 
-                with torch.amp.autocast('cuda', dtype=dtype):
-                    outputs = model(
-                        input_ids = batch['input_ids'],
-                        labels    = batch['labels'],
-                    )
+            with torch.no_grad():
+                for batch in val_loader:
+                    batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
 
-                total_val_loss += outputs['loss'].item()
-                num_batches    += 1
+                    with torch.amp.autocast('cuda', dtype=dtype):
+                        outputs = model(
+                            input_ids = batch['input_ids'],
+                            labels    = batch['labels'],
+                        )
 
-                del outputs, batch
+                    total_val_loss += outputs['loss'].item()
+                    num_batches    += 1
 
-        val_loss = total_val_loss / max(num_batches, 1)
+                    del outputs, batch
 
-        # Sync val loss across processes
-        if is_dist:
-            val_tensor = torch.tensor([val_loss], device=device)
-            train_util.all_reduce_mean(val_tensor)
-            val_loss = val_tensor.item()
+            val_loss = total_val_loss / max(num_batches, 1)
+
+            # Sync val loss across processes
+            if is_dist:
+                val_tensor = torch.tensor([val_loss], device=device)
+                train_util.all_reduce_mean(val_tensor)
+                val_loss = val_tensor.item()
 
         if train_logger:
             train_logger.log_epoch(epoch + 1, train_loss, val_loss, scheduler.get_last_lr()[0])
@@ -541,7 +580,10 @@ def main():
         # checkpointing (rank 0 saves, all ranks wait)
         save_model = train_util.unwrap_model(model)
 
-        if val_loss < best_val_loss:
+        # When no val data, use train loss for best-model selection
+        track_loss = val_loss if val_loader else train_loss
+
+        if track_loss < best_val_loss:
             best_val_loss    = val_loss
             patience_counter = 0
 

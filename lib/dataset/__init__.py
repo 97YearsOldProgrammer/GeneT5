@@ -8,6 +8,8 @@ from lib.dataset.wrapper import (
     extract_feature_types,
     extract_biotypes,
     find_genome_files,
+    save_gene_index,
+    load_gene_index,
     extract_coding_genes,
     build_eval_sample,
     select_diverse_samples,

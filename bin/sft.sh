@@ -3,11 +3,11 @@
 # Distributed fine-tuning across two DGX Sparks
 #
 # One-click (from master):
-#   bin/distributed.sh <train> <val> <output> <model> --worker <WORKER_IP>
+#   bin/sft.sh <data_dir> <output> <model> --worker <WORKER_IP>
 #
 # Manual (run on each node separately):
-#   Master: bin/distributed.sh <train> <val> <output> <model> --nnodes 2 --node-rank 0 --master <MASTER_IP>
-#   Worker: bin/distributed.sh <train> <val> <output> <model> --nnodes 2 --node-rank 1 --master <MASTER_IP>
+#   Master: bin/sft.sh <data_dir> <output> <model> --nnodes 2 --node-rank 0 --master <MASTER_IP>
+#   Worker: bin/sft.sh <data_dir> <output> <model> --nnodes 2 --node-rank 1 --master <MASTER_IP>
 #
 # All extra flags (--epochs, --lr, --batch_size, etc.) are passed to bin/finet
 #
@@ -44,8 +44,7 @@ except: pass" 2>/dev/null)
 done
 
 # Positional args
-TRAIN_DATA=""
-VAL_DATA=""
+DATA_DIR=""
 OUTPUT_DIR=""
 MODEL_PATH=""
 EXTRA_ARGS=()
@@ -95,10 +94,8 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         *)
-            if [ -z "$TRAIN_DATA" ]; then
-                TRAIN_DATA="$1"
-            elif [ -z "$VAL_DATA" ]; then
-                VAL_DATA="$1"
+            if [ -z "$DATA_DIR" ]; then
+                DATA_DIR="$1"
             elif [ -z "$OUTPUT_DIR" ]; then
                 OUTPUT_DIR="$1"
             elif [ -z "$MODEL_PATH" ]; then
@@ -109,8 +106,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [ -z "$TRAIN_DATA" ] || [ -z "$VAL_DATA" ] || [ -z "$OUTPUT_DIR" ] || [ -z "$MODEL_PATH" ]; then
-    echo "Usage: $0 <train.bin> <val.bin> <output_dir> <model_path> [options]"
+if [ -z "$DATA_DIR" ] || [ -z "$OUTPUT_DIR" ] || [ -z "$MODEL_PATH" ]; then
+    echo "Usage: $0 <data_dir> <output_dir> <model_path> [options]"
+    echo ""
+    echo "  data_dir: bake output directory (contains training.bin, validation.bin, eval.json)"
     echo ""
     echo "One-click (launches worker automatically):"
     echo "  --worker IP         Worker node IP (triggers one-click mode)"
@@ -192,8 +191,7 @@ if [[ -n "$WORKER_IP" ]]; then
     echo "Mode:            one-click (auto-launching worker)"
     echo "Worker:          ${WORKER_USER}@${WORKER_IP} (container: ${CONTAINER})"
 fi
-echo "Train data:      $TRAIN_DATA"
-echo "Val data:        $VAL_DATA"
+echo "Data dir:        $DATA_DIR"
 echo "Output dir:      $OUTPUT_DIR"
 echo "Model path:      $MODEL_PATH"
 echo "Extra args:      ${EXTRA_ARGS[*]}"
@@ -214,8 +212,7 @@ build_torchrun_cmd() {
         --master_addr=$MASTER_ADDR \
         --master_port=$MASTER_PORT \
         bin/finet \
-        $TRAIN_DATA \
-        $VAL_DATA \
+        $DATA_DIR \
         $OUTPUT_DIR \
         $MODEL_PATH \
         --memwatch \

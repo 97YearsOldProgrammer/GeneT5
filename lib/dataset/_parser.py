@@ -1,6 +1,7 @@
 import gzip
 import re
 import os
+import json
 import random
 import pathlib
 from collections import defaultdict
@@ -385,9 +386,9 @@ def find_genome_files(species_dir):
 
     for f in species_dir.iterdir():
         name = f.name.lower()
-        if name.endswith(('.fna', '.fna.gz', '.fa', '.fa.gz', '.fasta', '.fasta.gz')):
+        if name.endswith(('.fna', '.fna.gz', '.fa', '.fa.gz', '.fasta', '.fasta.gz')) or name == 'fna.gz':
             fna_path = f
-        elif name.endswith(('.gff', '.gff.gz', '.gff3', '.gff3.gz')):
+        elif name.endswith(('.gff', '.gff.gz', '.gff3', '.gff3.gz')) or name == 'gff.gz':
             gff_path = f
 
     if not fna_path:
@@ -396,6 +397,35 @@ def find_genome_files(species_dir):
         raise FileNotFoundError(f"No GFF file found in {species_dir}")
 
     return fna_path, gff_path
+
+
+##############################
+#####  Gene Index I/O    #####
+##############################
+
+
+def save_gene_index(gene_index, path):
+    """Save gene_index to JSON sidecar for later reuse (avoids re-parsing GFF)."""
+
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(path, 'w') as f:
+        json.dump(gene_index, f)
+
+
+def load_gene_index(path):
+    """Load gene_index from JSON sidecar. Returns None if file doesn't exist."""
+
+    path = pathlib.Path(path)
+    if not path.exists():
+        return None
+
+    try:
+        with open(path, 'r') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 ########################

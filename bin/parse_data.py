@@ -30,8 +30,11 @@ parser.add_argument('--tokenizer', required=False, type=str, default=None,
     metavar='<path>', help='tokenizer path for storing token lengths')
 parser.add_argument('--compress', required=False, type=str, default=None,
     choices=['zlib', 'zstd'], help='compress output with zlib or zstd')
-parser.add_argument('--canonical_only', action='store_true',
-    help='keep only canonical (longest) transcript per gene')
+# Kept as CLI flags so _databaker.py can pass them, but always-on in practice
+parser.add_argument('--canonical_only', action='store_true', default=True,
+    help=argparse.SUPPRESS)
+parser.add_argument('--fast_tokenizer', action='store_true', default=True,
+    help=argparse.SUPPRESS)
 
 args = parser.parse_args()
 
@@ -45,15 +48,20 @@ sequences  = ds.parse_fasta(args.fasta)
 features   = ds.parse_gff(args.gff)
 gene_index = ds.build_gene_index(features)
 
-if args.canonical_only:
-    from lib.dataset._parser import filter_canonical_transcripts
-    gene_index = filter_canonical_transcripts(gene_index)
+# Always filter to canonical transcripts
+from lib.dataset._parser import filter_canonical_transcripts
+gene_index = filter_canonical_transcripts(gene_index)
+
+# Save gene_index sidecar (avoids re-parsing GFF for eval)
+output_dir = pathlib.Path(args.output_dir)
+output_dir.mkdir(parents=True, exist_ok=True)
+ds.save_gene_index(gene_index, output_dir / "gene_index.json")
 
 print(f"\n  Sequences: {len(sequences)}")
 print(f"  Features:  {len(features)}")
 print(f"  Genes:     {len(gene_index)}")
-if args.canonical_only:
-    print(f"  Mode:      canonical only (one transcript per gene)")
+print(f"  Mode:      canonical only (one transcript per gene)")
+print(f"  Saved:     gene_index.json sidecar")
 
 # Sliding window chunking on ALL genes
 print(f"\n{' Sliding Window Chunking ':=^60}")
@@ -90,13 +98,17 @@ aug_count = sum(1 for c in all_chunks if c.is_augmented)
 print(f"  Raw chunks:       {raw_count}")
 print(f"  Augmented chunks: {aug_count}")
 
-# Tokenize if tokenizer provided
+# Tokenize — always use fast tokenizer (Rust backend, ~50ms load)
 tokenizer = None
 if args.tokenizer:
     print(f"\n{' Batch Tokenizing Chunks ':=^60}")
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
-    print(f"  Vocab size: {len(tokenizer)}")
+
+    from tokenizers import Tokenizer as FastTokenizer
+    tok_json = pathlib.Path(args.tokenizer) / "tokenizer.json"
+    if not tok_json.exists():
+        tok_json = pathlib.Path(args.tokenizer)
+    tokenizer = FastTokenizer.from_file(str(tok_json))
+    print(f"  Vocab size: {tokenizer.get_vocab_size()} (fast tokenizer)")
 
     batch_size   = 1000
     total_chunks = len(all_chunks)
@@ -108,12 +120,12 @@ if args.tokenizer:
         input_texts  = [c.get_input_text() for c in batch]
         target_texts = [c.get_target_text() for c in batch]
 
-        input_enc  = tokenizer(input_texts, add_special_tokens=False)
-        target_enc = tokenizer(target_texts, add_special_tokens=False)
+        input_enc  = tokenizer.encode_batch(input_texts, add_special_tokens=False)
+        target_enc = tokenizer.encode_batch(target_texts, add_special_tokens=False)
 
         for i, chunk in enumerate(batch):
-            chunk.input_ids  = input_enc['input_ids'][i]
-            chunk.target_ids = target_enc['input_ids'][i]
+            chunk.input_ids  = input_enc[i].ids
+            chunk.target_ids = target_enc[i].ids
             chunk.input_len  = len(chunk.input_ids)
             chunk.target_len = len(chunk.target_ids)
 
@@ -123,9 +135,6 @@ if args.tokenizer:
     print(f"    {total_chunks:,}/{total_chunks:,} (100.0%)")
 
 # Write output
-output_dir = pathlib.Path(args.output_dir)
-output_dir.mkdir(parents=True, exist_ok=True)
-
 print(f"\n{' Writing Output ':=^60}")
 
 train_path = output_dir / 'training.bin'

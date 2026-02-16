@@ -3,6 +3,7 @@ import pathlib
 import tempfile
 import shutil
 import os
+from dataclasses import dataclass, field
 
 import lib.dataset as ds
 
@@ -59,91 +60,79 @@ def decompress_to_temp(gz_path, temp_dir=None):
         return out_path
 
 
-####################
-#####  Config  #####
-####################
+############################
+#####  Auto-Discovery  #####
+############################
 
 
-TAXA_SPECIES = {
-    "Prokaryotes": [
-        "E.coli",
-        "B.subtilis",
-        "C.crescentus",
-        "Synechocystis.PCC6803",
-        "H.salinarum",
-        "V.fischeri",
-        "S.aureus",
-        "P.aeruginosa",
-        "M.tuberculosis",
-        "S.solfataricus",
-    ],
-    "Unicellular": [
-        "S.cerevisiae",
-        "S.pombe",
-        "C.reinhardtii",
-        "N.crassa",
-        "D.discoideum",
-        "T.thermophila",
-        "T.gondii",
-    ],
-    "Fungi": [
-        "A.nidulans",
-        "C.neoformans",
-        "M.oryzae",
-    ],
-    "Invertebrates": [
-        "C.elegans",
-        "D.melanogaster",
-        "N.vectensis",
-        "S.purpuratus",
-        "H.vulgaris",
-        "A.mellifera",
-        "B.mori",
-        "T.castaneum",
-        "P.tepidariorum",
-        "B.terrestris",
-        "A.aegypti",
-        "S.mansoni",
-        "C.intestinalis",
-        "B.floridae",
-    ],
-    "Vertebrates": [
-        "C.jacchus",
-        "G.gallus",
-        "C.porcellus",
-        "X.tropicalis",
-        "H.sapiens",
-        "O.latipes",
-        "M.musculus",
-        "R.norvegicus",
-        "D.rerio",
-        "B.taurus",
-    ],
-    "Plants": [
-        "P.patens",
-        "Z.mays",
-        "M.truncatula",
-        "O.sativa",
-        "A.thaliana",
-        "S.lycopersicum",
-        "P.trichocarpa",
-        "V.vinifera",
-        "T.aestivum",
-    ],
-}
+def discover_species(raw_dir):
+    """
+    Scan raw_dir for valid species (dirs containing fna.gz + gff.gz).
+
+    Returns list of (species_name, raw_path) tuples sorted by name.
+    Warns about invalid dirs (missing files, common-name duplicates, etc.).
+    """
+
+    raw_dir = pathlib.Path(raw_dir)
+    valid   = []
+    skipped = []
+
+    for entry in sorted(raw_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+
+        name = entry.name
+
+        # Skip hidden dirs
+        if name.startswith('.'):
+            continue
+
+        # Check for genome files
+        has_fna = False
+        has_gff = False
+
+        for f in entry.iterdir():
+            fn = f.name.lower()
+            if fn.endswith(('.fna.gz', '.fasta.gz', '.fa.gz')) or fn == 'fna.gz':
+                has_fna = True
+            elif fn.endswith(('.gff.gz', '.gff3.gz')) or fn == 'gff.gz':
+                has_gff = True
+
+        if has_fna and has_gff:
+            valid.append((name, entry))
+        else:
+            missing = []
+            if not has_fna:
+                missing.append("fna.gz")
+            if not has_gff:
+                missing.append("gff.gz")
+            skipped.append((name, missing))
+
+    if skipped:
+        print(f"  Skipped {len(skipped)} invalid dirs:")
+        for name, missing in skipped:
+            print(f"    {name}: missing {', '.join(missing)}")
+
+    return valid
 
 
-def build_species_lookup():
-    """Build species -> taxa lookup"""
-
-    lookup = {}
-    for taxa, species_list in TAXA_SPECIES.items():
-        for species in species_list:
-            lookup[species] = taxa
-    return lookup
+##############################
+#####  BakeJob Dataclass #####
+##############################
 
 
-SPECIES_LOOKUP = build_species_lookup()
+@dataclass
+class BakeJob:
+    """Work item for species processing — replaces fragile tuples."""
+
+    species:     str = ""
+    raw_dir:     str = ""
+    output_dir:  str = ""
+    log_dir:     str = ""
+    window_size: int = 20000
+    tokenizer:   str = None
+    n_workers:   int = 1
+    compress:    str = None
 
 
 ######################
@@ -192,7 +181,7 @@ def find_genome_files(species_dir):
 #################################
 
 
-def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_dir, token_file=None, tokenizer_path=None, n_workers=1, compress=None, canonical_only=False):
+def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_dir, token_file=None, tokenizer_path=None, n_workers=1, compress=None):
     """Run parse_data.py for a single species"""
 
     cmd = [
@@ -202,6 +191,8 @@ def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_di
         str(output_dir),
         "--limit", str(limit),
         "--n_workers", str(n_workers),
+        "--canonical_only",
+        "--fast_tokenizer",
     ]
 
     if token_file:
@@ -212,9 +203,6 @@ def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_di
 
     if compress:
         cmd.extend(["--compress", compress])
-
-    if canonical_only:
-        cmd.append("--canonical_only")
 
     log_file = log_dir / f"{species_name}.log"
     
@@ -281,25 +269,17 @@ def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_di
         }
 
 
-def process_species(args):
-    """Worker function for parallel species processing"""
+def process_species(job):
+    """Worker function for parallel species processing.
 
-    # Handle variable-length args tuples
-    if len(args) == 10:
-        species_name, raw_dir, baked_dir, log_dir, limit, token_file, tokenizer_path, n_workers, compress, canonical_only = args
-    elif len(args) == 9:
-        species_name, raw_dir, baked_dir, log_dir, limit, token_file, tokenizer_path, n_workers, compress = args
-        canonical_only = False
-    else:
-        species_name, raw_dir, baked_dir, log_dir, limit, token_file, tokenizer_path, n_workers = args
-        compress       = None
-        canonical_only = False
+    Accepts a BakeJob dataclass instance.
+    """
 
-    species_raw_dir = pathlib.Path(raw_dir) / species_name
+    species_raw_dir = pathlib.Path(job.raw_dir) / job.species
 
     if not species_raw_dir.exists():
         return {
-            "species": species_name,
+            "species": job.species,
             "success": False,
             "error":   f"Directory not found: {species_raw_dir}",
         }
@@ -308,12 +288,12 @@ def process_species(args):
 
     if fasta_file is None or gff_file is None:
         return {
-            "species": species_name,
+            "species": job.species,
             "success": False,
             "error":   f"Missing FASTA or GFF in: {species_raw_dir}",
         }
 
-    output_dir = pathlib.Path(baked_dir) / species_name
+    output_dir = pathlib.Path(job.output_dir) / job.species
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Pre-decompress gzipped files for faster parsing
@@ -325,12 +305,13 @@ def process_species(args):
         if str(gff_file).endswith('.gz'):
             gff_file = decompress_to_temp(gff_file, output_dir)
             decompressed_files.append(gff_file)
-    except Exception as e:
-        # Fall back to original gzipped files if decompression fails
+    except Exception:
         pass
 
     result = run_parse_data(
-        species_name, fasta_file, gff_file, output_dir, limit, log_dir, token_file, tokenizer_path, n_workers, compress, canonical_only
+        job.species, fasta_file, gff_file, output_dir, job.window_size,
+        pathlib.Path(job.log_dir), None, job.tokenizer, job.n_workers,
+        job.compress,
     )
 
     # Clean up decompressed files
@@ -569,35 +550,42 @@ def write_bake_summary(log_path, run_config, species_results, species_stats, tok
     return log_path
 
 
-#######################
-#####  Bake Stats #####
-#######################
+########################################
+#####  Augmentation Status Report  #####
+########################################
 
 
-def build_species_list(species=None, taxa=None, window_size=10000):
-    """Build list of species to process"""
+def report_augmentation_status(baked_dir):
+    """Read merged bins and print nosing/augmentation ratios."""
 
-    species_to_process = []
+    baked_dir = pathlib.Path(baked_dir)
 
-    if species:
-        for sp in species:
-            if sp in SPECIES_LOOKUP:
-                taxa_name = SPECIES_LOOKUP[sp]
-                species_to_process.append((sp, window_size, taxa_name))
-            else:
-                print(f"  WARNING: Unknown species '{sp}', skipping")
+    print(f"\n{'='*50}")
+    print(f"{'Augmentation Status':^50}")
+    print(f"{'='*50}")
 
-    elif taxa:
-        for taxa_name in taxa:
-            if taxa_name in TAXA_SPECIES:
-                for sp in TAXA_SPECIES[taxa_name]:
-                    species_to_process.append((sp, window_size, taxa_name))
-            else:
-                print(f"  WARNING: Unknown taxa '{taxa_name}', skipping")
+    for label, filename in [("training", "training.bin"), ("validation", "validation.bin")]:
+        bin_path = baked_dir / filename
+        if not bin_path.exists():
+            continue
 
-    else:
-        for taxa_name, species_list in TAXA_SPECIES.items():
-            for sp in species_list:
-                species_to_process.append((sp, window_size, taxa_name))
+        chunks    = ds.read_binary(bin_path)
+        total     = len(chunks)
+        raw_count = sum(1 for c in chunks if not c.is_augmented)
+        aug_count = total - raw_count
 
-    return species_to_process
+        raw_pct = (raw_count / total * 100) if total else 0
+        aug_pct = (aug_count / total * 100) if total else 0
+
+        print(f"  {label}:")
+        print(f"    Total:      {total:,} chunks")
+        print(f"    Ab initio:  {raw_count:,} ({raw_pct:.1f}%)")
+        print(f"    With hints: {aug_count:,} ({aug_pct:.1f}%)")
+
+    eval_path = baked_dir / "eval.json"
+    if eval_path.exists():
+        import json
+        with open(eval_path, 'r') as f:
+            eval_data = json.load(f)
+        print(f"  eval:")
+        print(f"    Total: {len(eval_data)} samples (100% ab initio)")
