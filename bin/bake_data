@@ -51,11 +51,18 @@ parser.add_argument("--eval_samples", type=int, default=50,
     help="Eval samples per held-out species [%(default)s]")
 parser.add_argument("--seed", type=int, default=42,
     help="Random seed for eval sample selection [%(default)s]")
+parser.add_argument("--finalize", action="store_true",
+    help="Skip per-species baking, only merge bins + generate eval (run after distributed bake)")
 
 args = parser.parse_args()
 
-# If neither --train nor --eval specified, do both
-if not args.train and not args.eval:
+# Finalize mode: merge + eval only, force single-node view
+if args.finalize:
+    args.train     = True
+    args.eval      = True
+    args.nnodes    = 1
+    args.node_rank = 0
+elif not args.train and not args.eval:
     args.train = True
     args.eval  = True
 
@@ -122,9 +129,11 @@ log_dir.mkdir(parents=True, exist_ok=True)
 
 
 modes = []
-if args.train:
+if args.finalize:
+    modes.append("finalize")
+elif args.train:
     modes.append("train")
-if args.eval:
+if args.eval and not args.finalize:
     modes.append("eval")
 
 print(f"\n{'='*60}")
@@ -182,7 +191,7 @@ def _make_jobs(species_list):
     ]
 
 
-if args.train:
+if not args.finalize and args.train:
     work_items = _make_jobs(species_to_process)
 
     print(f"\n{' Processing Training Species ':=^60}")
@@ -223,7 +232,7 @@ if args.train:
 #####################################
 
 
-if heldout_to_process and args.train:
+if not args.finalize and heldout_to_process and args.train:
     print(f"\n{' Held-Out Validation Species ':=^60}")
 
     heldout_items = _make_jobs(heldout_to_process)
@@ -250,22 +259,22 @@ if heldout_to_process and args.train:
 ##############################
 
 
-if args.train:
+if args.train and (args.finalize or args.nnodes == 1):
     import lib.dataset as ds
 
     print(f"\n{' Merging Per-Species Bins ':=^60}")
 
-    # Training species -> training.bin, held-out species -> validation.bin
-    train_species_names   = {name for name, _ in species_to_process}
-    heldout_species_names = {name for name, _ in heldout_to_process} if heldout_to_process else set()
+    # Finalize merges ALL species; single-node merges its own
+    all_train_names   = {name for name, _ in train_species}
+    all_heldout_names = {name for name, _ in heldout_species}
 
     training_bins = sorted(
         f for f in output_dir.glob("*/training.bin")
-        if f.parent.name in train_species_names
+        if f.parent.name in all_train_names
     )
     validation_bins = sorted(
         f for f in output_dir.glob("*/training.bin")
-        if f.parent.name in heldout_species_names
+        if f.parent.name in all_heldout_names
     )
 
     print(f"  Training files:   {len(training_bins)}")
@@ -303,7 +312,7 @@ if args.train:
 
 all_eval_samples = []
 
-if heldout_to_process and args.eval:
+if heldout_to_process and args.eval and (args.finalize or args.nnodes == 1):
     import lib.dataset as ds
 
     print(f"\n{' Generating Eval Samples ':=^60}")
@@ -358,12 +367,15 @@ if heldout_to_process and args.eval:
 
 bake_config = {
     **{k: str(v) if isinstance(v, pathlib.Path) else v for k, v in vars(args).items()},
-    "train_species":   [name for name, _ in species_to_process],
-    "heldout_species": [name for name, _ in heldout_to_process],
+    "train_species":   [name for name, _ in (train_species if args.finalize else species_to_process)],
+    "heldout_species": [name for name, _ in heldout_species],
     "eval_samples_generated": len(all_eval_samples),
 }
 
-config_path = output_dir / "bake_config.json"
+if args.nnodes > 1 and not args.finalize:
+    config_path = output_dir / f"bake_config_node{args.node_rank}.json"
+else:
+    config_path = output_dir / "bake_config.json"
 with open(config_path, 'w') as f:
     json.dump(bake_config, f, indent=2)
 

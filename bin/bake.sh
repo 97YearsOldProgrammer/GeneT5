@@ -8,7 +8,8 @@
 # What it does:
 #   1. SSHes to worker, launches bake_data --node_rank 1 inside the gt5 container
 #   2. Runs bake_data --node_rank 0 locally
-#   3. Waits for both, prints combined summary
+#   3. Waits for both nodes to finish per-species baking
+#   4. Runs --finalize locally to merge all bins + generate eval
 #
 # Species are sorted by genome size and round-robin assigned so both nodes
 # get roughly equal work (largest genome -> node 0, second -> node 1, etc.)
@@ -49,7 +50,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$WORKER_IP" ]]; then
-    echo "Usage: $0 --worker <WORKER_IP> --tokenizer <path> [bake_data args...]"
+    echo "Usage: $0 --worker <WORKER_IP> --tokenizer <path> <raw_dir> [bake_data args...]"
     echo ""
     echo "Options:"
     echo "  --worker IP          Worker node IP (required)"
@@ -60,11 +61,11 @@ if [[ -z "$WORKER_IP" ]]; then
     echo ""
     echo "Example:"
     echo "  bin/bake.sh --worker 192.168.100.11 \\"
-    echo "      --tokenizer ../model/base \\"
-    echo "      --output_dir ../baked/w20k \\"
+    echo "      ../raw \\"
+    echo "      --tokenizer ../model/GeneT5/init \\"
+    echo "      --output_dir ../baked/GeneT5/w20k \\"
     echo "      --window_size 20000 \\"
-    echo "      --species_parallel 3 \\"
-    echo "      --canonical_only"
+    echo "      --val_species B.taurus,S.lycopersicum"
     exit 1
 fi
 
@@ -95,8 +96,8 @@ if [[ "$WORKER_RUNNING" != "true" ]]; then
     done
 fi
 
-# Build the bake_data command
-BAKE_CMD="cd /workspace/GeneT5 && PYTHONPATH=/workspace/GeneT5 python bin/bake_data ${BAKE_ARGS[*]}"
+# Build the bake_data command (per-species baking only, no merge/eval)
+BAKE_CMD="cd /workspace/GeneT5 && PYTHONPATH=/workspace/GeneT5 python bin/bake_data ${BAKE_ARGS[*]} --train"
 
 # ── Launch worker (node 1) via SSH ──
 echo "[node 1] Launching on ${WORKER_IP}..."
@@ -111,7 +112,7 @@ sleep 2
 
 # ── Launch host (node 0) locally ──
 echo "[node 0] Launching locally..."
-PYTHONPATH=/workspace/GeneT5 python bin/bake_data ${BAKE_ARGS[*]} \
+PYTHONPATH=/workspace/GeneT5 python bin/bake_data ${BAKE_ARGS[*]} --train \
     --nnodes 2 --node_rank 0 \
     > >(while IFS= read -r line; do echo "[node 0] $line"; done) \
     2>&1 &
@@ -130,10 +131,29 @@ wait $WORKER_PID || WORKER_EXIT=$?
 
 echo ""
 echo "============================================================"
-echo "  Distributed Bake Complete"
+echo "  Per-Species Baking Complete"
 echo "============================================================"
 echo "  Node 0 (host):   exit=${HOST_EXIT}"
 echo "  Node 1 (worker): exit=${WORKER_EXIT}"
+echo "============================================================"
+
+if [[ $HOST_EXIT -ne 0 || $WORKER_EXIT -ne 0 ]]; then
+    echo "ERROR: One or more nodes failed. Skipping finalize."
+    exit 1
+fi
+
+# ── Finalize: merge all per-species bins + generate eval ──
+echo ""
+echo "============================================================"
+echo "  Finalizing: merge + eval"
+echo "============================================================"
+
+PYTHONPATH=/workspace/GeneT5 python bin/bake_data ${BAKE_ARGS[*]} --finalize
+
+echo ""
+echo "============================================================"
+echo "  Distributed Bake Complete"
+echo "============================================================"
 
 # ── Combined summary ──
 OUTPUT_DIR=""
@@ -146,17 +166,8 @@ done
 
 if [[ -n "$OUTPUT_DIR" && -d "$OUTPUT_DIR" ]]; then
     echo ""
-    echo "  Combined output:"
-    TRAIN_COUNT=$(find "$OUTPUT_DIR" -name "training.bin" | wc -l)
-    VAL_COUNT=$(find "$OUTPUT_DIR" -name "validation.bin" | wc -l)
     TOTAL_SIZE=$(du -sh "$OUTPUT_DIR" 2>/dev/null | cut -f1)
-    echo "    Training files:   ${TRAIN_COUNT}"
-    echo "    Validation files: ${VAL_COUNT}"
-    echo "    Total size:       ${TOTAL_SIZE}"
+    echo "  Total size: ${TOTAL_SIZE}"
 fi
 
 echo "============================================================"
-
-if [[ $HOST_EXIT -ne 0 || $WORKER_EXIT -ne 0 ]]; then
-    exit 1
-fi

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from flash_attn import flash_attn_func
+from flash_attn import flash_attn_func, flash_attn_with_kvcache
 
 
 #####################
