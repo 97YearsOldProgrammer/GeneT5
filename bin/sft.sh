@@ -291,55 +291,78 @@ if [[ -n "$WORKER_IP" ]]; then
 
     MASTER_PID=""
     WORKER_PID=""
+    CLEANED_UP=0
 
-    # Kill both sides on exit, Ctrl+C, or if either side dies
-    kill_local_tree() {
-        # Kill the entire process group: torchrun + all child python workers
-        [ -n "$MASTER_PID" ] && kill -- -$MASTER_PID 2>/dev/null || true
-        # Also pkill by pattern in case process group kill missed anything
-        pkill -f 'torchrun.*finet' 2>/dev/null || true
-        pkill -f 'python.*bin/finet' 2>/dev/null || true
+    SSH_BASE="ssh -F /dev/null -o StrictHostKeyChecking=no -o IdentityFile=~/.ssh/id_ed25519_spark -o IdentitiesOnly=yes"
+
+    # Kill a process and all its descendants with SIGKILL
+    kill_tree() {
+        local pid=$1
+        local children
+        children=$(pgrep -P "$pid" 2>/dev/null) || true
+        for child in $children; do
+            kill_tree "$child"
+        done
+        kill -9 "$pid" 2>/dev/null || true
     }
 
-    kill_remote_tree() {
-        ssh -F /dev/null -o StrictHostKeyChecking=no \
-            -o IdentityFile=~/.ssh/id_ed25519_spark -o IdentitiesOnly=yes \
-            "${WORKER_USER}@${WORKER_IP}" \
-            "docker exec ${CONTAINER} bash -c 'pkill -f torchrun.*finet; pkill -f python.*bin/finet'" 2>/dev/null || true
-    }
-
-    force_kill() {
-        # Escalate to SIGKILL if anything survived
-        sleep 2
+    kill_local() {
+        # Kill master process tree
+        if [ -n "$MASTER_PID" ] && kill -0 "$MASTER_PID" 2>/dev/null; then
+            kill_tree "$MASTER_PID"
+        fi
+        # Kill SSH tunnel to worker
+        if [ -n "$WORKER_PID" ] && kill -0 "$WORKER_PID" 2>/dev/null; then
+            kill_tree "$WORKER_PID"
+        fi
+        # Belt-and-suspenders: pattern kill (catches orphans + data loader workers)
         pkill -9 -f 'torchrun.*finet' 2>/dev/null || true
         pkill -9 -f 'python.*bin/finet' 2>/dev/null || true
-        ssh -F /dev/null -o StrictHostKeyChecking=no \
-            -o IdentityFile=~/.ssh/id_ed25519_spark -o IdentitiesOnly=yes \
-            "${WORKER_USER}@${WORKER_IP}" \
-            "docker exec ${CONTAINER} bash -c 'pkill -9 -f torchrun.*finet; pkill -9 -f python.*bin/finet'" 2>/dev/null || true
+    }
+
+    kill_remote() {
+        # 5s timeout so cleanup never hangs on unreachable worker
+        timeout 5 ${SSH_BASE} "${WORKER_USER}@${WORKER_IP}" \
+            "docker exec ${CONTAINER} bash -c 'pkill -9 -f torchrun; pkill -9 -f python.*finet'" \
+            2>/dev/null || echo "[cleanup] Worker unreachable, remote processes may need manual cleanup"
+    }
+
+    verify_clean() {
+        for attempt in 1 2 3; do
+            if ! pgrep -f 'python.*bin/finet' >/dev/null 2>&1 && \
+               ! pgrep -f 'torchrun.*finet' >/dev/null 2>&1; then
+                return 0
+            fi
+            echo "[cleanup] Attempt $attempt/3: killing remaining processes..."
+            pkill -9 -f 'torchrun' 2>/dev/null || true
+            pkill -9 -f 'python.*finet' 2>/dev/null || true
+            sleep 1
+        done
+        if pgrep -f 'python.*finet' >/dev/null 2>&1; then
+            echo "[cleanup] WARNING: processes survived all kill attempts:"
+            pgrep -af 'python.*finet' || true
+        fi
     }
 
     cleanup() {
-        trap - EXIT INT TERM
+        [ "$CLEANED_UP" -eq 1 ] && return
+        CLEANED_UP=1
+        trap - EXIT INT TERM HUP PIPE
         echo ""
         echo "[cleanup] Shutting down both nodes..."
-        kill_local_tree
-        kill_remote_tree
-        wait $MASTER_PID 2>/dev/null
-        wait $WORKER_PID 2>/dev/null
-        # Force kill stragglers
-        if pgrep -f 'python.*bin/finet' >/dev/null 2>&1; then
-            echo "[cleanup] Stragglers detected, sending SIGKILL..."
-            force_kill
-        fi
+        kill_local
+        kill_remote
+        wait "$MASTER_PID" 2>/dev/null || true
+        wait "$WORKER_PID" 2>/dev/null || true
+        verify_clean
         echo "[cleanup] Done"
     }
-    trap cleanup EXIT INT TERM
+    trap cleanup EXIT INT TERM HUP PIPE
 
     # Launch worker via SSH (background)
     echo ""
     echo "[worker] Launching on ${WORKER_IP}..."
-    ssh -F /dev/null -o StrictHostKeyChecking=no -o IdentityFile=~/.ssh/id_ed25519_spark -o IdentitiesOnly=yes "${WORKER_USER}@${WORKER_IP}" \
+    ${SSH_BASE} "${WORKER_USER}@${WORKER_IP}" \
         "docker exec ${CONTAINER} bash -c '${WORKER_CMD}'" \
         > >(while IFS= read -r line; do echo "[worker] $line"; done) \
         2>&1 &
@@ -356,34 +379,42 @@ if [[ -n "$WORKER_IP" ]]; then
     MASTER_PID=$!
     set +m
 
-    # Wait for first process to finish
+    # Monitor loop: check both processes every 2s, exit as soon as either dies
     MASTER_EXIT=0
     WORKER_EXIT=0
-    wait -n $MASTER_PID $WORKER_PID 2>/dev/null || true
+    while true; do
+        MASTER_ALIVE=true
+        WORKER_ALIVE=true
+        kill -0 "$MASTER_PID" 2>/dev/null || MASTER_ALIVE=false
+        kill -0 "$WORKER_PID" 2>/dev/null || WORKER_ALIVE=false
 
-    # Determine which finished and kill the other
-    if ! kill -0 $MASTER_PID 2>/dev/null; then
-        wait $MASTER_PID 2>/dev/null; MASTER_EXIT=$?
-        echo ""
-        echo "[master] Exited (code=$MASTER_EXIT), stopping worker..."
-        kill_remote_tree
-        wait $WORKER_PID 2>/dev/null; WORKER_EXIT=$?
-    elif ! kill -0 $WORKER_PID 2>/dev/null; then
-        wait $WORKER_PID 2>/dev/null; WORKER_EXIT=$?
-        echo ""
-        echo "[worker] Exited (code=$WORKER_EXIT), stopping master..."
-        kill_local_tree
-        wait $MASTER_PID 2>/dev/null; MASTER_EXIT=$?
-    fi
+        if ! $MASTER_ALIVE; then
+            wait "$MASTER_PID" 2>/dev/null; MASTER_EXIT=$?
+            echo ""
+            echo "[master] Exited (code=$MASTER_EXIT), stopping worker..."
+            kill_remote
+            kill_tree "$WORKER_PID" 2>/dev/null || true
+            wait "$WORKER_PID" 2>/dev/null; WORKER_EXIT=$?
+            break
+        fi
 
-    # Final sweep — nuke anything still alive
-    if pgrep -f 'python.*bin/finet' >/dev/null 2>&1; then
-        echo "[cleanup] Stragglers detected, sending SIGKILL..."
-        force_kill
-    fi
+        if ! $WORKER_ALIVE; then
+            wait "$WORKER_PID" 2>/dev/null; WORKER_EXIT=$?
+            echo ""
+            echo "[worker] Exited (code=$WORKER_EXIT), stopping master..."
+            kill_tree "$MASTER_PID" 2>/dev/null || true
+            wait "$MASTER_PID" 2>/dev/null; MASTER_EXIT=$?
+            kill_remote
+            break
+        fi
 
-    # Disable trap — we already cleaned up
-    trap - EXIT INT TERM
+        sleep 2
+    done
+
+    # Final verification (cleanup trap also runs on exit, but idempotent)
+    verify_clean
+    trap - EXIT INT TERM HUP PIPE
+    CLEANED_UP=1
 
     echo ""
     echo "========================================"

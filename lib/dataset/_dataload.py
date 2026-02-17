@@ -174,30 +174,42 @@ class PrefixLMCollator:
 
     def __call__(self, batch):
 
-        max_len = max(len(b["input_ids"]) for b in batch)
+        max_prefix = max(b["prefix_len"] for b in batch)
+
+        # Align prefixes: [prefix | gap_pad | target | tail_pad]
+        aligned = []
+        for b in batch:
+            ids    = b["input_ids"]
+            p_len  = b["prefix_len"]
+            prefix = ids[:p_len]
+            target = ids[p_len:]
+            gap    = [self.pad_token_id] * (max_prefix - p_len)
+            aligned.append(prefix + gap + target)
+
+        max_len = max(len(a) for a in aligned)
 
         all_input_ids = []
         all_labels    = []
 
-        for b in batch:
-            ids        = b["input_ids"]
-            prefix_len = b["prefix_len"]
-            pad_len    = max_len - len(ids)
+        for i, seq in enumerate(aligned):
+            target_len = len(batch[i]["input_ids"]) - batch[i]["prefix_len"]
+            pad_len    = max_len - len(seq)
+            padded     = seq + [self.pad_token_id] * pad_len
 
             # Model input: all tokens except last (teacher forcing)
-            padded_ids = ids + [self.pad_token_id] * pad_len
-            all_input_ids.append(padded_ids[:-1])
+            all_input_ids.append(padded[:-1])
 
-            # Labels: shifted right, prefix masked with -100
-            shifted = ids[1:] + [self.pad_token_id]
-            labels  = [self.label_pad] * (prefix_len - 1) + shifted[prefix_len - 1:]
-            labels  = labels + [self.label_pad] * pad_len
-            labels  = labels[:max_len - 1]
+            # Labels: mask prefix, keep target, mask tail pads
+            shifted = padded[1:]
+            labels  = [self.label_pad] * (max_prefix - 1)
+            labels += shifted[max_prefix - 1 : max_prefix - 1 + target_len]
+            labels += [self.label_pad] * (max_len - 1 - len(labels))
             all_labels.append(labels)
 
         return {
-            "input_ids": torch.tensor(all_input_ids, dtype=torch.long),
-            "labels":    torch.tensor(all_labels, dtype=torch.long),
+            "input_ids":  torch.tensor(all_input_ids, dtype=torch.long),
+            "labels":     torch.tensor(all_labels, dtype=torch.long),
+            "prefix_len": max_prefix,
         }
 
 

@@ -457,8 +457,9 @@ def main():
             with sync_context:
                 with torch.amp.autocast('cuda', dtype=dtype):
                     outputs = model(
-                        input_ids = batch['input_ids'],
-                        labels    = batch['labels'] if loss_fct is None else None,
+                        input_ids  = batch['input_ids'],
+                        labels     = batch['labels'] if loss_fct is None else None,
+                        prefix_len = batch.get('prefix_len', 0),
                     )
 
                     # Use label smoothing loss if enabled
@@ -548,8 +549,9 @@ def main():
 
                     with torch.amp.autocast('cuda', dtype=dtype):
                         outputs = model(
-                            input_ids = batch['input_ids'],
-                            labels    = batch['labels'],
+                            input_ids  = batch['input_ids'],
+                            labels     = batch['labels'],
+                            prefix_len = batch.get('prefix_len', 0),
                         )
 
                     total_val_loss += outputs['loss'].item()
