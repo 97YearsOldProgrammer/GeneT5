@@ -154,13 +154,15 @@ fi
 NCCL_ENVS=(
     "NCCL_DEBUG=INFO"
     "NCCL_IB_HCA=${CX7_HCA:-roceP2p1s0f1}"
-    "NCCL_IB_TIMEOUT=22"
-    "NCCL_IB_RETRY_CNT=7"
+    "NCCL_IB_TIMEOUT=23"
+    "NCCL_IB_RETRY_CNT=13"
     "NCCL_IB_MERGE_NICS=0"
     "NCCL_CROSS_NIC=0"
     "NCCL_MAX_NCHANNELS=2"
     "NCCL_NET_GDR_LEVEL=0"
     "NCCL_NET_GDR_READ=0"
+    "NCCL_TIMEOUT=1800"
+    "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=1800"
 )
 
 if [ -n "$CX7_IF" ]; then
@@ -357,7 +359,9 @@ if [[ -n "$WORKER_IP" ]]; then
         verify_clean
         echo "[cleanup] Done"
     }
-    trap cleanup EXIT INT TERM HUP PIPE
+    trap cleanup EXIT
+    trap 'cleanup; exit 130' INT
+    trap 'cleanup; exit 143' TERM HUP PIPE
 
     # Launch worker via SSH (background)
     echo ""

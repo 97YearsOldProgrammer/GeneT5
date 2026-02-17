@@ -1,3 +1,4 @@
+import os
 import struct
 import json
 import pathlib
@@ -405,6 +406,9 @@ def read_chunk_at_index(input_path, index):
 
         f.seek(offset)
         data = f.read(length)
+
+        # Drop pages from kernel cache to prevent 112GB file from filling RAM
+        os.posix_fadvise(f.fileno(), offset, length, os.POSIX_FADV_DONTNEED)
 
         if decompressor:
             data = decompressor(data)
