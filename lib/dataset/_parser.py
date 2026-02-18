@@ -1,10 +1,9 @@
 import gzip
-import re
-import os
 import json
 import random
 import pathlib
-from collections import defaultdict
+
+import pyfaidx
 
 
 ###################
@@ -12,38 +11,10 @@ from collections import defaultdict
 ###################
 
 
-def parse_fasta(fasta_path):
-    """Parse FASTA file (handles gzipped files)"""
+def lazy_fasta_open(fasta_path):
+    """Open FASTA with pyfaidx for lazy indexed access"""
 
-    sequences  = {}
-    current_id = None
-    current_seq = []
-
-    open_func = gzip.open if str(fasta_path).endswith('.gz') else open
-    mode = 'rt' if str(fasta_path).endswith('.gz') else 'r'
-
-    with open_func(fasta_path, mode) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-
-            if line.startswith('>'):
-                if current_id is not None:
-                    sequences[current_id] = ''.join(current_seq)
-
-                # Parse header: >seqid description
-                header     = line[1:].split()[0]
-                current_id = header
-                current_seq = []
-            else:
-                current_seq.append(line.upper())
-
-    # Add last sequence
-    if current_id is not None:
-        sequences[current_id] = ''.join(current_seq)
-
-    return sequences
+    return pyfaidx.Fasta(str(fasta_path), as_raw=True, sequence_always_upper=True)
 
 
 #################
@@ -70,79 +41,33 @@ def parse_gff_attributes(attr_string):
     return attrs
 
 
-def parse_gff(gff_path, buffer_size=1024*1024):
-    """Parse GFF3 file with buffered reading (handles gzipped files)"""
-
-    features = []
+def _iter_gff_features(gff_path):
+    """Yield parsed feature dicts from a GFF file (handles gzipped)"""
 
     open_func = gzip.open if str(gff_path).endswith('.gz') else open
-    mode = 'rt' if str(gff_path).endswith('.gz') else 'r'
+    mode      = 'rt' if str(gff_path).endswith('.gz') else 'r'
 
     with open_func(gff_path, mode) as f:
-        remainder = ""
-
-        while True:
-            chunk = f.read(buffer_size)
-            if not chunk:
-                # Process any remaining data
-                if remainder.strip():
-                    _parse_gff_lines(remainder, features)
-                break
-
-            # Combine with remainder from previous chunk
-            data = remainder + chunk
-
-            # Find last newline to avoid splitting mid-line
-            last_nl = data.rfind('\n')
-            if last_nl == -1:
-                remainder = data
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
                 continue
 
-            # Process complete lines
-            lines_data = data[:last_nl]
-            remainder  = data[last_nl + 1:]
+            parts = line.split('\t')
+            if len(parts) < 9:
+                continue
 
-            _parse_gff_lines(lines_data, features)
-
-    return features
-
-
-def _parse_gff_lines(data, features):
-    """Parse multiple GFF lines from a string buffer"""
-
-    for line in data.split('\n'):
-        line = line.strip()
-
-        if not line or line.startswith('#'):
-            continue
-
-        parts = line.split('\t')
-        if len(parts) < 9:
-            continue
-
-        seqid  = parts[0]
-        source = parts[1]
-        ftype  = parts[2]
-        start  = int(parts[3])
-        end    = int(parts[4])
-        score  = parts[5]
-        strand = parts[6]
-        phase  = parts[7]
-        attrs  = parse_gff_attributes(parts[8])
-
-        feature = {
-            "seqid":      seqid,
-            "source":     source,
-            "type":       ftype,
-            "start":      start,
-            "end":        end,
-            "score":      score,
-            "strand":     strand,
-            "phase":      phase,
-            "attributes": attrs,
-        }
-
-        features.append(feature)
+            yield {
+                "seqid":      parts[0],
+                "source":     parts[1],
+                "type":       parts[2],
+                "start":      int(parts[3]),
+                "end":        int(parts[4]),
+                "score":      parts[5],
+                "strand":     parts[6],
+                "phase":      parts[7],
+                "attributes": parse_gff_attributes(parts[8]),
+            }
 
 
 ########################
@@ -150,16 +75,27 @@ def _parse_gff_lines(data, features):
 ########################
 
 
-def build_gene_index(features):
-    """Build hierarchical gene index from GFF features"""
+TRANSCRIPT_TYPES = frozenset({
+    "mrna", "transcript", "ncrna", "lncrna",
+    "rrna", "trna", "snorna", "mirna", "pseudogenic_transcript",
+})
+
+CHILD_TYPES = frozenset({
+    "exon", "cds", "five_prime_utr", "three_prime_utr",
+    "start_codon", "stop_codon", "intron",
+})
+
+
+def parse_gff_to_gene_index(gff_path):
+    """Stream GFF directly into gene_index — no intermediate features list"""
 
     gene_index     = {}
     transcript_map = {}
 
-    # First pass: collect genes and transcripts
-    for feat in features:
+    # Pass 1: collect genes and transcripts
+    for feat in _iter_gff_features(gff_path):
         ftype = feat["type"].lower()
-        attrs = feat.get("attributes", {})
+        attrs = feat["attributes"]
 
         if ftype == "gene":
             gene_id = attrs.get("ID", "")
@@ -174,7 +110,7 @@ def build_gene_index(features):
                     "attributes":  attrs,
                 }
 
-        elif ftype in ("mrna", "transcript", "ncrna", "lncrna", "rrna", "trna", "snorna", "mirna", "pseudogenic_transcript"):
+        elif ftype in TRANSCRIPT_TYPES:
             transcript_id = attrs.get("ID", "")
             parent_gene   = attrs.get("Parent", "")
 
@@ -187,10 +123,9 @@ def build_gene_index(features):
                     "start":    feat["start"],
                     "end":      feat["end"],
                     "strand":   feat["strand"],
-                    "features": [],
                 }
 
-    # Second pass: assign transcripts to genes
+    # Assign transcripts to genes (iterates transcript_map, not file)
     for t_id, t_data in transcript_map.items():
         gene_id = t_data["gene_id"]
         if gene_id in gene_index:
@@ -202,16 +137,14 @@ def build_gene_index(features):
                 "features": [],
             }
 
-    # Third pass: assign child features (exons, CDS, etc.) to transcripts and genes
-    child_types = {"exon", "cds", "five_prime_utr", "three_prime_utr", "start_codon", "stop_codon", "intron"}
-
-    for feat in features:
+    # Pass 2: assign child features to transcripts and genes
+    for feat in _iter_gff_features(gff_path):
         ftype = feat["type"].lower()
 
-        if ftype not in child_types:
+        if ftype not in CHILD_TYPES:
             continue
 
-        attrs  = feat.get("attributes", {})
+        attrs  = feat["attributes"]
         parent = attrs.get("Parent", "")
 
         if not parent:
@@ -223,10 +156,8 @@ def build_gene_index(features):
             gene_id = t_data["gene_id"]
 
             if gene_id in gene_index:
-                # Add to gene's features
                 gene_index[gene_id]["features"].append(feat)
 
-                # Add to transcript's features
                 if parent in gene_index[gene_id]["transcripts"]:
                     gene_index[gene_id]["transcripts"][parent]["features"].append(feat)
 
@@ -234,7 +165,7 @@ def build_gene_index(features):
         elif parent in gene_index:
             gene_index[parent]["features"].append(feat)
 
-    # Fourth pass: merge CDS info into exons
+    # Merge CDS info into exons
     _merge_cds_into_exons(gene_index)
 
     return gene_index
@@ -405,7 +336,7 @@ def find_genome_files(species_dir):
 
 
 def save_gene_index(gene_index, path):
-    """Save gene_index to JSON sidecar for later reuse (avoids re-parsing GFF)."""
+    """Save gene_index to JSON sidecar for later reuse (avoids re-parsing GFF)"""
 
     path = pathlib.Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -415,7 +346,7 @@ def save_gene_index(gene_index, path):
 
 
 def load_gene_index(path):
-    """Load gene_index from JSON sidecar. Returns None if file doesn't exist."""
+    """Load gene_index from JSON sidecar"""
 
     path = pathlib.Path(path)
     if not path.exists():

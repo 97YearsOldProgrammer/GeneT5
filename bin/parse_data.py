@@ -3,6 +3,8 @@ import pathlib
 import multiprocessing
 import json
 
+import pyfaidx
+
 import lib.dataset as ds
 
 
@@ -44,21 +46,20 @@ n_workers = args.n_workers or max(1, multiprocessing.cpu_count() - 1)
 print(f"\n{' GFF3/FASTA Processing ':=^60}")
 print(f"  Workers: {n_workers}")
 
-sequences  = ds.parse_fasta(args.fasta)
-features   = ds.parse_gff(args.gff)
-gene_index = ds.build_gene_index(features)
-
-# Always filter to canonical transcripts
-from lib.dataset._parser import filter_canonical_transcripts
-gene_index = filter_canonical_transcripts(gene_index)
+gene_index = ds.parse_gff_to_gene_index(args.gff)
+ds.filter_canonical_transcripts(gene_index)
 
 # Save gene_index sidecar (avoids re-parsing GFF for eval)
 output_dir = pathlib.Path(args.output_dir)
 output_dir.mkdir(parents=True, exist_ok=True)
 ds.save_gene_index(gene_index, output_dir / "gene_index.json")
 
-print(f"\n  Sequences: {len(sequences)}")
-print(f"  Features:  {len(features)}")
+# Brief open to count sequences
+fasta     = pyfaidx.Fasta(args.fasta, as_raw=True, sequence_always_upper=True)
+n_seqids  = len(fasta.keys())
+fasta.close()
+
+print(f"\n  Sequences: {n_seqids}")
 print(f"  Genes:     {len(gene_index)}")
 print(f"  Mode:      canonical only (one transcript per gene)")
 print(f"  Saved:     gene_index.json sidecar")
@@ -71,7 +72,7 @@ print(f"  Overlap ratio: {args.overlap_ratio:.4f} (1/e)")
 print(f"  Max N ratio:   {args.max_n_ratio*100:.0f}%")
 
 all_raw_chunks, chunk_stats = ds.sliding_window_chunking(
-    sequences,
+    args.fasta,
     gene_index,
     window_size   = args.limit,
     overlap_ratio = args.overlap_ratio,

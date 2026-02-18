@@ -2,8 +2,9 @@ import random
 import math
 import bisect
 import multiprocessing
-from multiprocessing import shared_memory
 from concurrent.futures import ProcessPoolExecutor, as_completed
+
+import pyfaidx
 
 import lib.dataset._binary as binary
 import lib.nosing.nosing   as nosing
@@ -178,11 +179,13 @@ def _chunk_chromosome_genecentric(args):
     Gene-centric chunking with O(log G) operations
 
     Slides window across gene regions only, uses binary search for lookups
+    Each worker opens its own pyfaidx handle — no large data transfer
     """
 
-    seqid, sequence, chr_gene_index, window_size, step_bp, anchor_pad = args
+    seqid, fasta_path, chr_gene_index, window_size, step_bp, anchor_pad = args
 
-    seq_len = len(sequence)
+    fasta   = pyfaidx.Fasta(str(fasta_path), as_raw=True, sequence_always_upper=True)
+    seq_len = len(fasta[seqid])
     chunks  = []
 
     stats = {
@@ -194,6 +197,7 @@ def _chunk_chromosome_genecentric(args):
     }
 
     if not chr_gene_index:
+        fasta.close()
         return chunks, stats
 
     # Build interval index - O(G log G) once
@@ -201,6 +205,7 @@ def _chunk_chromosome_genecentric(args):
     all_features = build_feature_list(chr_gene_index)
 
     if not all_features:
+        fasta.close()
         return chunks, stats
 
     # Build feature starts array for binary search
@@ -276,7 +281,7 @@ def _chunk_chromosome_genecentric(args):
             window_start += step_size
             continue
 
-        chunk_seq       = sequence[window_start:window_end]
+        chunk_seq       = fasta[seqid][window_start:window_end]
         primary_biotype = biotypes[0] if biotypes else "."
 
         chunk = binary.BinaryChunk(
@@ -301,6 +306,7 @@ def _chunk_chromosome_genecentric(args):
 
         window_start += step_size
 
+    fasta.close()
     return chunks, stats
 
 
@@ -309,12 +315,12 @@ def _chunk_chromosome_genecentric(args):
 ########################################
 
 
-def sliding_window_chunking(sequences, gene_index, window_size=20000, overlap_ratio=None, max_n_ratio=0.1, n_workers=None):
+def sliding_window_chunking(fasta_path, gene_index, window_size=20000, overlap_ratio=None, max_n_ratio=0.1, n_workers=None):
     """
     Gene-centric sliding window chunking
 
     Pre-partitions genes by chromosome, uses O(log G) binary search for lookups.
-    Only processes regions around genes, not the entire genome.
+    Workers open their own pyfaidx handles — no genome data crosses process boundary.
     """
 
     if overlap_ratio is None:
@@ -341,15 +347,16 @@ def sliding_window_chunking(sequences, gene_index, window_size=20000, overlap_ra
         "features_per_chunk": [],
     }
 
-    # Only process chromosomes with genes
-    work_seqids = [seqid for seqid in sequences.keys() if seqid in genes_by_seqid]
+    # Open briefly to get chromosome names, then close
+    fasta       = pyfaidx.Fasta(str(fasta_path), as_raw=True, sequence_always_upper=True)
+    work_seqids = [seqid for seqid in fasta.keys() if seqid in genes_by_seqid]
+    fasta.close()
 
-    # Build work items with pre-partitioned gene indices
+    # Build work items — pass path, not sequence data
     work_items = []
     for seqid in work_seqids:
-        sequence       = sequences[seqid]
         chr_gene_index = genes_by_seqid[seqid]
-        work_items.append((seqid, sequence, chr_gene_index, window_size, step_bp, anchor_pad))
+        work_items.append((seqid, str(fasta_path), chr_gene_index, window_size, step_bp, anchor_pad))
 
     if len(work_items) <= 2 or n_workers == 1:
         for args in work_items:
@@ -392,13 +399,13 @@ def _merge_stats(combined, new):
 ########################################
 
 
-def dynamic_chunking(sequences, gene_index, limit_bp=25000, overlap_bp=5000, anchor_pad=5000, n_workers=None):
+def dynamic_chunking(fasta_path, gene_index, limit_bp=25000, overlap_bp=5000, anchor_pad=5000, n_workers=None):
     """Legacy wrapper - redirects to sliding_window_chunking"""
 
     overlap_ratio = overlap_bp / limit_bp if limit_bp > 0 else 1 / math.e
 
     return sliding_window_chunking(
-        sequences,
+        fasta_path,
         gene_index,
         window_size   = limit_bp,
         overlap_ratio = overlap_ratio,

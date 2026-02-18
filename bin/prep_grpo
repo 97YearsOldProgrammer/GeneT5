@@ -34,9 +34,8 @@ for species_path in args.species_dirs:
     print(f"\nProcessing {species_dir.name}...")
 
     fna_path, gff_path = ds.find_genome_files(species_dir)
-    sequences          = ds.parse_fasta(fna_path)
-    features           = ds.parse_gff(gff_path)
-    gene_index         = ds.build_gene_index(features)
+    sequences          = ds.lazy_fasta_open(fna_path)
+    gene_index         = ds.parse_gff_to_gene_index(gff_path)
     gene_index         = ds.filter_canonical_transcripts(gene_index)
     coding_genes       = ds.extract_coding_genes(gene_index)
 

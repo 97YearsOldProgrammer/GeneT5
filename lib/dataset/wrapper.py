@@ -10,9 +10,8 @@ import lib.dataset._util       as util
 #####################
 
 
-parse_fasta                    = parser.parse_fasta
-parse_gff                      = parser.parse_gff
-build_gene_index               = parser.build_gene_index
+lazy_fasta_open                = parser.lazy_fasta_open
+parse_gff_to_gene_index        = parser.parse_gff_to_gene_index
 filter_canonical_transcripts   = parser.filter_canonical_transcripts
 extract_feature_types          = parser.extract_feature_types
 extract_biotypes               = parser.extract_biotypes

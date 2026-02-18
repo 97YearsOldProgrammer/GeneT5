@@ -376,13 +376,12 @@ if heldout_species and args.eval and (args.finalize or args.nnodes == 1):
         else:
             print(f"  {sp}: WARNING - no sidecar, re-parsing GFF")
             fna_path, gff_path = ds.find_genome_files(species_dir)
-            features   = ds.parse_gff(gff_path)
-            gene_index = ds.build_gene_index(features)
+            gene_index = ds.parse_gff_to_gene_index(gff_path)
             gene_index = ds.filter_canonical_transcripts(gene_index)
 
-        # FASTA still needs to be read for eval (need actual sequences)
+        # pyfaidx handle — duck-type compatible with old dict (fasta[seqid][start:end])
         fna_path, _ = ds.find_genome_files(species_dir)
-        sequences   = ds.parse_fasta(fna_path)
+        sequences   = ds.lazy_fasta_open(fna_path)
         coding      = ds.extract_coding_genes(gene_index)
 
         species_samples = []

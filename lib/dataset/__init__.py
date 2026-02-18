@@ -1,9 +1,8 @@
 from lib.dataset.wrapper import (
 
     # Parser
-    parse_fasta,
-    parse_gff,
-    build_gene_index,
+    lazy_fasta_open,
+    parse_gff_to_gene_index,
     filter_canonical_transcripts,
     extract_feature_types,
     extract_biotypes,
