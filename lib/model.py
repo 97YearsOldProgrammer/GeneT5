@@ -1,4 +1,5 @@
 import torch
+import torch._dynamo
 import torch.nn             as nn
 import torch.nn.functional  as F
 import json
@@ -64,6 +65,7 @@ class GeneT5(nn.Module):
 
         x      = self.embed(input_ids)
         x      = self.embed_dropout(x)
+        torch._dynamo.mark_dynamic(x, 1)
         x, moe = self.decoder(x, prefix_len=prefix_len)
         logits = self.lm_head(x)
 

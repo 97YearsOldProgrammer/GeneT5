@@ -418,7 +418,7 @@ def main():
             print(f"  Step checkpoints: disabled (use --save_steps N to enable)")
 
     if args.compile and is_main:
-        print("  torch.compile warmup: first 3-5 batches will be 10-60x slower")
+        print("  torch.compile: first batch will be slow (one-time compilation)")
 
     patience_counter = 0
     global_step = 0
