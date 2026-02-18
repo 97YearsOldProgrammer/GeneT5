@@ -344,10 +344,26 @@ if [[ -n "$WORKER_IP" ]]; then
     }
 
     kill_remote() {
-        # 5s timeout so cleanup never hangs on unreachable worker
-        timeout 5 ${SSH_BASE} "${WORKER_USER}@${WORKER_IP}" \
-            "docker exec ${CONTAINER} bash -c 'pkill -9 -f torchrun; pkill -9 -f python.*finet'" \
-            2>/dev/null || echo "[cleanup] Worker unreachable, remote processes may need manual cleanup"
+        # Try docker exec first (fast path), then docker restart as fallback
+        # Use background + wait to avoid blocking on unresponsive worker
+        (
+            timeout 10 ${SSH_BASE} "${WORKER_USER}@${WORKER_IP}" \
+                "docker exec ${CONTAINER} bash -c 'pkill -9 -f torchrun; pkill -9 -f python.*finet'" \
+                2>/dev/null \
+            || timeout 15 ${SSH_BASE} "${WORKER_USER}@${WORKER_IP}" \
+                "docker restart ${CONTAINER}" \
+                2>/dev/null \
+            || echo "[cleanup] Worker unreachable, run on worker: docker restart ${CONTAINER}"
+        ) &
+        local kill_pid=$!
+        # Wait up to 20s total, then give up
+        local waited=0
+        while kill -0 $kill_pid 2>/dev/null && [ $waited -lt 20 ]; do
+            sleep 1
+            waited=$((waited + 1))
+        done
+        kill -9 $kill_pid 2>/dev/null || true
+        wait $kill_pid 2>/dev/null || true
     }
 
     verify_clean() {

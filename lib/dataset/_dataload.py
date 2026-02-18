@@ -187,7 +187,8 @@ class BinaryTrainDataset:
 #####################
 
 
-PAD_BUCKETS = [2048, 4096, 6144, 8192, 16384]
+PAD_BUCKETS = [2048, 4096, 6144, 8192]
+DEFAULT_MAX_SEQ = PAD_BUCKETS[-1]
 
 
 def _bucket_pad(length):
@@ -196,24 +197,33 @@ def _bucket_pad(length):
     for b in PAD_BUCKETS:
         if length <= b:
             return b
-    return length
+    return PAD_BUCKETS[-1]
 
 
 class PrefixLMCollator:
     """Collator for prefix-LM training: mask loss on input prefix, compute on output only"""
 
-    def __init__(self, pad_token_id, label_pad=-100):
+    def __init__(self, pad_token_id, label_pad=-100, max_seq_len=DEFAULT_MAX_SEQ):
 
         self.pad_token_id = pad_token_id
         self.label_pad    = label_pad
+        self.max_seq_len  = max_seq_len
+        self._dropped     = 0
 
     def __call__(self, batch):
 
-        max_prefix = max(b["prefix_len"] for b in batch)
+        # Drop oversized samples — gene boundaries can't be split
+        kept = [b for b in batch if len(b["input_ids"]) <= self.max_seq_len]
+        if len(kept) < len(batch):
+            self._dropped += len(batch) - len(kept)
+        if not kept:
+            return None
+
+        max_prefix = max(b["prefix_len"] for b in kept)
 
         # Align prefixes: [prefix | gap_pad | target | tail_pad]
         aligned = []
-        for b in batch:
+        for b in kept:
             ids    = b["input_ids"]
             p_len  = b["prefix_len"]
             prefix = ids[:p_len]
@@ -221,13 +231,22 @@ class PrefixLMCollator:
             gap    = [self.pad_token_id] * (max_prefix - p_len)
             aligned.append(prefix + gap + target)
 
+        # Drop sequences that grew past max_seq_len after prefix alignment
+        pairs = [(a, k) for a, k in zip(aligned, kept) if len(a) <= self.max_seq_len]
+        if not pairs:
+            return None
+        if len(pairs) < len(aligned):
+            self._dropped += len(aligned) - len(pairs)
+        aligned = [p[0] for p in pairs]
+        kept    = [p[1] for p in pairs]
+
         max_len = _bucket_pad(max(len(a) for a in aligned))
 
         all_input_ids = []
         all_labels    = []
 
         for i, seq in enumerate(aligned):
-            target_len = len(batch[i]["input_ids"]) - batch[i]["prefix_len"]
+            target_len = len(kept[i]["input_ids"]) - kept[i]["prefix_len"]
             pad_len    = max_len - len(seq)
             padded     = seq + [self.pad_token_id] * pad_len
 
