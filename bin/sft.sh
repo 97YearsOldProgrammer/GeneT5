@@ -200,6 +200,21 @@ echo "Extra args:      ${EXTRA_ARGS[*]}"
 echo "========================================"
 
 
+##################################
+#####  Pre-flight Cleanup   #####
+##################################
+
+
+echo "[preflight] Dropping stale page cache..."
+sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || echo "[preflight] WARNING: drop_caches failed (need root)"
+
+# Warn if swap is active (should be disabled on host: sudo swapoff -a && sudo sed -i '/swap/s/^/#/' /etc/fstab)
+if grep -q 'swap' /proc/swaps 2>/dev/null; then
+    SWAP_USED=$(awk 'NR>1{s+=$4} END{printf "%.0f", s/1024}' /proc/swaps 2>/dev/null)
+    echo "[preflight] WARNING: swap active (${SWAP_USED}MB used) — disable on host: sudo swapoff -a"
+fi
+
+
 #############################
 #####  Torchrun Command #####
 #############################
@@ -288,6 +303,8 @@ if [[ -n "$WORKER_IP" ]]; then
     ENV_STR+="  fi; "
     ENV_STR+="done; "
     ENV_STR+="cd /workspace/GeneT5; "
+    # Pre-flight cleanup on worker (page cache)
+    ENV_STR+="sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true; "
 
     WORKER_CMD="${ENV_STR}$(build_torchrun_cmd 1)"
 

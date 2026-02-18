@@ -2,6 +2,7 @@ import os
 import struct
 import json
 import pathlib
+import atexit
 
 
 #######################
@@ -250,6 +251,72 @@ class BinaryChunk:
         return int(seq_tokens + hint_tokens + overhead)
 
 
+################################
+#####  File Handle Cache   #####
+################################
+
+
+_FILE_CACHE = {}
+
+
+def _get_cached_handle(path):
+    """Get or create persistent file handle with pre-loaded offset table"""
+
+    path = str(path)
+    if path in _FILE_CACHE:
+        return _FILE_CACHE[path]
+
+    f = open(path, 'rb')
+
+    magic = f.read(4)
+    if magic != MAGIC_HEADER:
+        f.close()
+        raise ValueError(f"Invalid magic header: {magic}")
+
+    version       = struct.unpack('<B', f.read(1))[0]
+    compress_type = struct.unpack('<B', f.read(1))[0]
+    num_chunks    = struct.unpack('<I', f.read(4))[0]
+
+    decompressor = _get_decompressor(compress_type)
+
+    offsets = []
+    if version >= 2:
+        raw = f.read(num_chunks * OFFSET_ENTRY_SIZE_V2)
+        for i in range(num_chunks):
+            off = i * OFFSET_ENTRY_SIZE_V2
+            offset, length = struct.unpack('<QI', raw[off:off + OFFSET_ENTRY_SIZE_V2])
+            offsets.append((offset, length))
+    else:
+        raw = f.read(num_chunks * OFFSET_ENTRY_SIZE_V1)
+        for i in range(num_chunks):
+            off = i * OFFSET_ENTRY_SIZE_V1
+            offset, length = struct.unpack('<II', raw[off:off + OFFSET_ENTRY_SIZE_V1])
+            offsets.append((offset, length))
+
+    # Advise kernel: deprioritize pages from this file for eviction
+    try:
+        os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_NOREUSE)
+    except (AttributeError, OSError):
+        pass
+
+    _FILE_CACHE[path] = (f, offsets, decompressor)
+    return _FILE_CACHE[path]
+
+
+def _close_all_handles():
+    """Close all cached file handles on interpreter exit"""
+
+    for _, (f, _, _) in _FILE_CACHE.items():
+        try:
+            f.close()
+        except Exception:
+            pass
+    _FILE_CACHE.clear()
+
+
+atexit.register(_close_all_handles)
+
+
 #################
 #####  I/O  #####
 #################
@@ -381,39 +448,27 @@ def read_binary(input_path):
 
 
 def read_chunk_at_index(input_path, index):
-    """Read single chunk by index without loading entire file"""
+    """Read single chunk by index using persistent file handle"""
 
-    with open(input_path, 'rb') as f:
-        magic = f.read(4)
-        if magic != MAGIC_HEADER:
-            raise ValueError(f"Invalid magic header: {magic}")
+    f, offsets, decompressor = _get_cached_handle(input_path)
 
-        version       = struct.unpack('<B', f.read(1))[0]
-        compress_type = struct.unpack('<B', f.read(1))[0]
-        num_chunks    = struct.unpack('<I', f.read(4))[0]
+    if index >= len(offsets):
+        raise IndexError(f"Index {index} out of range (total: {len(offsets)})")
 
-        if index >= num_chunks:
-            raise IndexError(f"Index {index} out of range (total: {num_chunks})")
+    offset, length = offsets[index]
+    f.seek(offset)
+    data = f.read(length)
 
-        decompressor = _get_decompressor(compress_type)
-
-        if version >= 2:
-            f.seek(10 + index * 12)
-            offset, length = struct.unpack('<QI', f.read(12))
-        else:
-            f.seek(10 + index * 8)
-            offset, length = struct.unpack('<II', f.read(8))
-
-        f.seek(offset)
-        data = f.read(length)
-
-        # Drop pages from kernel cache to prevent 112GB file from filling RAM
+    # Drop just-read pages from kernel cache
+    try:
         os.posix_fadvise(f.fileno(), offset, length, os.POSIX_FADV_DONTNEED)
+    except (AttributeError, OSError):
+        pass
 
-        if decompressor:
-            data = decompressor(data)
+    if decompressor:
+        data = decompressor(data)
 
-        return BinaryChunk.from_bytes(data)
+    return BinaryChunk.from_bytes(data)
 
 
 def iter_binary(input_path):

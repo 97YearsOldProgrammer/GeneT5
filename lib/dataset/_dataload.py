@@ -164,6 +164,18 @@ class BinaryTrainDataset:
 #####################
 
 
+PAD_BUCKETS = [2048, 4096, 6144, 8192, 16384]
+
+
+def _bucket_pad(length):
+    """Round length up to nearest bucket boundary for compile shape stability"""
+
+    for b in PAD_BUCKETS:
+        if length <= b:
+            return b
+    return length
+
+
 class PrefixLMCollator:
     """Collator for prefix-LM training: mask loss on input prefix, compute on output only"""
 
@@ -186,7 +198,7 @@ class PrefixLMCollator:
             gap    = [self.pad_token_id] * (max_prefix - p_len)
             aligned.append(prefix + gap + target)
 
-        max_len = max(len(a) for a in aligned)
+        max_len = _bucket_pad(max(len(a) for a in aligned))
 
         all_input_ids = []
         all_labels    = []
