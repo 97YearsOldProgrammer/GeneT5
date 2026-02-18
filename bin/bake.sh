@@ -96,6 +96,10 @@ if [[ "$WORKER_RUNNING" != "true" ]]; then
     done
 fi
 
+# Sync requirements on worker (idempotent, picks up webdataset etc.)
+echo "[node 1] Syncing pip requirements..."
+${SSH_CMD} "docker exec ${CONTAINER} pip install -q -r /workspace/GeneT5/requirements.txt" 2>/dev/null || true
+
 # Build the bake_data command (per-species baking only, no merge/eval)
 BAKE_CMD="cd /workspace/GeneT5 && PYTHONPATH=/workspace/GeneT5 python bin/bake_data ${BAKE_ARGS[*]} --train"
 

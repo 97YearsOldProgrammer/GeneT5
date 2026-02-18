@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import glob
 import json
 import random
 import time
@@ -9,6 +10,7 @@ import os
 
 import torch
 import torch.distributed as dist
+import webdataset as wds
 
 import torch.utils.data as data_utils
 import transformers as tf
@@ -135,22 +137,24 @@ def main():
     with open(bake_cfg) as f:
         cfg = json.load(f)
 
-    species_list = cfg.get("train_species", [])
-    shard_paths  = [data_dir / sp / "training.bin" for sp in species_list]
-    missing      = [p for p in shard_paths if not p.exists()]
+    # Discover tar shards from bake output
+    species_list    = cfg.get("train_species", [])
+    total_train     = cfg.get("total_train_samples", 0)
+    shard_urls      = []
+    for sp in species_list:
+        sp_tars = sorted(glob.glob(str(data_dir / sp / "*.tar")))
+        shard_urls.extend(sp_tars)
 
-    if missing:
+    if not shard_urls:
         if is_main:
-            print(f"\nERROR: Missing {len(missing)} training shards:")
-            for p in missing[:5]:
-                print(f"       {p}")
+            print(f"\nERROR: No .tar training shards found in {data_dir}")
+            print(f"       Run bin/bake_data first to produce training data")
         if is_dist:
             train_util.cleanup_distributed()
         return
 
-    train_source = [str(p) for p in shard_paths]
     if is_main:
-        print(f"\n  Training shards: {len(shard_paths)} species files")
+        print(f"\n  Training tars:    {len(shard_urls)} shards, {total_train:,} samples")
 
     has_val  = val_bin.exists()
     has_eval = eval_json.exists() and not args.no_eval
@@ -220,14 +224,17 @@ def main():
         print(f"\nLoading datasets...")
         print(f"  Data dir: {data_dir}")
 
-    train_dataset = ds.BinaryTrainDataset(train_source, tokenizer, args.seed)
+    world_size = train_util.get_world_size()
+
+    # WebDataset pipeline for training (resampled=True handles DDP automatically)
+    train_dataset = ds.create_train_pipeline(shard_urls, tokenizer)
 
     val_dataset = None
     if has_val:
         val_dataset = ds.BinaryTrainDataset(str(val_bin), tokenizer, args.seed)
 
     if is_main:
-        print(f"  Train: {len(train_dataset):,}")
+        print(f"  Train: {total_train:,} samples (WebDataset)")
         if val_dataset:
             print(f"  Val:   {len(val_dataset):,}")
         else:
@@ -238,7 +245,7 @@ def main():
             reason = "skipped (--no_eval)" if args.no_eval else "none (no eval.json)"
             print(f"  Eval:  {reason}")
 
-    if len(train_dataset) == 0:
+    if total_train == 0:
         if is_main:
             print(f"\nERROR: Training dataset is empty!")
             print(f"       Please check: {data_dir}")
@@ -250,32 +257,29 @@ def main():
     if is_main:
         print(f"\nSetting up dataloaders...")
 
-    collator = ds.PrefixLMCollator(tokenizer.pad_token_id, -100)
-
-    # Distributed sampler for multi-node training
-    dist_sampler     = None
-    val_dist_sampler = None
-    if is_dist:
-        dist_sampler = data_utils.distributed.DistributedSampler(train_dataset, shuffle=True)
-        if val_dataset:
-            val_dist_sampler = data_utils.distributed.DistributedSampler(val_dataset, shuffle=False)
-
+    collator   = ds.PrefixLMCollator(tokenizer.pad_token_id, -100)
     persistent = args.num_workers > 0
 
-    train_loader = data_utils.DataLoader(
+    # WebLoader wraps the IterableDataset for batching + collation
+    train_loader = wds.WebLoader(
         train_dataset,
         batch_size         = args.batch_size,
-        shuffle            = not is_dist,
-        sampler            = dist_sampler,
         collate_fn         = collator,
         num_workers        = args.num_workers,
         pin_memory         = not args.no_pin_memory,
-        drop_last          = True,
         persistent_workers = persistent,
     )
 
-    val_loader = None
+    # Define epoch length from known sample count
+    batches_per_epoch = total_train // (args.batch_size * world_size)
+    train_loader      = train_loader.with_epoch(batches_per_epoch)
+
+    # Validation uses standard DataLoader with DistributedSampler
+    val_dist_sampler = None
+    val_loader       = None
     if val_dataset:
+        if is_dist:
+            val_dist_sampler = data_utils.distributed.DistributedSampler(val_dataset, shuffle=False)
         val_loader = data_utils.DataLoader(
             val_dataset,
             batch_size         = args.batch_size,
@@ -288,7 +292,7 @@ def main():
         )
 
     if is_main:
-        print(f"  Train batches: {len(train_loader)}")
+        print(f"  Train batches: {batches_per_epoch}")
         if val_loader:
             print(f"  Val batches:   {len(val_loader)}")
         else:
@@ -332,7 +336,7 @@ def main():
             fused        = True,
         )
 
-    total_steps  = len(train_loader) * args.epochs // args.grad_accum
+    total_steps  = batches_per_epoch * args.epochs // args.grad_accum
     warmup_steps = int(total_steps * args.warmup_ratio)
 
     scheduler = tf.get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
@@ -371,10 +375,10 @@ def main():
         config = {
             **vars(args),
             'vocab_size':    len(tokenizer),
-            'train_samples': len(train_dataset),
+            'train_samples': total_train,
             'val_samples':   len(val_dataset) if val_dataset else 0,
             'has_eval':      has_eval,
-            'world_size':    train_util.get_world_size(),
+            'world_size':    world_size,
             'effective_lr':  effective_lr,
         }
 
@@ -405,7 +409,6 @@ def main():
             print("  Gradient checkpointing: enabled")
 
     # Print progress logging info
-    batches_per_epoch = len(train_loader)
     optimizer_steps_per_epoch = batches_per_epoch // args.grad_accum
     if is_main:
         print(f"  Progress logging: every {args.log_every_pct}% ({batches_per_epoch * args.log_every_pct // 100} batches)")
@@ -446,12 +449,9 @@ def main():
             print(f"\nEpoch {epoch + 1}/{args.epochs}")
             print('-' * 40)
 
-        # Sync distributed sampler epoch for proper shuffling
-        if dist_sampler:
-            dist_sampler.set_epoch(epoch)
+        # Sync distributed sampler epoch for validation only
         if val_dist_sampler:
             val_dist_sampler.set_epoch(epoch)
-        train_dataset.set_epoch(epoch)
         if val_dataset:
             val_dataset.set_epoch(epoch)
 
@@ -462,7 +462,7 @@ def main():
         optimizer.zero_grad(set_to_none=True)
 
         # Progress tracking
-        num_batches = len(train_loader)
+        num_batches  = batches_per_epoch
         log_interval = max(1, num_batches * args.log_every_pct // 100)
         last_logged_pct = -1
         epoch_start_time = time.time()
@@ -547,7 +547,7 @@ def main():
                     batch_per_sec = batch_per_sec,
                 )
 
-        train_loss = total_train_loss / max(len(train_loader), 1)
+        train_loss = total_train_loss / max(num_batches, 1)
 
         # Sync train loss across processes
         if is_dist:

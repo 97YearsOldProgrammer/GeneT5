@@ -55,6 +55,7 @@ filter_n_heavy_chunks   = chunking.filter_n_heavy_chunks
 #####################
 
 
+create_train_pipeline  = dataload.create_train_pipeline
 BinaryTrainDataset     = dataload.BinaryTrainDataset
 PrefixLMCollator       = dataload.PrefixLMCollator
 DynamicPaddingCollator = dataload.DynamicPaddingCollator

@@ -272,6 +272,10 @@ if [[ -n "$WORKER_IP" ]]; then
             ;;
     esac
 
+    # Sync requirements on worker (idempotent, picks up webdataset etc.)
+    echo "[worker] Syncing pip requirements..."
+    ${SSH_CMD} "docker exec ${CONTAINER} pip install -q -r /workspace/GeneT5/requirements.txt" 2>/dev/null || true
+
     # Auto-patch NGC triton cluster_dims bug on both nodes (idempotent)
     TRITON_FILE="/usr/local/lib/python3.12/dist-packages/torch/_inductor/runtime/triton_heuristics.py"
     PATCH_MARKER='getattr(binary.metadata, "cluster_dims"'

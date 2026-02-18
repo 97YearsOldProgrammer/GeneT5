@@ -2,6 +2,7 @@ import subprocess
 import pathlib
 import tempfile
 import shutil
+import json
 import os
 from dataclasses import dataclass, field
 
@@ -123,16 +124,17 @@ def discover_species(raw_dir):
 
 @dataclass
 class BakeJob:
-    """Work item for species processing — replaces fragile tuples."""
+    """Work item for species processing — replaces fragile tuples"""
 
-    species:     str = ""
-    raw_dir:     str = ""
-    output_dir:  str = ""
-    log_dir:     str = ""
-    window_size: int = 20000
-    tokenizer:   str = None
-    n_workers:   int = 1
-    compress:    str = None
+    species:       str = ""
+    raw_dir:       str = ""
+    output_dir:    str = ""
+    log_dir:       str = ""
+    window_size:   int = 20000
+    tokenizer:     str = None
+    n_workers:     int = 1
+    compress:      str = None
+    output_format: str = "binary"
 
 
 ######################
@@ -269,10 +271,45 @@ def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_di
         }
 
 
-def process_species(job):
-    """Worker function for parallel species processing.
+def convert_binary_to_tar(binary_path, species_name, maxcount=50000):
+    """Convert training.bin to WebDataset tar shards, return sample count"""
 
-    Accepts a BakeJob dataclass instance.
+    import webdataset as wds
+
+    binary_path = pathlib.Path(binary_path)
+    shard_dir   = binary_path.parent
+    pattern     = str(shard_dir / f"{species_name}-%06d.tar")
+
+    total_written = 0
+    with wds.ShardWriter(pattern, maxcount=maxcount) as sink:
+        for idx, chunk in enumerate(ds.iter_binary(binary_path)):
+            key = f"{chunk.seqid}_{chunk.start}_{chunk.end}_{idx:06d}"
+
+            meta = {
+                "seqid":    chunk.seqid,
+                "start":    chunk.start,
+                "end":      chunk.end,
+                "gene_ids": chunk.gene_ids,
+            }
+
+            sink.write({
+                "__key__":    key,
+                "input.txt":  chunk.get_input_text(),
+                "target.txt": chunk.get_target_text(),
+                "meta.json":  json.dumps(meta),
+            })
+            total_written += 1
+
+    # Remove the binary after successful conversion
+    binary_path.unlink()
+
+    return total_written
+
+
+def process_species(job):
+    """Worker function for parallel species processing
+
+    Accepts a BakeJob dataclass instance
     """
 
     species_raw_dir = pathlib.Path(job.raw_dir) / job.species
@@ -321,6 +358,17 @@ def process_species(job):
                 f.unlink()
         except Exception:
             pass
+
+    # Convert binary to tar shards if requested and parse succeeded
+    if result["success"] and job.output_format == "tar":
+        binary_path = output_dir / "training.bin"
+        if binary_path.exists():
+            try:
+                total = convert_binary_to_tar(binary_path, job.species)
+                result["total_samples"] = total
+            except Exception as e:
+                result["success"] = False
+                result["error"]   = f"Tar conversion failed: {e}"
 
     return result
 

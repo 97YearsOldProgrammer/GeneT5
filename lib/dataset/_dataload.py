@@ -3,8 +3,31 @@ import bisect
 import random
 
 import torch
+import webdataset as wds
 
 import lib.dataset._binary as binary
+
+
+############################
+#####  WebDataset I/O  #####
+############################
+
+
+def create_train_pipeline(shard_urls, tokenizer, shuffle_buffer=10000):
+    """WebDataset pipeline for sequential tar-based training"""
+
+    def tokenize_sample(sample):
+
+        input_ids  = tokenizer.encode(sample["input.txt"], add_special_tokens=False)
+        target_ids = tokenizer.encode(sample["target.txt"], add_special_tokens=False)
+        return {"input_ids": input_ids + target_ids, "prefix_len": len(input_ids)}
+
+    return (
+        wds.WebDataset(shard_urls, resampled=True)
+        .shuffle(shuffle_buffer)
+        .decode()
+        .map(tokenize_sample)
+    )
 
 
 #################
