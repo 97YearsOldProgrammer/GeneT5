@@ -23,7 +23,7 @@ def create_train_pipeline(shard_urls, tokenizer, shuffle_buffer=10000):
         return {"input_ids": input_ids + target_ids, "prefix_len": len(input_ids)}
 
     return (
-        wds.WebDataset(shard_urls, resampled=True)
+        wds.WebDataset(shard_urls, resampled=True, nodesplitter=wds.split_by_node)
         .shuffle(shuffle_buffer)
         .decode()
         .map(tokenize_sample)

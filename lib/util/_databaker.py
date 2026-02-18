@@ -282,8 +282,9 @@ def convert_binary_to_tar(binary_path, species_name, maxcount=50000):
 
     total_written = 0
     with wds.ShardWriter(pattern, maxcount=maxcount) as sink:
-        for idx, chunk in enumerate(ds.iter_binary(binary_path)):
-            key = f"{chunk.seqid}_{chunk.start}_{chunk.end}_{idx:06d}"
+        for idx, chunk in ds.iter_binary(binary_path):
+            safe_seqid = chunk.seqid.replace(".", "_")
+            key        = f"{safe_seqid}_{chunk.start}_{chunk.end}_{idx:06d}"
 
             meta = {
                 "seqid":    chunk.seqid,

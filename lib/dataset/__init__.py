@@ -26,6 +26,7 @@ from lib.dataset.wrapper import (
     get_binary_info,
     get_chunk_count,
     read_chunk_at_index,
+    iter_binary,
     merge_binary_files,
     BinaryChunk,
 

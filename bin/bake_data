@@ -307,18 +307,10 @@ if args.train and (args.finalize or args.nnodes == 1):
     all_tar_files  = sorted(output_dir.glob("*/*.tar"))
     training_tars  = [f for f in all_tar_files if f.parent.name in all_train_names]
 
-    # Count total training samples from conversion results + already-baked
-    # For already-baked species, count samples by listing tar files
-    import glob as _glob
-
+    # Count total training samples from stats.json (written by parse_data.py)
     total_train_samples = 0
-    if 'train_totals' in dir():
-        total_train_samples = sum(train_totals.values())
-
-    # Also count samples from already-baked species via stats.json
-    for sp_name in already_baked & all_train_names:
-        sp_dir     = output_dir / sp_name
-        stats_path = sp_dir / "stats.json"
+    for sp_name in all_train_names:
+        stats_path = output_dir / sp_name / "stats.json"
         if stats_path.exists():
             with open(stats_path) as f:
                 sp_stats = json.load(f)
@@ -420,13 +412,17 @@ if heldout_species and args.eval and (args.finalize or args.nnodes == 1):
 ##############################
 
 
+# Ensure total_train_samples is set even if merge section was skipped
+if 'total_train_samples' not in dir():
+    total_train_samples = 0
+
 bake_config = {
     **{k: str(v) if isinstance(v, pathlib.Path) else v for k, v in vars(args).items()},
     "train_species":        [name for name, _ in train_species],
     "heldout_species":      [name for name, _ in heldout_species],
     "eval_samples_generated": len(all_eval_samples),
     "output_format":        "tar",
-    "total_train_samples":  total_train_samples if 'total_train_samples' in dir() else 0,
+    "total_train_samples":  total_train_samples,
 }
 
 if args.nnodes > 1 and not args.finalize:
@@ -451,8 +447,7 @@ if args.train:
     tar_count  = len(list(output_dir.glob("*/*.tar")))
 
     if tar_count > 0:
-        n_samples = total_train_samples if 'total_train_samples' in dir() else 0
-        print(f"  training tars:   {tar_count} shards, {n_samples:,} samples")
+        print(f"  training tars:   {tar_count} shards, {total_train_samples:,} samples")
 
     if merged_val.exists():
         info = ds.get_binary_info(merged_val)
