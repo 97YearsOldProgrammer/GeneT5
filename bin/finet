@@ -119,18 +119,38 @@ def main():
         torch.set_float32_matmul_precision('high')
 
     # Auto-discover data files from bake output directory
-    data_dir   = pathlib.Path(args.data_dir)
-    train_bin  = data_dir / "training.bin"
-    val_bin    = data_dir / "validation.bin"
-    eval_json  = data_dir / "eval.json"
+    data_dir  = pathlib.Path(args.data_dir)
+    val_bin   = data_dir / "validation.bin"
+    eval_json = data_dir / "eval.json"
+    bake_cfg  = data_dir / "bake_config.json"
 
-    if not train_bin.exists():
+    if not bake_cfg.exists():
         if is_main:
-            print(f"\nERROR: {train_bin} not found")
+            print(f"\nERROR: {bake_cfg} not found")
             print(f"       Run bin/bake_data first to produce training data")
         if is_dist:
             train_util.cleanup_distributed()
         return
+
+    with open(bake_cfg) as f:
+        cfg = json.load(f)
+
+    species_list = cfg.get("train_species", [])
+    shard_paths  = [data_dir / sp / "training.bin" for sp in species_list]
+    missing      = [p for p in shard_paths if not p.exists()]
+
+    if missing:
+        if is_main:
+            print(f"\nERROR: Missing {len(missing)} training shards:")
+            for p in missing[:5]:
+                print(f"       {p}")
+        if is_dist:
+            train_util.cleanup_distributed()
+        return
+
+    train_source = [str(p) for p in shard_paths]
+    if is_main:
+        print(f"\n  Training shards: {len(shard_paths)} species files")
 
     has_val  = val_bin.exists()
     has_eval = eval_json.exists() and not args.no_eval
@@ -200,7 +220,7 @@ def main():
         print(f"\nLoading datasets...")
         print(f"  Data dir: {data_dir}")
 
-    train_dataset = ds.BinaryTrainDataset(str(train_bin), tokenizer, args.seed)
+    train_dataset = ds.BinaryTrainDataset(train_source, tokenizer, args.seed)
 
     val_dataset = None
     if has_val:
@@ -221,7 +241,7 @@ def main():
     if len(train_dataset) == 0:
         if is_main:
             print(f"\nERROR: Training dataset is empty!")
-            print(f"       Please check: {train_bin}")
+            print(f"       Please check: {data_dir}")
         if is_dist:
             train_util.cleanup_distributed()
         return

@@ -686,6 +686,18 @@ def merge_binary_files(input_paths, output_path, compress=None, show_progress=Tr
     return output_path
 
 
+def get_chunk_count(input_path):
+    """Read chunk count from binary header (10 bytes, no offset table)"""
+
+    with open(input_path, 'rb') as f:
+        magic = f.read(4)
+        if magic != MAGIC_HEADER:
+            raise ValueError(f"Invalid magic header: {magic}")
+        _version  = struct.unpack('<B', f.read(1))[0]
+        _compress = struct.unpack('<B', f.read(1))[0]
+        return struct.unpack('<I', f.read(4))[0]
+
+
 def get_binary_info(input_path):
     """Get metadata about binary dataset without loading all chunks (supports v1 and v2)"""
 

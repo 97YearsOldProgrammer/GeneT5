@@ -52,7 +52,9 @@ parser.add_argument("--eval_samples", type=int, default=50,
 parser.add_argument("--seed", type=int, default=42,
     help="Random seed for eval sample selection [%(default)s]")
 parser.add_argument("--finalize", action="store_true",
-    help="Skip per-species baking, only merge bins + generate eval (run after distributed bake)")
+    help="Skip per-species baking, only generate eval (run after distributed bake)")
+parser.add_argument("--force", action="store_true",
+    help="Re-bake all species even if output already exists")
 
 args = parser.parse_args()
 
@@ -70,6 +72,17 @@ elif not args.train and not args.eval:
 val_species_set = set()
 if args.val_species:
     val_species_set = {s.strip() for s in args.val_species.split(",")}
+
+# Inherit held-out split from existing config if not specified
+if not args.val_species:
+    existing_cfg = pathlib.Path(args.output_dir) / "bake_config.json"
+    if existing_cfg.exists():
+        with open(existing_cfg) as f:
+            prev = json.load(f)
+        prev_heldout = prev.get("heldout_species", [])
+        if prev_heldout:
+            val_species_set = set(prev_heldout)
+            print(f"  Inherited held-out from existing config: {', '.join(sorted(val_species_set))}")
 
 n_workers_per_species = args.n_workers or max(1, multiprocessing.cpu_count() - 1)
 raw_dir               = pathlib.Path(args.raw_dir)
@@ -112,15 +125,26 @@ if args.node_rank == 0:
 else:
     heldout_to_process = []
 
-if not species_to_process and not heldout_to_process:
-    print("No species to process!")
-    sys.exit(0)
-
 output_dir = pathlib.Path(args.output_dir)
 log_dir    = pathlib.Path(args.log_dir)
 
 output_dir.mkdir(parents=True, exist_ok=True)
 log_dir.mkdir(parents=True, exist_ok=True)
+
+# Detect already-baked species by scanning output_dir for training.bin
+already_baked = set()
+if not args.force and not args.finalize:
+    for d in output_dir.iterdir():
+        if d.is_dir() and (d / "training.bin").exists():
+            already_baked.add(d.name)
+
+    if already_baked:
+        species_to_process = [(n, p) for n, p in species_to_process if n not in already_baked]
+        heldout_to_process = [(n, p) for n, p in heldout_to_process if n not in already_baked]
+
+if not species_to_process and not heldout_to_process and not already_baked:
+    print("No species found!")
+    sys.exit(0)
 
 
 ####################
@@ -157,16 +181,20 @@ if args.nnodes > 1:
     print(f"  This node:        {len(species_to_process)} species ({total_size / 1024**3:.1f} GB)")
     print(f"  Total species:    {len(train_species)}")
 else:
-    print(f"  Species:          {len(species_to_process)}")
+    print(f"  Species:          {len(all_discovered)}")
 print(f"  Species parallel: {args.species_parallel}")
 print(f"  Workers/species:  {n_workers_per_species}")
 
 print(f"\n{' Species Summary ':=^60}")
-print(f"  Discovered: {len(all_discovered)} species")
-print(f"  Training:   {len(species_to_process)}")
-print(f"  Held-out:   {len(heldout_to_process)}")
-for name, _ in sorted(species_to_process):
-    print(f"    {name}")
+print(f"  Discovered:     {len(all_discovered)} species")
+if already_baked:
+    print(f"  Already baked:  {len(already_baked)} (use --force to re-bake)")
+print(f"  New to bake:    {len(species_to_process)} training + {len(heldout_to_process)} held-out")
+if species_to_process:
+    for name, _ in sorted(species_to_process):
+        print(f"    + {name}")
+elif not args.finalize:
+    print(f"    (nothing new)")
 
 
 ##############################
@@ -262,9 +290,6 @@ if not args.finalize and heldout_to_process and args.train:
 if args.train and (args.finalize or args.nnodes == 1):
     import lib.dataset as ds
 
-    print(f"\n{' Merging Per-Species Bins ':=^60}")
-
-    # Finalize merges ALL species; single-node merges its own
     all_train_names   = {name for name, _ in train_species}
     all_heldout_names = {name for name, _ in heldout_species}
 
@@ -277,23 +302,25 @@ if args.train and (args.finalize or args.nnodes == 1):
         if f.parent.name in all_heldout_names
     )
 
-    print(f"  Training files:   {len(training_bins)}")
-    print(f"  Validation files: {len(validation_bins)} (held-out species)")
-
+    # Training shards summary (finet reads shards directly via bake_config.json)
+    print(f"\n{' Per-Species Training Shards ':=^60}")
+    total_chunks = 0
+    total_bytes  = 0
     for f in training_bins:
-        size_mb = f.stat().st_size / 1024 / 1024
-        print(f"    {f.parent.name:30s} {size_mb:.1f} MB")
+        info    = ds.get_binary_info(f)
+        fsize   = f.stat().st_size
+        total_chunks += info['num_chunks']
+        total_bytes  += fsize
+        size_mb       = fsize / 1024 / 1024
+        print(f"    {f.parent.name:30s} {info['num_chunks']:>7,} chunks  ({size_mb:.1f} MB)")
 
-    # Stream-merge all per-species bins into one
-    if training_bins:
-        print(f"\n  Training merge:")
-        ds.merge_binary_files(
-            training_bins,
-            output_dir / "training.bin",
-            compress      = args.compress,
-            show_progress = True,
-        )
+    if total_bytes < 1024 ** 3:
+        total_str = f"{total_bytes / 1024 / 1024:.1f} MB"
+    else:
+        total_str = f"{total_bytes / 1024 ** 3:.2f} GB"
+    print(f"  Total: {len(training_bins)} files, {total_chunks:,} chunks, {total_str}")
 
+    # Validation merge (small file, ~110MB)
     if validation_bins:
         print(f"\n  Validation merge (capped at {args.val_windows:,}):")
         ds.merge_binary_files(
@@ -312,12 +339,12 @@ if args.train and (args.finalize or args.nnodes == 1):
 
 all_eval_samples = []
 
-if heldout_to_process and args.eval and (args.finalize or args.nnodes == 1):
+if heldout_species and args.eval and (args.finalize or args.nnodes == 1):
     import lib.dataset as ds
 
     print(f"\n{' Generating Eval Samples ':=^60}")
 
-    for sp, _ in heldout_to_process:
+    for sp, _ in heldout_species:
         species_dir = raw_dir / sp
 
         # Try loading gene_index sidecar first (avoids re-parsing GFF)
@@ -367,7 +394,7 @@ if heldout_to_process and args.eval and (args.finalize or args.nnodes == 1):
 
 bake_config = {
     **{k: str(v) if isinstance(v, pathlib.Path) else v for k, v in vars(args).items()},
-    "train_species":   [name for name, _ in (train_species if args.finalize else species_to_process)],
+    "train_species":   [name for name, _ in train_species],
     "heldout_species": [name for name, _ in heldout_species],
     "eval_samples_generated": len(all_eval_samples),
 }
@@ -390,13 +417,11 @@ print(f"\n{' Final Output ':=^60}")
 if args.train:
     import lib.dataset as ds
 
-    merged_train = output_dir / "training.bin"
     merged_val   = output_dir / "validation.bin"
+    shard_count  = len(list(output_dir.glob("*/training.bin")))
 
-    if merged_train.exists():
-        info = ds.get_binary_info(merged_train)
-        size = ds.format_size(merged_train.stat().st_size)
-        print(f"  training.bin:    {info['num_chunks']:,} chunks  ({size})")
+    if shard_count > 0:
+        print(f"  training shards: {shard_count} per-species files")
 
     if merged_val.exists():
         info = ds.get_binary_info(merged_val)

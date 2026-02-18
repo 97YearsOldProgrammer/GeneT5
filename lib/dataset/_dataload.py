@@ -1,4 +1,5 @@
 import os
+import bisect
 import random
 
 import torch
@@ -91,26 +92,47 @@ class BinaryDatasetReader:
 
 
 class BinaryTrainDataset:
-    """Dataset wrapper for binary training files"""
+    """Dataset wrapper for binary training files (single or sharded)"""
 
     def __init__(self, binary_path, tokenizer, seed=42):
+        """
+        Accept str (single file, backward compat) or list (sharded mode)
+        Init only reads 10-byte headers — no file handles opened here
+        """
 
-        self.binary_path = binary_path
-        self.tokenizer   = tokenizer
-        self.seed        = seed
-        self.epoch       = 0
+        self.tokenizer = tokenizer
+        self.seed      = seed
+        self.epoch     = 0
+        self._lengths  = None
 
-        self._info    = binary.get_binary_info(binary_path)
-        self._length  = self._info["num_chunks"]
-        self._reader  = BinaryDatasetReader(binary_path, tokenizer)
-        self._lengths = None
+        if isinstance(binary_path, list):
+            self._paths  = [str(p) for p in binary_path]
+            self._multi  = True
+        else:
+            self._paths  = [str(binary_path)]
+            self._multi  = False
 
-    @property
-    def lengths(self):
-        """Get lengths with lazy loading"""
-        if self._lengths is None:
-            self._lengths = self._reader.lengths
-        return self._lengths
+        # Build cumulative index from header-only reads
+        counts       = [binary.get_chunk_count(p) for p in self._paths]
+        self._counts = counts
+        self._length = sum(counts)
+
+        # Cumulative sums for bisect: [c0-1, c0+c1-1, ...]
+        self._cumsum = []
+        running      = 0
+        for c in counts:
+            running += c
+            self._cumsum.append(running)
+
+    def _resolve(self, idx):
+        """Map flat index to (file_path, local_index)"""
+
+        if not self._multi:
+            return self._paths[0], idx
+
+        fi = bisect.bisect_right(self._cumsum, idx)
+        base = self._cumsum[fi - 1] if fi > 0 else 0
+        return self._paths[fi], idx - base
 
     def set_epoch(self, epoch):
 
@@ -122,41 +144,19 @@ class BinaryTrainDataset:
 
     def __getitem__(self, idx):
 
-        random.seed(self.seed + self.epoch * len(self) + idx)
+        random.seed(self.seed + self.epoch * self._length + idx)
 
-        sample     = self._reader.get_sample(idx)
-        input_ids  = self.tokenizer.encode(sample["input_text"], add_special_tokens=False)
-        target_ids = self.tokenizer.encode(sample["target_text"], add_special_tokens=False)
+        path, local = self._resolve(idx)
+        chunk      = binary.read_chunk_at_index(path, local)
+        input_ids  = self.tokenizer.encode(chunk.get_input_text(), add_special_tokens=False)
+        target_ids = self.tokenizer.encode(chunk.get_target_text(), add_special_tokens=False)
 
-        # Concatenate: input + target for causal LM
         full_ids = input_ids + target_ids
 
         return {
             "input_ids":  full_ids,
             "prefix_len": len(input_ids),
         }
-
-    def get_batch_tokenized(self, indices):
-        """Get batch of samples with batched tokenization"""
-
-        samples      = self._reader.get_samples_batched(indices)
-        input_texts  = [s["input_text"] for s in samples]
-        target_texts = [s["target_text"] for s in samples]
-
-        input_enc  = self.tokenizer(input_texts, add_special_tokens=False, padding=False, truncation=False)
-        target_enc = self.tokenizer(target_texts, add_special_tokens=False, padding=False, truncation=False)
-
-        results = []
-        for i in range(len(indices)):
-            inp_ids = input_enc["input_ids"][i]
-            tgt_ids = target_enc["input_ids"][i]
-            full    = inp_ids + tgt_ids
-            results.append({
-                "input_ids":  full,
-                "prefix_len": len(inp_ids),
-            })
-
-        return results
 
 
 #####################

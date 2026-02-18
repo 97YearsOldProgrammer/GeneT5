@@ -33,6 +33,7 @@ BinaryChunk         = binary.BinaryChunk
 write_binary        = binary.write_binary
 read_binary         = binary.read_binary
 get_binary_info     = binary.get_binary_info
+get_chunk_count     = binary.get_chunk_count
 read_chunk_at_index = binary.read_chunk_at_index
 iter_binary         = binary.iter_binary
 merge_binary_files  = binary.merge_binary_files
