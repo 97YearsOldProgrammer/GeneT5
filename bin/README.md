@@ -12,26 +12,20 @@ Reproducible commands for building and training GeneT5 from scratch
 ### Init the Model
 
 ```bash
-PYTHONPATH=. python bin/init_model.py \
-    --save_dir ../model/base \
+python -u bin/init_model.py \
+    --save_dir ../model/GeneT5/init/init_moe4 \
     --dnabert_path "zhihan1996/DNABERT-2-117M" \
     --tie_weights \
-    --decoder_layers 12 \
-    --decoder_heads 12 \
-    --decoder_kv_heads 3 \
-    --decoder_ff_dim 3072 \
-    --decoder_dropout 0.1 \
+    --layers 12 \
+    --heads 12 \
+    --ff_dim 3072 \
+    --dropout 0.1 \
     --use_moe \
-    --num_experts 16 \
-    --moe_top_k 2 \
+    --num_experts 4 \
+    --moe_top_k 1 \
     --init_std 0.02 \
-    --init_embed_std 0.02 \
-    --init_ffn_std 0.02 \
-    --init_attn_std 0.02 \
     --init_moe_router_std 0.006 \
-    --encoder_window_size 1024 \
-    --decoder_window_size 256 \
-    2>&1 | tee ../logs/init.log
+    2>&1 | tee ../logs/GeneT5/init.log
 ```
 
 
@@ -78,22 +72,6 @@ PYTHONPATH=. python bin/bake_data ../raw \
     --species_parallel 4 \
     --nnodes 2 --node_rank 1 \
     2>&1 | tee ../logs/baker/w20k_v3_node1.log
-```
-
-**4-node bake** (scale to more machines)
-
-```bash
-# Each node gets a balanced slice of species by genome size
-for RANK in 0 1 2 3; do
-    PYTHONPATH=. python bin/bake_data ../raw \
-        --tokenizer ../model/GeneT5/ \
-        --output_dir ../baked/GeneT5/w20k_v3/ \
-        --species_parallel 4 \
-        --val_species B.taurus,S.lycopersicum \
-        --nnodes 4 --node_rank $RANK \
-        2>&1 | tee ../logs/baker/w20k_v3_node${RANK}.log &
-done
-wait
 ```
 
 **Output structure** (flat, all species together)
@@ -157,68 +135,6 @@ bin/bake.sh --worker 192.168.100.11 \
 python bin/prep_eval ../raw/S.scrofa/ -o ../baked/GeneT5/eval/S.scrofa_eval.json
 ```
 
----
-
-
-### Token Management
-
-Init tokenizer with gene-type tokens from GFF
-
-```bash
-PYTHONPATH=. python bin/init_tk.py data/new_tokens.txt
-```
-
-Append new tokens discovered during baking
-
-```bash
-PYTHONPATH=. python bin/append_tk.py data/new_tokens.txt ../model/base/tokenizer.json
-```
-
-Resize embeddings after tokenizer changes
-
-```bash
-PYTHONPATH=. python bin/resize_model.py ../model/base ../model/base
-```
-
-
----
-
-
-### Single-Node Fine-Tuning
-
-```bash
-PYTHONPATH=. python bin/finet \
-    ../baked/w5k_c4.5k/training.packed \
-    ../baked/w5k_c4.5k/validation.packed \
-    ../model/run_001 \
-    ../model/base \
-    --epochs 4 \
-    --lr 1e-4 \
-    --batch_size 8 \
-    --grad_accum 64 \
-    --weight_decay 0.01 \
-    --warmup_ratio 0.03 \
-    --max_grad_norm 1.0 \
-    --label_smoothing 0.1 \
-    --early_stopping 2 \
-    --save_steps 500 \
-    --empty_cache_steps 100 \
-    --compile \
-    --memwatch \
-    --log_every_pct 5 \
-    2>&1 | tee ../logs/tune/run_001.log
-```
-
-**Key Flags**
-
-| Flag               | Purpose                                    |
-| :----------------- | :----------------------------------------- |
-| `--compile`        | torch.compile on encoder/decoder (~33% speedup) |
-| `--memwatch`       | Background memory CSV (5s intervals, then 30s) |
-| `--mxfp8`          | MXFP8 quantization (Blackwell only)        |
-| `--optim_8bit`     | 8-bit AdamW (saves ~12GB optimizer memory) |
-| `--log_every_pct N`| Progress log frequency                     |
-
 
 ---
 
@@ -228,8 +144,25 @@ PYTHONPATH=. python bin/finet \
 Uses `torchrun` + NCCL over ConnectX-7 RoCE
 
 **Master** (spark-1089, 192.168.100.10)
+
 ```bash
-bash bin/sft.sh ../baked/GeneT5/w20k_ts51_v2/training.bin ../baked/GeneT5/w20k_ts51_v2/validation.bin ../model/GeneT5/feb10_run1/ ../model/GeneT5/ --worker 192.168.100.11 --label_smoothing 0.1 --num_workers 3 --batch_size 8 --epochs 4 --save_steps 2000 --optim_8bit --empty_cache_steps 500 --memwatch
+bash -u bin/sft.sh \
+    ../baked/GeneT5/feb17_s51_v1_e1/ \
+    ../model/GeneT5/feb19_moe4_t1/ \
+    ../model/GeneT5/init/init_moe4 \
+    --worker 192.168.100.11 \
+    --num_workers 2 \
+    --batch_size 8 \
+    --grad_accum 32 \
+    --epochs 3 \
+    --lr 0.02 \
+    --warmup_ratio 0.03 \
+    --label_smoothing 0.1 \
+    --save_steps 500 \
+    --log_every_pct 2 \
+    --memwatch \
+    --compile \
+    2>&1 | tee ../logs/GeneT5/sft/feb19_moe4_t1.log
 ```
 
 **RoCE Verification** (before distributed run)
@@ -250,58 +183,6 @@ ib_write_bw -d rocep1s0f1 -x 3 192.168.100.10 --report_gbits  # client
 **RoCE Fallback**: If RDMA fails, uncomment Socket transport in `distributed.sh` lines 127-128
 
 **NCCL Logs**: Look for `NET/IB` (RoCE active) vs `NET/Socket` (fallback)
-
-
----
-
-
-### Logging
-
-All commands use `tee` to write to both stdout and a log file. Use this pattern for any new run:
-
-```bash
-# Convention: ../logs/<category>/<run_name>.log
-# Categories: tune/, baker/, init.log
-
-# Training run with timestamped log
-RUN="exp_$(date +%Y%m%d)_desc"
-PYTHONPATH=. python bin/finet \
-    ../baked/w5k_c4.5k/training.packed \
-    ../baked/w5k_c4.5k/validation.packed \
-    ../model/$RUN ../model/base \
-    --epochs 4 --lr 1e-4 --batch_size 8 \
-    --grad_accum 64 --compile --memwatch \
-    2>&1 | tee ../logs/tune/${RUN}.log
-
-# Bake run (per-species logs go to baker/ subdir)
-PYTHONPATH=. python bin/bake_data \
-    --raw_dir ../raw --output_dir ../baked/w5k_c4k \
-    --tokenizer ../model/base --window_size 5000 --target 4000 \
-    --log_dir ../logs/baker/w5k_c4k \
-    2>&1 | tee ../logs/baker/w5k_c4k.log
-```
-
-**Log locations**
-
-| Category | Path | Content |
-| :------- | :--- | :------ |
-| Model init | `../logs/init.log` | Architecture, param counts |
-| Baking | `../logs/baker/<dataset>.log` | Per-species stats, packing summary |
-| Per-species bake | `../logs/baker/<dataset>/<Species>.log` | Gene extraction, token stats |
-| Training | `../logs/tune/<run>.log` | Loss, lr, batch/s, memory |
-
-
----
-
-
-### torch.compile Notes
-
-- **NGC 25.12 bug**: Requires monkeypatch in `triton_heuristics.py` for `cluster_dims` attribute
-  (apply in both master and worker containers)
-- Use `dynamic=None` (not `True`) to avoid 15+ minute compilation hangs
-- First 2 batches recompile (~10s each), then all shapes run from cache (~0.15s)
-- Inductor cache at `/tmp/torchinductor_root/` — copy to worker for faster startup
-- GB10 shows "Not enough SMs for max_autotune_gemm" — informational, not an error
 
 
 ---
