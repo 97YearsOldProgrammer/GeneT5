@@ -3,7 +3,6 @@
 import argparse
 import glob
 import json
-import random
 import time
 import pathlib
 import os
@@ -37,7 +36,8 @@ DEFAULTS = {
 }
 
 
-def main():
+def build_parser():
+    """Build CLI argument parser for fine-tuning"""
 
     parser = argparse.ArgumentParser(description='Fine-tune GeneT5')
     parser.add_argument('data_dir', type=str, metavar='<data>',
@@ -94,8 +94,12 @@ def main():
         help='skip generative F1 evaluation even if eval.json exists')
     parser.add_argument('--eval_samples', required=False, type=int, default=20,
         metavar='<int>', help='number of samples per eval run [%(default)i]')
+    return parser
 
-    args = parser.parse_args()
+
+def main():
+
+    args = build_parser().parse_args()
 
     # distributed setup (auto-detected from torchrun env vars)
     dist_info = train_util.setup_distributed(backend="nccl")
@@ -108,17 +112,11 @@ def main():
     if is_dist and is_main:
         print(f"Distributed: {dist_info['world_size']} nodes, rank {dist_info['rank']}")
 
-    # device setup
     device = train_util.get_device()
     if is_main:
         print(f"Device: {device}")
 
-    # set seeds
-    torch.manual_seed(args.seed)
-    random.seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-        torch.set_float32_matmul_precision('high')
+    train_util.set_seeds(args.seed)
 
     # Auto-discover data files from bake output directory
     data_dir  = pathlib.Path(args.data_dir)
@@ -138,9 +136,9 @@ def main():
         cfg = json.load(f)
 
     # Discover tar shards from bake output
-    species_list    = cfg.get("train_species", [])
-    total_train     = cfg.get("total_train_samples", 0)
-    shard_urls      = []
+    species_list = cfg.get("train_species", [])
+    total_train  = cfg.get("total_train_samples", 0)
+    shard_urls   = []
     for sp in species_list:
         sp_tars = sorted(glob.glob(str(data_dir / sp / "*.tar")))
         shard_urls.extend(sp_tars)
@@ -200,24 +198,8 @@ def main():
     if is_main:
         print(f"  Trainable: {stats['total_trainable']:,}")
 
-    # apply MXFP8 quantization to dense Linear layers
     if args.mxfp8:
-        from torchao.prototype.mx_formats import MXLinearConfig
-        from torchao.quantization import quantize_
-
-        mx_config = MXLinearConfig.from_recipe_name("mxfp8_cublas")
-
-        def mxfp8_filter(mod, fqn):
-            if not isinstance(mod, torch.nn.Linear):
-                return False
-            if mod.in_features % 32 != 0 or mod.out_features % 32 != 0:
-                return False
-            return True
-
-        quantize_(raw_model, mx_config, filter_fn=mxfp8_filter)
-        n_mx = sum(1 for _, m in raw_model.named_modules() if type(m).__name__ == 'MXLinear')
-        if is_main:
-            print(f"  MXFP8: converted {n_mx} Linear layers to MXLinear")
+        train_util.apply_mxfp8(raw_model)
 
     # load datasets
     if is_main:
@@ -257,22 +239,29 @@ def main():
     if is_main:
         print(f"\nSetting up dataloaders...")
 
-    collator   = ds.PrefixLMCollator(tokenizer.pad_token_id, -100)
-    persistent = args.num_workers > 0
+    collator     = ds.PrefixLMCollator(tokenizer.pad_token_id, -100, max_seq_len=ds.DEFAULT_MAX_SEQ)
+    val_collator = ds.PrefixLMCollator(tokenizer.pad_token_id, -100, max_seq_len=ds.DEFAULT_MAX_SEQ)
+    budget       = args.batch_size * ds.BUDGET_SEQ
+    persistent   = args.num_workers > 0
 
-    # WebLoader wraps the IterableDataset for batching + collation
+    # WebLoader yields individual samples; token_budget_batcher groups them
     train_loader = wds.WebLoader(
         train_dataset,
-        batch_size         = args.batch_size,
-        collate_fn         = collator,
+        batch_size         = None,
         num_workers        = args.num_workers,
         pin_memory         = not args.no_pin_memory,
         persistent_workers = persistent,
+    ).compose(
+        lambda src: ds.token_budget_batcher(src, budget, args.batch_size, collator)
     )
 
     # Define epoch length from known sample count
-    batches_per_epoch = total_train // (args.batch_size * world_size)
-    train_loader      = train_loader.with_epoch(batches_per_epoch)
+    # token_budget_batcher produces variable batches; estimate avg samples/batch
+    # Fallback: half of max_seq (conservative estimate for genomic data)
+    avg_seq               = cfg.get("avg_seq_len", ds.DEFAULT_MAX_SEQ // 2)
+    est_samples_per_batch = max(1, min(args.batch_size, budget // avg_seq))
+    batches_per_epoch     = total_train // (est_samples_per_batch * world_size)
+    train_loader          = train_loader.with_epoch(batches_per_epoch)
 
     # Validation uses standard DataLoader with DistributedSampler
     val_dist_sampler = None
@@ -285,14 +274,14 @@ def main():
             batch_size         = args.batch_size,
             shuffle            = False,
             sampler            = val_dist_sampler,
-            collate_fn         = collator,
+            collate_fn         = val_collator,
             num_workers        = args.num_workers,
             pin_memory         = not args.no_pin_memory,
             persistent_workers = persistent,
         )
 
     if is_main:
-        print(f"  Train batches: {batches_per_epoch}")
+        print(f"  Train batches: ~{batches_per_epoch} (avg_seq={avg_seq}, ~{est_samples_per_batch} samp/batch)")
         if val_loader:
             print(f"  Val batches:   {len(val_loader)}")
         else:
@@ -302,44 +291,13 @@ def main():
     if is_main:
         print(f"\nSetting up optimizer...")
 
-    # Scale learning rate for distributed training (linear scaling rule)
     effective_lr = args.lr * train_util.get_world_size() if is_dist else args.lr
-
-    if args.optim_8bit:
-        try:
-            import bitsandbytes as bnb
-            optimizer = bnb.optim.AdamW8bit(
-                model.parameters(),
-                lr           = effective_lr,
-                betas        = (0.9, 0.95),
-                weight_decay = args.weight_decay,
-            )
-            if is_main:
-                print("  Using 8-bit AdamW (saves ~12GB optimizer memory)")
-        except (ImportError, RuntimeError) as e:
-            if is_main:
-                print(f"  WARNING: bitsandbytes not available ({type(e).__name__}), falling back to standard AdamW")
-                print("           Install/fix with: pip install bitsandbytes")
-            optimizer = torch.optim.AdamW(
-                model.parameters(),
-                lr           = effective_lr,
-                betas        = (0.9, 0.95),
-                weight_decay = args.weight_decay,
-                fused        = True,
-            )
-    else:
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr           = effective_lr,
-            betas        = (0.9, 0.95),
-            weight_decay = args.weight_decay,
-            fused        = True,
-        )
+    optimizer    = train_util.create_optimizer(model, effective_lr, args.weight_decay,
+                       optim_8bit=args.optim_8bit)
 
     total_steps  = batches_per_epoch * args.epochs // args.grad_accum
     warmup_steps = int(total_steps * args.warmup_ratio)
-
-    scheduler = tf.get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    scheduler    = tf.get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
     if is_main:
         if is_dist:
@@ -353,22 +311,10 @@ def main():
     best_val_loss = float('inf')
 
     if args.checkpoint:
-        checkpoint = torch.load(args.checkpoint, map_location=device)
-
-        load_target = train_util.unwrap_model(model)
-        load_target.load_state_dict(checkpoint['model_state_dict'])
-
-        if 'optimizer_state_dict' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-
-        if 'scheduler_state_dict' in checkpoint:
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-
-        start_epoch   = checkpoint.get('epoch', 0)
-        best_val_loss = checkpoint.get('config', {}).get('best_val_loss', float('inf'))
-
-        if is_main:
-            print(f"  Loaded checkpoint from {args.checkpoint} (epoch {start_epoch})")
+        ckpt_info     = train_util.load_checkpoint(model, optimizer, scheduler,
+                            args.checkpoint, device)
+        start_epoch   = ckpt_info['epoch']
+        best_val_loss = ckpt_info['best_val_loss']
 
     # save config
     if is_main:
@@ -393,7 +339,6 @@ def main():
 
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
-    # Setup label smoothing loss if enabled
     if args.label_smoothing > 0:
         loss_fct = LigerCrossEntropyLoss(ignore_index=-100, label_smoothing=args.label_smoothing)
         if is_main:
@@ -401,14 +346,12 @@ def main():
     else:
         loss_fct = None
 
-    # Enable gradient checkpointing if requested
     if args.gradient_checkpointing:
         if hasattr(raw_model.decoder, 'gradient_checkpointing_enable'):
             raw_model.decoder.gradient_checkpointing_enable()
         if is_main:
             print("  Gradient checkpointing: enabled")
 
-    # Print progress logging info
     optimizer_steps_per_epoch = batches_per_epoch // args.grad_accum
     if is_main:
         print(f"  Progress logging: every {args.log_every_pct}% ({batches_per_epoch * args.log_every_pct // 100} batches)")
@@ -421,7 +364,7 @@ def main():
         print("  torch.compile: first batch will be slow (one-time compilation)")
 
     patience_counter = 0
-    global_step = 0
+    global_step      = 0
 
     # Start memory watcher if enabled
     mem_watcher = None
@@ -449,30 +392,31 @@ def main():
             print(f"\nEpoch {epoch + 1}/{args.epochs}")
             print('-' * 40)
 
-        # Sync distributed sampler epoch for validation only
         if val_dist_sampler:
             val_dist_sampler.set_epoch(epoch)
         if val_dataset:
             val_dataset.set_epoch(epoch)
 
-        # train epoch
         model.train()
         total_train_loss = 0
 
         optimizer.zero_grad(set_to_none=True)
 
-        # Progress tracking
-        num_batches  = batches_per_epoch
-        log_interval = max(1, num_batches * args.log_every_pct // 100)
-        last_logged_pct = -1
+        num_batches      = batches_per_epoch
+        log_interval     = max(1, num_batches * args.log_every_pct // 100)
+        last_logged_pct  = -1
         epoch_start_time = time.time()
 
         for step, batch in enumerate(train_loader):
             if batch is None:
                 continue
+
+            if step == 0 and is_main:
+                ids_shape = batch['input_ids'].shape if torch.is_tensor(batch['input_ids']) else 'N/A'
+                print(f"  First batch: input_ids={ids_shape}, prefix_len={batch.get('prefix_len', 'N/A')}")
+
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
 
-            # Only sync gradients on accumulation boundary
             is_sync_step = (step + 1) % args.grad_accum == 0
             sync_context = nullcontext() if (not is_dist or is_sync_step) else model.no_sync()
 
@@ -484,7 +428,6 @@ def main():
                         prefix_len = batch.get('prefix_len', 0),
                     )
 
-                    # Use label smoothing loss if enabled
                     if loss_fct is not None:
                         logits = outputs['logits']
                         loss   = loss_fct(logits.reshape(-1, raw_model.vocab_size), batch['labels'].reshape(-1))
@@ -496,9 +439,7 @@ def main():
 
                     loss = loss / args.grad_accum
 
-                # Save loss value before backward
                 loss_val = loss.item() * args.grad_accum
-
                 loss.backward()
 
             del outputs, loss, batch
@@ -510,28 +451,26 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
-                # Step-based checkpoint saving (rank 0 only)
-                if args.save_steps and global_step % args.save_steps == 0 and is_main:
-                    save_path = output_dir / f'checkpoint_step_{global_step}.pt'
-                    step_model = train_util.unwrap_model(model)
-                    checkpoint = {
-                        'epoch':                epoch,
-                        'global_step':          global_step,
-                        'model_state_dict':     step_model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict(),
-                        'config':               {'best_val_loss': best_val_loss},
-                    }
-                    torch.save(checkpoint, save_path)
-                    print(f"  [Step {global_step}] Saved checkpoint: {save_path.name}")
+                if global_step % 100 == 0 and global_step > 0 and is_main:
+                    elapsed     = time.time() - epoch_start_time
+                    batch_per_s = (step + 1) / elapsed if elapsed > 0 else 0
+                    print(f"  step {global_step} | loss {loss_val:.4f} | "
+                          f"batch {step+1}/{num_batches} | "
+                          f"{batch_per_s:.1f} batch/s")
 
-                # Periodic cache clearing
+                if args.save_steps and global_step % args.save_steps == 0:
+                    train_util.save_checkpoint(model, optimizer, scheduler, epoch,
+                        output_dir / f'checkpoint_step_{global_step}.pt',
+                        config={'best_val_loss': best_val_loss},
+                        global_step=global_step)
+                    if is_main:
+                        print(f"  [Step {global_step}] Saved checkpoint")
+
                 if args.empty_cache_steps and global_step % args.empty_cache_steps == 0:
                     torch.cuda.empty_cache()
 
             total_train_loss += loss_val
 
-            # Progress logging every N%
             current_pct = (step + 1) * 100 // num_batches
             if train_logger and current_pct >= last_logged_pct + args.log_every_pct:
                 last_logged_pct = (current_pct // args.log_every_pct) * args.log_every_pct
@@ -551,49 +490,15 @@ def main():
 
         train_loss = total_train_loss / max(num_batches, 1)
 
-        # Sync train loss across processes
         if is_dist:
             loss_tensor = torch.tensor([train_loss], device=device)
             train_util.all_reduce_mean(loss_tensor)
             train_loss = loss_tensor.item()
 
-        # evaluate
+        # validate
         val_loss = float('inf')
-
         if val_loader:
-            model.eval()
-            total_val_loss = 0
-            num_batches    = 0
-
-            with torch.no_grad():
-                for batch in val_loader:
-                    if batch is None:
-                        continue
-                    batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
-
-                    with torch.amp.autocast('cuda', dtype=dtype):
-                        outputs = model(
-                            input_ids  = batch['input_ids'],
-                            labels     = batch['labels'],
-                            prefix_len = batch.get('prefix_len', 0),
-                        )
-
-                    total_val_loss += outputs['loss'].item()
-                    num_batches    += 1
-
-                    del outputs, batch
-
-            val_loss = total_val_loss / max(num_batches, 1)
-
-            # Sync val loss across processes
-            if is_dist:
-                val_tensor = torch.tensor([val_loss], device=device)
-                train_util.all_reduce_mean(val_tensor)
-                val_loss = val_tensor.item()
-
-        if is_main and collator._dropped > 0:
-            print(f"  Dropped {collator._dropped} oversized samples (>{collator.max_seq_len} tokens)")
-            collator._dropped = 0
+            val_loss = train_util.validate_prefixlm(model, val_loader, device, dtype, is_dist)
 
         if train_logger:
             train_logger.log_epoch(epoch + 1, train_loss, val_loss, scheduler.get_last_lr()[0])
@@ -607,10 +512,7 @@ def main():
             print(f"  Eval: exon_F1={eval_metrics['exon_f1']:.4f}  gene_F1={eval_metrics['gene_f1']:.4f}  "
                   f"({eval_metrics['num_predicted']} predicted, {eval_metrics['eval_sec']}s)")
 
-        # checkpointing (rank 0 saves, all ranks wait)
-        save_model = train_util.unwrap_model(model)
-
-        # When no val data, use train loss for best-model selection
+        # checkpointing
         track_loss = val_loss if val_loader else train_loss
 
         if track_loss < best_val_loss:
@@ -620,18 +522,9 @@ def main():
             if is_main:
                 print(f"  New best! Saving best_model.pt")
 
-                save_path = output_dir / 'best_model.pt'
-                save_path.parent.mkdir(parents=True, exist_ok=True)
-
-                checkpoint = {
-                    'epoch':                epoch + 1,
-                    'model_state_dict':     save_model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'config':               {'best_val_loss': best_val_loss, 'best_epoch': epoch + 1},
-                }
-                torch.save(checkpoint, save_path)
-
+            train_util.save_checkpoint(model, optimizer, scheduler, epoch + 1,
+                output_dir / 'best_model.pt',
+                config={'best_val_loss': best_val_loss, 'best_epoch': epoch + 1})
             train_util.barrier()
         else:
             patience_counter += 1
@@ -644,18 +537,10 @@ def main():
                     print(f"\n  Early stopping!")
                 break
 
-        if (epoch + 1) % args.save_every == 0 and is_main:
-            save_path = output_dir / 'checkpoint_latest.pt'
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-
-            checkpoint = {
-                'epoch':                epoch + 1,
-                'model_state_dict':     save_model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'config':               {'best_val_loss': best_val_loss},
-            }
-            torch.save(checkpoint, save_path)
+        if (epoch + 1) % args.save_every == 0:
+            train_util.save_checkpoint(model, optimizer, scheduler, epoch + 1,
+                output_dir / 'checkpoint_latest.pt',
+                config={'best_val_loss': best_val_loss})
 
         train_util.barrier()
 
@@ -671,16 +556,7 @@ def main():
     if is_main:
         print(f"\n{'=' * 60}")
         print('Saving final model...')
-
-        final_model = train_util.unwrap_model(model)
-        final_model.save(output_dir / 'pytorch_model.bin')
-        tokenizer.save_pretrained(output_dir)
-
-        model_path = pathlib.Path(args.model_path)
-        with open(model_path / 'config.json') as f:
-            model_config = json.load(f)
-        with open(output_dir / 'config.json', 'w') as f:
-            json.dump(model_config, f, indent=2)
+        train_util.save_final_model(model, tokenizer, args.model_path, output_dir)
 
         print(f"\n{'=' * 60}")
         print(f"Complete!")
@@ -688,7 +564,6 @@ def main():
         print(f"  Best Val Loss: {best_val_loss:.4f}")
         print(f"{'=' * 60}")
 
-    # cleanup distributed
     if is_dist:
         train_util.cleanup_distributed()
 

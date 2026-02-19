@@ -1,4 +1,6 @@
 import os
+import json
+import random
 from pathlib import Path
 
 import torch
@@ -449,6 +451,42 @@ def evaluate_seq2seq_distributed(model, dataloader, device, use_amp=True):
     return avg_loss, avg_moe_loss
 
 
+def validate_prefixlm(model, val_loader, device, dtype, is_dist=False):
+    """Run validation loop for prefix-LM models with distributed sync"""
+
+    model.eval()
+    total_val_loss = 0
+    num_batches    = 0
+
+    with torch.no_grad():
+        for batch in val_loader:
+            if batch is None:
+                continue
+            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+
+            with torch.amp.autocast('cuda', dtype=dtype):
+                outputs = model(
+                    input_ids  = batch['input_ids'],
+                    labels     = batch['labels'],
+                    prefix_len = batch.get('prefix_len', 0),
+                )
+
+            total_val_loss += outputs['loss'].item()
+            num_batches    += 1
+
+            del outputs, batch
+
+    val_loss = total_val_loss / max(num_batches, 1)
+
+    if is_dist:
+        val_tensor = torch.tensor([val_loss], device=device)
+        all_reduce_mean(val_tensor)
+        val_loss = val_tensor.item()
+
+    model.train()
+    return val_loss
+
+
 ##################################
 #####  Checkpoint Functions  #####
 ##################################
@@ -482,28 +520,31 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path, device="cpu"):
     }
 
 
-def save_checkpoint(model, optimizer, scheduler, epoch, save_path, config=None):
+def save_checkpoint(model, optimizer, scheduler, epoch, save_path, config=None, global_step=None):
     """Save model, optimizer, and scheduler states (only on main process)"""
-    
+
     if not is_main_process():
         return
-    
+
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     # Unwrap DDP model for saving
     target_model = unwrap_model(model)
-    
+
     checkpoint = {
         "epoch":                epoch,
         "model_state_dict":     target_model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
     }
-    
+
+    if global_step is not None:
+        checkpoint["global_step"] = global_step
+
     if config:
         checkpoint["config"] = config
-    
+
     torch.save(checkpoint, save_path)
 
 
@@ -518,6 +559,20 @@ def save_checkpoint_distributed(model, optimizer, scheduler, epoch, save_path, c
         save_checkpoint(model, optimizer, scheduler, epoch, save_path, config)
     
     barrier()  # Wait for save to complete
+
+
+def save_final_model(model, tokenizer, model_path, output_dir):
+    """Save final model weights, tokenizer, and config"""
+
+    final_model = unwrap_model(model)
+    final_model.save(output_dir / 'pytorch_model.bin')
+    tokenizer.save_pretrained(output_dir)
+
+    model_path = Path(model_path)
+    with open(model_path / 'config.json') as f:
+        model_config = json.load(f)
+    with open(output_dir / 'config.json', 'w') as f:
+        json.dump(model_config, f, indent=2)
 
 
 ###################################
@@ -618,6 +673,58 @@ def prepare_optimizer_scheduler_distributed(
     return optimizer, scheduler
 
 
+def apply_mxfp8(model):
+    """Apply MXFP8 quantization to eligible Linear layers"""
+
+    from torchao.prototype.mx_formats import MXLinearConfig
+    from torchao.quantization import quantize_
+
+    mx_config = MXLinearConfig.from_recipe_name("mxfp8_cublas")
+
+    def mxfp8_filter(mod, fqn):
+        if not isinstance(mod, torch.nn.Linear):
+            return False
+        if mod.in_features % 32 != 0 or mod.out_features % 32 != 0:
+            return False
+        return True
+
+    quantize_(model, mx_config, filter_fn=mxfp8_filter)
+    n_mx = sum(1 for _, m in model.named_modules() if type(m).__name__ == 'MXLinear')
+
+    if is_main_process():
+        print(f"  MXFP8: converted {n_mx} Linear layers to MXLinear")
+
+
+def create_optimizer(model, lr, weight_decay, optim_8bit=False,
+                     betas=(0.9, 0.95), fused=True):
+    """Create AdamW optimizer with optional 8-bit mode and fallback"""
+
+    if optim_8bit:
+        try:
+            import bitsandbytes as bnb
+            optimizer = bnb.optim.AdamW8bit(
+                model.parameters(),
+                lr           = lr,
+                betas        = betas,
+                weight_decay = weight_decay,
+            )
+            if is_main_process():
+                print("  Using 8-bit AdamW (saves ~12GB optimizer memory)")
+            return optimizer
+        except (ImportError, RuntimeError) as e:
+            if is_main_process():
+                print(f"  WARNING: bitsandbytes not available ({type(e).__name__}), falling back to standard AdamW")
+                print("           Install/fix with: pip install bitsandbytes")
+
+    return torch.optim.AdamW(
+        model.parameters(),
+        lr           = lr,
+        betas        = betas,
+        weight_decay = weight_decay,
+        fused        = fused,
+    )
+
+
 ###############################
 #####  Utility Functions  #####
 ###############################
@@ -649,6 +756,16 @@ def log_metrics(metrics, epoch, step=None, prefix=""):
     else:
         header = f"[Epoch {epoch}]"
     
-    metric_str = " | ".join([f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}" 
+    metric_str = " | ".join([f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}"
                              for k, v in metrics.items()])
     print(f"{prefix}{header} {metric_str}")
+
+
+def set_seeds(seed):
+    """Set random seeds for reproducibility"""
+
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.set_float32_matmul_precision('high')

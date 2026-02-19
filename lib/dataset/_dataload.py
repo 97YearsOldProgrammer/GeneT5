@@ -1,4 +1,5 @@
 import os
+import math
 import bisect
 import random
 
@@ -187,8 +188,9 @@ class BinaryTrainDataset:
 #####################
 
 
-PAD_BUCKETS = [2048, 4096, 6144, 8192]
+PAD_BUCKETS     = [2048, 4096, 6144, 8192, 16384]
 DEFAULT_MAX_SEQ = PAD_BUCKETS[-1]
+BUDGET_SEQ      = 8192
 
 
 def _bucket_pad(length):
@@ -197,7 +199,35 @@ def _bucket_pad(length):
     for b in PAD_BUCKETS:
         if length <= b:
             return b
-    return PAD_BUCKETS[-1]
+    step = PAD_BUCKETS[-1] - PAD_BUCKETS[-2]
+    return PAD_BUCKETS[-1] + step * ((length - PAD_BUCKETS[-1] + step - 1) // step)
+
+
+def token_budget_batcher(source, budget, max_batch, collator):
+    """Yield variable-size batches that fit within a token budget"""
+
+    buf     = []
+    buf_max = 0
+
+    for sample in source:
+        seq_len  = len(sample["input_ids"])
+        new_max  = max(buf_max, seq_len)
+        new_cost = _bucket_pad(new_max) * (len(buf) + 1)
+
+        if buf and (new_cost > budget or len(buf) + 1 > max_batch):
+            result = collator(buf)
+            if result is not None:
+                yield result
+            buf     = []
+            buf_max = 0
+
+        buf.append(sample)
+        buf_max = max(buf_max, seq_len)
+
+    if buf:
+        result = collator(buf)
+        if result is not None:
+            yield result
 
 
 class PrefixLMCollator:
@@ -213,9 +243,12 @@ class PrefixLMCollator:
     def __call__(self, batch):
 
         # Drop oversized samples — gene boundaries can't be split
-        kept = [b for b in batch if len(b["input_ids"]) <= self.max_seq_len]
-        if len(kept) < len(batch):
-            self._dropped += len(batch) - len(kept)
+        if self.max_seq_len is not None:
+            kept = [b for b in batch if len(b["input_ids"]) <= self.max_seq_len]
+            if len(kept) < len(batch):
+                self._dropped += len(batch) - len(kept)
+        else:
+            kept = batch
         if not kept:
             return None
 
@@ -232,13 +265,14 @@ class PrefixLMCollator:
             aligned.append(prefix + gap + target)
 
         # Drop sequences that grew past max_seq_len after prefix alignment
-        pairs = [(a, k) for a, k in zip(aligned, kept) if len(a) <= self.max_seq_len]
-        if not pairs:
-            return None
-        if len(pairs) < len(aligned):
-            self._dropped += len(aligned) - len(pairs)
-        aligned = [p[0] for p in pairs]
-        kept    = [p[1] for p in pairs]
+        if self.max_seq_len is not None:
+            pairs = [(a, k) for a, k in zip(aligned, kept) if len(a) <= self.max_seq_len]
+            if not pairs:
+                return None
+            if len(pairs) < len(aligned):
+                self._dropped += len(aligned) - len(pairs)
+            aligned = [p[0] for p in pairs]
+            kept    = [p[1] for p in pairs]
 
         max_len = _bucket_pad(max(len(a) for a in aligned))
 
@@ -253,10 +287,17 @@ class PrefixLMCollator:
             # Model input: all tokens except last (teacher forcing)
             all_input_ids.append(padded[:-1])
 
-            # Labels: mask prefix, keep target, mask tail pads
-            shifted = padded[1:]
-            labels  = [self.label_pad] * (max_prefix - 1)
-            labels += shifted[max_prefix - 1 : max_prefix - 1 + target_len]
+            # Labels: mask prefix+gap, keep target, mask tail pads
+            shifted  = padded[1:]
+            gap_size = max_prefix - kept[i]["prefix_len"]
+            if gap_size > 0:
+                mask_len  = max_prefix
+                n_targets = target_len - 1
+            else:
+                mask_len  = max_prefix - 1
+                n_targets = target_len
+            labels  = [self.label_pad] * mask_len
+            labels += shifted[mask_len : mask_len + n_targets]
             labels += [self.label_pad] * (max_len - 1 - len(labels))
             all_labels.append(labels)
 

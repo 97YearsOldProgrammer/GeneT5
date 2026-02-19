@@ -65,6 +65,7 @@ class GeneT5(nn.Module):
 
         x      = self.embed(input_ids)
         x      = self.embed_dropout(x)
+        torch._dynamo.mark_dynamic(x, 0)
         torch._dynamo.mark_dynamic(x, 1)
         x, moe = self.decoder(x, prefix_len=prefix_len)
         logits = self.lm_head(x)
