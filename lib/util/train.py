@@ -633,123 +633,52 @@ def apply_mxfp8(model):
         print(f"  MXFP8: converted {n_mx} Linear layers to MXLinear")
 
 
-def _newton_schulz(G, steps=5):
-    """Batched Newton-Schulz orthogonalization (supports ndim >= 2)
+class WrappedOptimizer:
+    """AdamW wrapper with scheduler interface used by bin/finet
 
-    From KellerJordan/Muon — uses dim=(-2,-1) and batched @ so each
-    expert's [embed, ff] slice is orthogonalized independently
+    Supports optional 8-bit AdamW via bitsandbytes for memory savings
     """
 
-    a, b, c = (3.4445, -4.7750, 2.0315)
-    X       = G.bfloat16()
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-    for _ in range(steps):
-        A = X @ X.mT
-        B = b * A + c * A @ A
-        X = a * X + B @ X
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-    return X
+    def __init__(self, model, lr, weight_decay, use_8bit=False):
 
+        params = [p for p in model.parameters() if p.requires_grad]
 
-class MuonAdamW:
-    """Muon for matrix weights + AdamW for embeddings/norms
-
-    Custom Muon step with Keller Jordan's batched Newton-Schulz iteration
-    which handles ndim >= 2 natively (orthogonalizes each expert's 2D slice
-    independently without reshaping)
-    """
-
-    def __init__(self, model, muon_lr, adam_lr, weight_decay, momentum=0.95):
-
-        self._muon_params = []
-        adam_params        = []
-
-        for name, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
-            if p.ndim >= 2 and 'embed' not in name:
-                self._muon_params.append(p)
-            else:
-                adam_params.append(p)
-
-        self._muon_bufs = [torch.zeros_like(p) for p in self._muon_params]
-        self._momentum  = momentum
-        self._wd        = weight_decay
-
-        # Dummy optimizer for LR scheduling (Muon step is manual)
-        self._lr_proxy = torch.optim.SGD([torch.zeros(1)], lr=muon_lr)
-
-        self.adam = torch.optim.AdamW(
-            adam_params,
-            lr           = adam_lr,
-            weight_decay = weight_decay,
-            fused        = True,
-        )
+        if use_8bit:
+            import bitsandbytes as bnb
+            self._opt = bnb.optim.AdamW8bit(
+                params,
+                lr           = lr,
+                weight_decay = weight_decay,
+            )
+        else:
+            self._opt = torch.optim.AdamW(
+                params,
+                lr           = lr,
+                weight_decay = weight_decay,
+                fused        = True,
+            )
         self._schedulers = []
 
     def step(self):
 
-        lr = self._lr_proxy.param_groups[0]['lr']
-
-        for p, buf in zip(self._muon_params, self._muon_bufs):
-            if p.grad is None:
-                continue
-            grad = p.grad
-
-            # Momentum + Nesterov
-            buf.lerp_(grad, 1 - self._momentum)
-            update = grad.lerp_(buf, self._momentum)
-
-            # Orthogonalize via Newton-Schulz
-            update = _newton_schulz(update)
-
-            # Scale by aspect ratio
-            update *= max(1, p.size(-2) / p.size(-1)) ** 0.5
-
-            # Weight decay + LR step
-            p.data.add_(update, alpha=-lr)
-            p.data.mul_(1 - lr * self._wd)
-
-        self.adam.step()
+        self._opt.step()
 
     def zero_grad(self, set_to_none=False):
 
-        for p in self._muon_params:
-            if set_to_none:
-                p.grad = None
-            elif p.grad is not None:
-                p.grad.zero_()
-        self.adam.zero_grad(set_to_none=set_to_none)
+        self._opt.zero_grad(set_to_none=set_to_none)
 
     def state_dict(self):
 
-        muon_state = {
-            'bufs':     [buf.clone() for buf in self._muon_bufs],
-            'lr_proxy': self._lr_proxy.state_dict(),
-        }
-        return {'muon': muon_state, 'adam': self.adam.state_dict()}
+        return {'adam': self._opt.state_dict()}
 
     def load_state_dict(self, state_dict):
 
-        if 'muon' not in state_dict:
-            return
-        muon_state = state_dict['muon']
-        if 'bufs' in muon_state:
-            for buf, saved in zip(self._muon_bufs, muon_state['bufs']):
-                buf.copy_(saved)
-            if 'lr_proxy' in muon_state:
-                self._lr_proxy.load_state_dict(muon_state['lr_proxy'])
-        self.adam.load_state_dict(state_dict['adam'])
+        sd = state_dict.get('adam', state_dict)
+        self._opt.load_state_dict(sd)
 
     def create_schedulers(self, schedule_fn, warmup_steps, total_steps):
 
-        self._schedulers = [
-            schedule_fn(self._lr_proxy, warmup_steps, total_steps),
-            schedule_fn(self.adam, warmup_steps, total_steps),
-        ]
+        self._schedulers = [schedule_fn(self._opt, warmup_steps, total_steps)]
 
     def step_schedulers(self):
 
@@ -762,26 +691,25 @@ class MuonAdamW:
 
     def parameters(self):
 
-        yield from self._muon_params
-        for g in self.adam.param_groups:
+        for g in self._opt.param_groups:
             for p in g['params']:
                 yield p
 
+    @property
+    def param_groups(self):
 
-def create_optimizer(model, lr, weight_decay):
-    """Create Muon+AdamW optimizer (Muon for matrix weights, AdamW for rest)"""
+        return self._opt.param_groups
 
-    adam_lr = lr * 0.015
 
-    opt = MuonAdamW(model, muon_lr=lr, adam_lr=adam_lr, weight_decay=weight_decay)
+def create_optimizer(model, lr, weight_decay, use_8bit=False):
+    """Create AdamW optimizer with optional 8-bit quantization"""
+
+    opt = WrappedOptimizer(model, lr, weight_decay, use_8bit=use_8bit)
 
     if is_main_process():
-        n_muon = len(opt._muon_params)
-        n_adam = sum(len(g['params']) for g in opt.adam.param_groups)
-        p_muon = sum(p.numel() for p in opt._muon_params)
-        p_adam = sum(p.numel() for g in opt.adam.param_groups for p in g['params'])
-        print(f"  Muon:  {n_muon} tensors, {p_muon:,} params (lr={lr})")
-        print(f"  AdamW: {n_adam} tensors, {p_adam:,} params (lr={adam_lr:.6f})")
+        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        kind     = "AdamW-8bit" if use_8bit else "AdamW-fused"
+        print(f"  {kind}: {n_params:,} params (lr={lr})")
 
     return opt
 

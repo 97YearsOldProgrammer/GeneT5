@@ -8,11 +8,11 @@ import pathlib
 import os
 
 import torch
-import torch.distributed as dist
-import webdataset as wds
+import torch.distributed    as dist
+import webdataset           as wds
 
-import torch.utils.data as data_utils
-import transformers as tf
+import torch.utils.data     as data_utils
+import transformers         as tf
 
 from contextlib import nullcontext
 from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
@@ -26,7 +26,7 @@ import lib.util.train   as train_util
 
 DEFAULTS = {
     'batch_size':     8,
-    'lr':             0.02,
+    'lr':             1e-4,
     'epochs':         3,
     'weight_decay':   0.1,
     'warmup_ratio':   0.03,
@@ -84,6 +84,8 @@ def build_parser():
         help='disable pin_memory in dataloaders (can reduce CPU memory pressure)')
     parser.add_argument('--memwatch', action='store_true',
         help='enable background memory monitoring to CSV (first 5min: 5s intervals, then 30s)')
+    parser.add_argument('--optim_8bit', action='store_true',
+        help='use bitsandbytes 8-bit AdamW (saves ~50%% optimizer memory)')
     parser.add_argument('--mxfp8', action='store_true',
         help='apply MXFP8 quantization to dense Linear layers (Blackwell only)')
     parser.add_argument('--compile', action='store_true',
@@ -290,7 +292,8 @@ def main():
         print(f"\nSetting up optimizer...")
 
     effective_lr = args.lr * train_util.get_world_size() if is_dist else args.lr
-    optimizer    = train_util.create_optimizer(model, effective_lr, args.weight_decay)
+    optimizer    = train_util.create_optimizer(model, effective_lr, args.weight_decay,
+                       use_8bit=args.optim_8bit)
 
     total_steps  = batches_per_epoch * args.epochs // args.grad_accum
     warmup_steps = int(total_steps * args.warmup_ratio)
