@@ -75,6 +75,7 @@ class MoE(nn.Module):
 
         self._grouped_mm_available = hasattr(torch, '_grouped_mm')
 
+    @torch.compiler.disable
     def _prepare_expert_batches(self, top_k_indices, top_k_probs, num_tokens, device):
         """Prepare sorted token batches for fused expert computation"""
 
@@ -107,7 +108,8 @@ class MoE(nn.Module):
         if sorted_tokens.shape[0] == 0:
             return output
 
-        sorted_input = x_flat[sorted_tokens]
+        idx_e        = sorted_tokens.unsqueeze(-1).expand(-1, embed_dim)
+        sorted_input = torch.gather(x_flat, 0, idx_e)
         offs         = expert_offsets[1:].to(torch.int32)
 
         gate_w = self.expert_weights.gate_weights
@@ -119,7 +121,8 @@ class MoE(nn.Module):
         hidden   = LigerSiLUMulFunction.apply(gate_out, up_out)
         out      = torch._grouped_mm(hidden, down_w, offs=offs)
 
-        output.index_add_(0, sorted_tokens, (out * sorted_weights.unsqueeze(-1)).to(output.dtype))
+        weighted = (out * sorted_weights.unsqueeze(-1)).to(output.dtype)
+        output   = output.scatter_add(0, idx_e, weighted)
 
         return output
 

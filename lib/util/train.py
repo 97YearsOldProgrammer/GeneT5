@@ -7,8 +7,7 @@ import torch
 import torch.nn             as nn
 import torch.distributed    as dist
 
-from torch.optim  import AdamW
-from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup, EncoderDecoderModel
+
 
 
 
@@ -536,8 +535,10 @@ def save_checkpoint(model, optimizer, scheduler, epoch, save_path, config=None, 
         "epoch":                epoch,
         "model_state_dict":     target_model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
     }
+
+    if scheduler is not None:
+        checkpoint["scheduler_state_dict"] = scheduler.state_dict()
 
     if global_step is not None:
         checkpoint["global_step"] = global_step
@@ -610,69 +611,6 @@ def prepare_tokenizer(model_path):
     return GeneTokenizer(model_path)
 
 
-def prepare_optimizer_scheduler(model, train_loader, lr, weight_decay, 
-                                epochs, grad_accum, warmup_ratio, scheduler_type="linear"):
-    """Prepare optimizer and scheduler."""
-
-    total_steps  = len(train_loader) * epochs // grad_accum
-    warmup_steps = int(total_steps * warmup_ratio)
-    
-    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    
-    if scheduler_type == "cosine":
-        scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-    else:
-        scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-    
-    return optimizer, scheduler
-
-
-def prepare_optimizer_scheduler_distributed(
-    model,
-    train_loader,
-    lr,
-    weight_decay,
-    epochs,
-    grad_accum,
-    warmup_ratio,
-    scheduler_type = "cosine",
-    betas          = (0.9, 0.95),
-):
-    """
-    Prepare optimizer and scheduler for distributed training.
-    
-    Accounts for world size in learning rate scaling (linear scaling rule).
-    """
-    from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
-    
-    world_size   = get_world_size()
-    total_steps  = len(train_loader) * epochs // grad_accum
-    warmup_steps = int(total_steps * warmup_ratio)
-    
-    # Linear scaling rule for distributed training
-    scaled_lr = lr * world_size
-    
-    optimizer = AdamW(
-        model.parameters(),
-        lr           = scaled_lr,
-        betas        = betas,
-        weight_decay = weight_decay,
-    )
-    
-    if scheduler_type == "cosine":
-        scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-    else:
-        scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-    
-    if is_main_process():
-        print(f"  Base LR:      {lr}")
-        print(f"  Scaled LR:    {scaled_lr} (world_size={world_size})")
-        print(f"  Total steps:  {total_steps}")
-        print(f"  Warmup steps: {warmup_steps}")
-    
-    return optimizer, scheduler
-
-
 def apply_mxfp8(model):
     """Apply MXFP8 quantization to eligible Linear layers"""
 
@@ -695,34 +633,157 @@ def apply_mxfp8(model):
         print(f"  MXFP8: converted {n_mx} Linear layers to MXLinear")
 
 
-def create_optimizer(model, lr, weight_decay, optim_8bit=False,
-                     betas=(0.9, 0.95), fused=True):
-    """Create AdamW optimizer with optional 8-bit mode and fallback"""
+def _newton_schulz(G, steps=5):
+    """Batched Newton-Schulz orthogonalization (supports ndim >= 2)
 
-    if optim_8bit:
-        try:
-            import bitsandbytes as bnb
-            optimizer = bnb.optim.AdamW8bit(
-                model.parameters(),
-                lr           = lr,
-                betas        = betas,
-                weight_decay = weight_decay,
-            )
-            if is_main_process():
-                print("  Using 8-bit AdamW (saves ~12GB optimizer memory)")
-            return optimizer
-        except (ImportError, RuntimeError) as e:
-            if is_main_process():
-                print(f"  WARNING: bitsandbytes not available ({type(e).__name__}), falling back to standard AdamW")
-                print("           Install/fix with: pip install bitsandbytes")
+    From KellerJordan/Muon — uses dim=(-2,-1) and batched @ so each
+    expert's [embed, ff] slice is orthogonalized independently
+    """
 
-    return torch.optim.AdamW(
-        model.parameters(),
-        lr           = lr,
-        betas        = betas,
-        weight_decay = weight_decay,
-        fused        = fused,
-    )
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X       = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    for _ in range(steps):
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+
+class MuonAdamW:
+    """Muon for matrix weights + AdamW for embeddings/norms
+
+    Custom Muon step with Keller Jordan's batched Newton-Schulz iteration
+    which handles ndim >= 2 natively (orthogonalizes each expert's 2D slice
+    independently without reshaping)
+    """
+
+    def __init__(self, model, muon_lr, adam_lr, weight_decay, momentum=0.95):
+
+        self._muon_params = []
+        adam_params        = []
+
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim >= 2 and 'embed' not in name:
+                self._muon_params.append(p)
+            else:
+                adam_params.append(p)
+
+        self._muon_bufs = [torch.zeros_like(p) for p in self._muon_params]
+        self._momentum  = momentum
+        self._wd        = weight_decay
+
+        # Dummy optimizer for LR scheduling (Muon step is manual)
+        self._lr_proxy = torch.optim.SGD([torch.zeros(1)], lr=muon_lr)
+
+        self.adam = torch.optim.AdamW(
+            adam_params,
+            lr           = adam_lr,
+            weight_decay = weight_decay,
+            fused        = True,
+        )
+        self._schedulers = []
+
+    def step(self):
+
+        lr = self._lr_proxy.param_groups[0]['lr']
+
+        for p, buf in zip(self._muon_params, self._muon_bufs):
+            if p.grad is None:
+                continue
+            grad = p.grad
+
+            # Momentum + Nesterov
+            buf.lerp_(grad, 1 - self._momentum)
+            update = grad.lerp_(buf, self._momentum)
+
+            # Orthogonalize via Newton-Schulz
+            update = _newton_schulz(update)
+
+            # Scale by aspect ratio
+            update *= max(1, p.size(-2) / p.size(-1)) ** 0.5
+
+            # Weight decay + LR step
+            p.data.add_(update, alpha=-lr)
+            p.data.mul_(1 - lr * self._wd)
+
+        self.adam.step()
+
+    def zero_grad(self, set_to_none=False):
+
+        for p in self._muon_params:
+            if set_to_none:
+                p.grad = None
+            elif p.grad is not None:
+                p.grad.zero_()
+        self.adam.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self):
+
+        muon_state = {
+            'bufs':     [buf.clone() for buf in self._muon_bufs],
+            'lr_proxy': self._lr_proxy.state_dict(),
+        }
+        return {'muon': muon_state, 'adam': self.adam.state_dict()}
+
+    def load_state_dict(self, state_dict):
+
+        if 'muon' not in state_dict:
+            return
+        muon_state = state_dict['muon']
+        if 'bufs' in muon_state:
+            for buf, saved in zip(self._muon_bufs, muon_state['bufs']):
+                buf.copy_(saved)
+            if 'lr_proxy' in muon_state:
+                self._lr_proxy.load_state_dict(muon_state['lr_proxy'])
+        self.adam.load_state_dict(state_dict['adam'])
+
+    def create_schedulers(self, schedule_fn, warmup_steps, total_steps):
+
+        self._schedulers = [
+            schedule_fn(self._lr_proxy, warmup_steps, total_steps),
+            schedule_fn(self.adam, warmup_steps, total_steps),
+        ]
+
+    def step_schedulers(self):
+
+        for s in self._schedulers:
+            s.step()
+
+    def get_last_lr(self):
+
+        return self._schedulers[0].get_last_lr() if self._schedulers else [0.0]
+
+    def parameters(self):
+
+        yield from self._muon_params
+        for g in self.adam.param_groups:
+            for p in g['params']:
+                yield p
+
+
+def create_optimizer(model, lr, weight_decay):
+    """Create Muon+AdamW optimizer (Muon for matrix weights, AdamW for rest)"""
+
+    adam_lr = lr * 0.015
+
+    opt = MuonAdamW(model, muon_lr=lr, adam_lr=adam_lr, weight_decay=weight_decay)
+
+    if is_main_process():
+        n_muon = len(opt._muon_params)
+        n_adam = sum(len(g['params']) for g in opt.adam.param_groups)
+        p_muon = sum(p.numel() for p in opt._muon_params)
+        p_adam = sum(p.numel() for g in opt.adam.param_groups for p in g['params'])
+        print(f"  Muon:  {n_muon} tensors, {p_muon:,} params (lr={lr})")
+        print(f"  AdamW: {n_adam} tensors, {p_adam:,} params (lr={adam_lr:.6f})")
+
+    return opt
 
 
 ###############################

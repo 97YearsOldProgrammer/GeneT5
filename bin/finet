@@ -26,7 +26,7 @@ import lib.util.train   as train_util
 
 DEFAULTS = {
     'batch_size':     8,
-    'lr':             1e-4,
+    'lr':             0.02,
     'epochs':         3,
     'weight_decay':   0.1,
     'warmup_ratio':   0.03,
@@ -78,8 +78,6 @@ def build_parser():
         metavar='<int>', help='log progress every N percent of epoch [%(default)i]')
     parser.add_argument('--save_steps', required=False, type=int, default=None,
         metavar='<int>', help='save checkpoint every N optimizer steps (default: end of epoch only)')
-    parser.add_argument('--optim_8bit', action='store_true',
-        help='use 8-bit Adam optimizer (requires bitsandbytes, saves ~50%% optimizer memory)')
     parser.add_argument('--empty_cache_steps', required=False, type=int, default=None,
         metavar='<int>', help='call torch.cuda.empty_cache() every N steps to reduce fragmentation')
     parser.add_argument('--no_pin_memory', action='store_true',
@@ -292,12 +290,11 @@ def main():
         print(f"\nSetting up optimizer...")
 
     effective_lr = args.lr * train_util.get_world_size() if is_dist else args.lr
-    optimizer    = train_util.create_optimizer(model, effective_lr, args.weight_decay,
-                       optim_8bit=args.optim_8bit)
+    optimizer    = train_util.create_optimizer(model, effective_lr, args.weight_decay)
 
     total_steps  = batches_per_epoch * args.epochs // args.grad_accum
     warmup_steps = int(total_steps * args.warmup_ratio)
-    scheduler    = tf.get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    optimizer.create_schedulers(tf.get_cosine_schedule_with_warmup, warmup_steps, total_steps)
 
     if is_main:
         if is_dist:
@@ -311,7 +308,7 @@ def main():
     best_val_loss = float('inf')
 
     if args.checkpoint:
-        ckpt_info     = train_util.load_checkpoint(model, optimizer, scheduler,
+        ckpt_info     = train_util.load_checkpoint(model, optimizer, None,
                             args.checkpoint, device)
         start_epoch   = ckpt_info['epoch']
         best_val_loss = ckpt_info['best_val_loss']
@@ -447,7 +444,7 @@ def main():
             if (step + 1) % args.grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
-                scheduler.step()
+                optimizer.step_schedulers()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
@@ -459,7 +456,7 @@ def main():
                           f"{batch_per_s:.1f} batch/s")
 
                 if args.save_steps and global_step % args.save_steps == 0:
-                    train_util.save_checkpoint(model, optimizer, scheduler, epoch,
+                    train_util.save_checkpoint(model, optimizer, None, epoch,
                         output_dir / f'checkpoint_step_{global_step}.pt',
                         config={'best_val_loss': best_val_loss},
                         global_step=global_step)
@@ -484,7 +481,7 @@ def main():
                     batch         = step + 1,
                     num_batches   = num_batches,
                     loss          = avg_loss,
-                    lr            = scheduler.get_last_lr()[0],
+                    lr            = optimizer.get_last_lr()[0],
                     batch_per_sec = batch_per_sec,
                 )
 
@@ -501,7 +498,7 @@ def main():
             val_loss = train_util.validate_prefixlm(model, val_loader, device, dtype, is_dist)
 
         if train_logger:
-            train_logger.log_epoch(epoch + 1, train_loss, val_loss, scheduler.get_last_lr()[0])
+            train_logger.log_epoch(epoch + 1, train_loss, val_loss, optimizer.get_last_lr()[0])
 
         # Post-epoch eval (rank 0 only)
         if evaluator and is_main:
@@ -522,7 +519,7 @@ def main():
             if is_main:
                 print(f"  New best! Saving best_model.pt")
 
-            train_util.save_checkpoint(model, optimizer, scheduler, epoch + 1,
+            train_util.save_checkpoint(model, optimizer, None, epoch + 1,
                 output_dir / 'best_model.pt',
                 config={'best_val_loss': best_val_loss, 'best_epoch': epoch + 1})
             train_util.barrier()
@@ -538,7 +535,7 @@ def main():
                 break
 
         if (epoch + 1) % args.save_every == 0:
-            train_util.save_checkpoint(model, optimizer, scheduler, epoch + 1,
+            train_util.save_checkpoint(model, optimizer, None, epoch + 1,
                 output_dir / 'checkpoint_latest.pt',
                 config={'best_val_loss': best_val_loss})
 
