@@ -289,17 +289,13 @@ def main():
     if is_main:
         print(f"\nSetting up optimizer...")
 
-    effective_lr = args.lr * train_util.get_world_size() if is_dist else args.lr
-    optimizer    = train_util.create_optimizer(model, effective_lr, args.weight_decay)
+    optimizer = train_util.create_optimizer(model, args.lr, args.weight_decay)
 
     total_steps  = batches_per_epoch * args.epochs // args.grad_accum
     warmup_steps = int(total_steps * args.warmup_ratio)
     optimizer.create_schedulers(tf.get_cosine_schedule_with_warmup, warmup_steps, total_steps)
 
     if is_main:
-        if is_dist:
-            print(f"  Base LR:      {args.lr}")
-            print(f"  Scaled LR:    {effective_lr} (x{train_util.get_world_size()} nodes)")
         print(f"  Total steps:  {total_steps}")
         print(f"  Warmup steps: {warmup_steps}")
 
@@ -322,7 +318,6 @@ def main():
             'val_samples':   len(val_dataset) if val_dataset else 0,
             'has_eval':      has_eval,
             'world_size':    world_size,
-            'effective_lr':  effective_lr,
         }
 
         with open(output_dir / 'finetune_config.json', 'w') as f:
