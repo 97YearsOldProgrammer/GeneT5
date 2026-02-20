@@ -173,7 +173,6 @@ fi
 for env in "${NCCL_ENVS[@]}"; do
     export "$env"
 done
-export BNB_CUDA_VERSION=130
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,garbage_collection_threshold:0.8"
 export PYTHONPATH="${PYTHONPATH:-/workspace/GeneT5}"
 
@@ -298,7 +297,6 @@ if [[ -n "$WORKER_IP" ]]; then
             *) ENV_STR+="export $env; " ;;
         esac
     done
-    ENV_STR+="export BNB_CUDA_VERSION=130; "
     ENV_STR+="export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8; "
     ENV_STR+="export PYTHONPATH=/workspace/GeneT5; "
     # Worker detects its own CX7 interface + HCA (may differ from master)

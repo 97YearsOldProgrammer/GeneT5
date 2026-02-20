@@ -633,52 +633,125 @@ def apply_mxfp8(model):
         print(f"  MXFP8: converted {n_mx} Linear layers to MXLinear")
 
 
-class WrappedOptimizer:
-    """AdamW wrapper with scheduler interface used by bin/finet
+def _newton_schulz(G, steps=5):
+    """Batched Newton-Schulz orthogonalization (supports ndim >= 2)"""
 
-    Supports optional 8-bit AdamW via bitsandbytes for memory savings
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X       = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    for _ in range(steps):
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+
+class MuonE2E:
+    """End-to-end Muon optimizer for ALL parameter types
+
+    ndim >= 2: Newton-Schulz ortho + aspect ratio scaling (includes embeddings)
+    ndim == 1: L2-normalized momentum
     """
 
-    def __init__(self, model, lr, weight_decay, use_8bit=False):
+    def __init__(self, model, lr, weight_decay, momentum=0.95):
 
-        params = [p for p in model.parameters() if p.requires_grad]
+        self._params_2d = []
+        self._params_1d = []
 
-        if use_8bit:
-            import bitsandbytes as bnb
-            self._opt = bnb.optim.AdamW8bit(
-                params,
-                lr           = lr,
-                weight_decay = weight_decay,
-            )
-        else:
-            self._opt = torch.optim.AdamW(
-                params,
-                lr           = lr,
-                weight_decay = weight_decay,
-                fused        = True,
-            )
+        for p in model.parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim >= 2:
+                self._params_2d.append(p)
+            else:
+                self._params_1d.append(p)
+
+        self._bufs_2d = [torch.zeros_like(p) for p in self._params_2d]
+        self._bufs_1d = [torch.zeros_like(p) for p in self._params_1d]
+        self._momentum = momentum
+        self._wd       = weight_decay
+
+        self._lr_proxy  = torch.optim.SGD([torch.zeros(1)], lr=lr)
         self._schedulers = []
 
     def step(self):
 
-        self._opt.step()
+        lr = self._lr_proxy.param_groups[0]['lr']
+
+        for p, buf in zip(self._params_2d, self._bufs_2d):
+            if p.grad is None:
+                continue
+            g = p.grad
+
+            buf.lerp_(g, 1 - self._momentum)
+            update = g.lerp_(buf, self._momentum)
+
+            update = _newton_schulz(update)
+            update *= max(1, p.size(-2) / p.size(-1)) ** 0.5
+
+            p.data.mul_(1 - lr * self._wd)
+            p.data.add_(update, alpha=-lr)
+
+        for p, buf in zip(self._params_1d, self._bufs_1d):
+            if p.grad is None:
+                continue
+            g = p.grad
+
+            buf.lerp_(g, 1 - self._momentum)
+            update = g.lerp_(buf, self._momentum)
+
+            nrm = update.norm() + 1e-7
+            update = update / nrm
+
+            p.data.mul_(1 - lr * self._wd)
+            p.data.add_(update, alpha=-lr)
 
     def zero_grad(self, set_to_none=False):
 
-        self._opt.zero_grad(set_to_none=set_to_none)
+        for p in self._params_2d:
+            if set_to_none:
+                p.grad = None
+            elif p.grad is not None:
+                p.grad.zero_()
+
+        for p in self._params_1d:
+            if set_to_none:
+                p.grad = None
+            elif p.grad is not None:
+                p.grad.zero_()
 
     def state_dict(self):
 
-        return {'adam': self._opt.state_dict()}
+        return {
+            'muon_e2e': {
+                'bufs_2d':  [buf.clone() for buf in self._bufs_2d],
+                'bufs_1d':  [buf.clone() for buf in self._bufs_1d],
+                'lr_proxy': self._lr_proxy.state_dict(),
+            }
+        }
 
     def load_state_dict(self, state_dict):
+        """Load state; silently skip incompatible checkpoints (AdamW, MuonAdamW)"""
 
-        sd = state_dict.get('adam', state_dict)
-        self._opt.load_state_dict(sd)
+        if 'muon_e2e' not in state_dict:
+            return
+        s = state_dict['muon_e2e']
+        if 'bufs_2d' in s:
+            for buf, saved in zip(self._bufs_2d, s['bufs_2d']):
+                buf.copy_(saved)
+        if 'bufs_1d' in s:
+            for buf, saved in zip(self._bufs_1d, s['bufs_1d']):
+                buf.copy_(saved)
+        if 'lr_proxy' in s:
+            self._lr_proxy.load_state_dict(s['lr_proxy'])
 
     def create_schedulers(self, schedule_fn, warmup_steps, total_steps):
 
-        self._schedulers = [schedule_fn(self._opt, warmup_steps, total_steps)]
+        self._schedulers = [schedule_fn(self._lr_proxy, warmup_steps, total_steps)]
 
     def step_schedulers(self):
 
@@ -691,26 +764,25 @@ class WrappedOptimizer:
 
     def parameters(self):
 
-        for g in self._opt.param_groups:
-            for p in g['params']:
-                yield p
+        yield from self._params_2d
+        yield from self._params_1d
 
     @property
     def param_groups(self):
 
-        return self._opt.param_groups
+        return self._lr_proxy.param_groups
 
 
-def create_optimizer(model, lr, weight_decay, use_8bit=False):
-    """Create AdamW optimizer with optional 8-bit quantization"""
+def create_optimizer(model, lr, weight_decay):
+    """Create Muon E2E optimizer"""
 
-    opt = WrappedOptimizer(model, lr, weight_decay, use_8bit=use_8bit)
-
+    opt = MuonE2E(model, lr, weight_decay)
     if is_main_process():
-        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        kind     = "AdamW-8bit" if use_8bit else "AdamW-fused"
-        print(f"  {kind}: {n_params:,} params (lr={lr})")
-
+        n_2d = sum(p.numel() for p in opt._params_2d)
+        n_1d = sum(p.numel() for p in opt._params_1d)
+        print(f"  MuonE2E: {n_2d + n_1d:,} params (lr={lr})")
+        print(f"    2D/3D: {len(opt._params_2d)} tensors, {n_2d:,} params (Newton-Schulz)")
+        print(f"    1D:    {len(opt._params_1d)} tensors, {n_1d:,} params (L2-norm)")
     return opt
 
 

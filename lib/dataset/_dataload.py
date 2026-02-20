@@ -188,7 +188,7 @@ class BinaryTrainDataset:
 #####################
 
 
-PAD_BUCKETS     = [2048, 4096, 6144, 8192, 16384]
+PAD_BUCKETS     = list(range(512, 9217, 512))
 DEFAULT_MAX_SEQ = PAD_BUCKETS[-1]
 BUDGET_SEQ      = 8192
 
@@ -203,13 +203,31 @@ def _bucket_pad(length):
     return PAD_BUCKETS[-1] + step * ((length - PAD_BUCKETS[-1] + step - 1) // step)
 
 
-def token_budget_batcher(source, budget, max_batch, collator):
+def _length_sorted_chunks(source, sort_size=256):
+    """Accumulate samples, sort by length, yield in length order"""
+
+    pool = []
+    for sample in source:
+        pool.append(sample)
+        if len(pool) >= sort_size:
+            pool.sort(key=lambda s: len(s["input_ids"]))
+            yield from pool
+            pool = []
+
+    if pool:
+        pool.sort(key=lambda s: len(s["input_ids"]))
+        yield from pool
+
+
+def token_budget_batcher(source, budget, max_batch, collator, sort_size=256):
     """Yield variable-size batches that fit within a token budget"""
+
+    sorted_source = _length_sorted_chunks(source, sort_size)
 
     buf     = []
     buf_max = 0
 
-    for sample in source:
+    for sample in sorted_source:
         seq_len  = len(sample["input_ids"])
         new_max  = max(buf_max, seq_len)
         new_cost = _bucket_pad(new_max) * (len(buf) + 1)
