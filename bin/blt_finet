@@ -1,0 +1,491 @@
+#!/usr/bin/env python3
+
+import argparse
+import glob
+import json
+import time
+import pathlib
+import os
+
+import torch
+import torch.distributed    as dist
+import webdataset           as wds
+import torch.utils.data     as data_utils
+import transformers         as tf
+
+from contextlib import nullcontext
+from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
+
+import lib.dataset                  as ds
+import lib.dataset._blt_dataload    as blt_ds
+import lib.blt_tokenizer            as btk
+import lib.blt_model                as blt_mdl
+import lib.util                     as util
+import lib.util.train               as train_util
+import lib.util.build_blt_model     as blt_build
+
+
+DEFAULTS = {
+    'batch_size':     8,
+    'lr':             3e-4,
+    'epochs':         10,
+    'weight_decay':   0.1,
+    'warmup_ratio':   0.03,
+    'grad_accum':     64,
+    'max_grad_norm':  1.0,
+    'num_workers':    2,
+}
+
+
+def build_parser():
+
+    parser = argparse.ArgumentParser(description='Fine-tune GeneBLT')
+    parser.add_argument('data_dir', type=str, metavar='<data>',
+        help='baked data directory')
+    parser.add_argument('output_dir', type=str, metavar='<o>',
+        help='output directory')
+    parser.add_argument('model_path', type=str, metavar='<model>',
+        help='GeneT5 or GeneBLT checkpoint path')
+    parser.add_argument('--checkpoint', required=False, type=str, default=None,
+        metavar='<file>', help='resume from training checkpoint')
+    parser.add_argument('--epochs', required=False, type=int, default=DEFAULTS['epochs'],
+        metavar='<int>', help='number of epochs [%(default)i]')
+    parser.add_argument('--batch_size', required=False, type=int, default=DEFAULTS['batch_size'],
+        metavar='<int>', help='batch size [%(default)i]')
+    parser.add_argument('--lr', required=False, type=float, default=DEFAULTS['lr'],
+        metavar='<float>', help='learning rate [%(default)g]')
+    parser.add_argument('--grad_accum', required=False, type=int, default=DEFAULTS['grad_accum'],
+        metavar='<int>', help='gradient accumulation steps [%(default)i]')
+    parser.add_argument('--weight_decay', required=False, type=float, default=DEFAULTS['weight_decay'],
+        metavar='<float>', help='weight decay [%(default).2f]')
+    parser.add_argument('--warmup_ratio', required=False, type=float, default=DEFAULTS['warmup_ratio'],
+        metavar='<float>', help='warmup ratio [%(default).2f]')
+    parser.add_argument('--max_grad_norm', required=False, type=float, default=DEFAULTS['max_grad_norm'],
+        metavar='<float>', help='max gradient norm [%(default).1f]')
+    parser.add_argument('--seed', required=False, type=int, default=42,
+        metavar='<int>', help='random seed [%(default)i]')
+    parser.add_argument('--save_every', required=False, type=int, default=1,
+        metavar='<int>', help='save checkpoint every N epochs [%(default)i]')
+    parser.add_argument('--num_workers', required=False, type=int, default=DEFAULTS['num_workers'],
+        metavar='<int>', help='dataloader workers [%(default)i]')
+    parser.add_argument('--early_stopping', required=False, type=int, default=None,
+        metavar='<int>', help='early stopping patience')
+    parser.add_argument('--label_smoothing', required=False, type=float, default=0.0,
+        metavar='<float>', help='label smoothing factor [%(default).2f]')
+    parser.add_argument('--gradient_checkpointing', action='store_true',
+        help='enable gradient checkpointing')
+    parser.add_argument('--log_every_pct', required=False, type=int, default=10,
+        metavar='<int>', help='log progress every N percent [%(default)i]')
+    parser.add_argument('--save_steps', required=False, type=int, default=None,
+        metavar='<int>', help='save checkpoint every N optimizer steps')
+    parser.add_argument('--empty_cache_steps', required=False, type=int, default=None,
+        metavar='<int>', help='empty CUDA cache every N steps')
+    parser.add_argument('--no_pin_memory', action='store_true',
+        help='disable pin_memory in dataloaders')
+    parser.add_argument('--memwatch', action='store_true',
+        help='enable background memory monitoring')
+    parser.add_argument('--compile', action='store_true',
+        help='enable torch.compile on global transformer')
+    parser.add_argument('--freeze_global', action='store_true',
+        help='freeze global transformer (Stage 1: train local modules only)')
+    parser.add_argument('--global_lr_scale', required=False, type=float, default=1.0,
+        metavar='<float>', help='LR multiplier for global transformer gradients [%(default).1f]')
+    return parser
+
+
+def main():
+
+    args = build_parser().parse_args()
+
+    dist_info = train_util.setup_distributed(backend="nccl")
+    is_dist   = dist_info is not None
+    is_main   = train_util.is_main_process()
+
+    if is_main:
+        print(f"\n{' GeneBLT Fine-Tuning ':=^60}")
+
+    if is_dist and is_main:
+        print(f"Distributed: {dist_info['world_size']} nodes, rank {dist_info['rank']}")
+
+    device = train_util.get_device()
+    if is_main:
+        print(f"Device: {device}")
+
+    train_util.set_seeds(args.seed)
+
+    # auto-discover data files
+    data_dir  = pathlib.Path(args.data_dir)
+    bake_cfg  = data_dir / "bake_config.json"
+
+    if not bake_cfg.exists():
+        if is_main:
+            print(f"\nERROR: {bake_cfg} not found")
+        if is_dist:
+            train_util.cleanup_distributed()
+        return
+
+    with open(bake_cfg) as f:
+        cfg = json.load(f)
+
+    species_list = cfg.get("train_species", [])
+    total_train  = cfg.get("total_train_samples", 0)
+    shard_urls   = []
+    for sp in species_list:
+        sp_tars = sorted(glob.glob(str(data_dir / sp / "*.tar")))
+        shard_urls.extend(sp_tars)
+
+    if not shard_urls:
+        if is_main:
+            print(f"\nERROR: No .tar training shards found in {data_dir}")
+        if is_dist:
+            train_util.cleanup_distributed()
+        return
+
+    if is_main:
+        print(f"\n  Training tars: {len(shard_urls)} shards, {total_train:,} samples")
+
+    output_dir = pathlib.Path(args.output_dir)
+    if is_main:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    if is_dist:
+        train_util.barrier()
+
+    # byte tokenizer
+    tokenizer = btk.ByteTokenizer()
+    if is_main:
+        print(f"\n  ByteTokenizer: vocab_size={tokenizer.vocab_size}")
+
+    # load or build model
+    model_path = pathlib.Path(args.model_path)
+
+    if (model_path / "blt_config.json").exists():
+        if is_main:
+            print(f"\nLoading GeneBLT checkpoint...")
+        model = blt_mdl.GeneBLT.from_pretrained(model_path, device='cpu', dtype=torch.bfloat16)
+    else:
+        if is_main:
+            print(f"\nBuilding GeneBLT from GeneT5 checkpoint...")
+        model = blt_build.build_gene_blt(str(model_path), str(output_dir / "init_blt"))
+        model = model.to(dtype=torch.bfloat16)
+
+    # freeze global transformer if requested
+    if args.freeze_global:
+        for p in model.global_transformer.parameters():
+            p.requires_grad = False
+        if is_main:
+            print("  Frozen: global transformer")
+
+    # torch.compile
+    if args.compile:
+        if is_main:
+            print("\nCompiling model regions...")
+        compile_opts = {"mode": "default", "dynamic": None}
+        model.global_transformer = torch.compile(model.global_transformer, **compile_opts)
+        if is_main:
+            print("  Compiled: global_transformer")
+
+    model = train_util.wrap_model_distributed(model, device,
+        find_unused_params=False, static_graph=False)
+
+    if is_dist:
+        from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
+        model.register_comm_hook(state=None, hook=default_hooks.bf16_compress_hook)
+
+    raw_model = train_util.unwrap_model(model)
+    stats     = raw_model.get_param_stats()
+    if is_main:
+        print(f"  Trainable: {stats['total_trainable']:,}")
+        print(f"  Frozen:    {stats['total_frozen']:,}")
+
+    # datasets
+    if is_main:
+        print(f"\nLoading datasets...")
+
+    world_size    = train_util.get_world_size()
+    train_dataset = blt_ds.create_blt_train_pipeline(shard_urls, tokenizer)
+
+    collator     = blt_ds.BytePrefixLMCollator(tokenizer.pad_token_id, -100, max_byte_len=blt_ds.BYTE_MAX_SEQ)
+    val_collator = blt_ds.BytePrefixLMCollator(tokenizer.pad_token_id, -100, max_byte_len=blt_ds.BYTE_MAX_SEQ)
+    budget       = args.batch_size * blt_ds.BUDGET_PATCHES
+    persistent   = args.num_workers > 0
+
+    train_loader = wds.WebLoader(
+        train_dataset,
+        batch_size         = None,
+        num_workers        = args.num_workers,
+        pin_memory         = not args.no_pin_memory,
+        persistent_workers = persistent,
+    ).compose(
+        lambda src: blt_ds.byte_budget_batcher(src, budget, args.batch_size, collator)
+    )
+
+    avg_seq               = cfg.get("avg_seq_len", blt_ds.BYTE_MAX_SEQ // 2)
+    est_samples_per_batch = max(1, min(args.batch_size, budget // max(1, blt_ds._patch_count(avg_seq))))
+    batches_per_epoch     = total_train // (est_samples_per_batch * world_size)
+    train_loader          = train_loader.with_epoch(batches_per_epoch)
+
+    if is_main:
+        print(f"  Train batches: ~{batches_per_epoch}")
+
+    # optimizer
+    if is_main:
+        print(f"\nSetting up optimizer...")
+
+    optimizer = train_util.create_optimizer(model, args.lr, args.weight_decay)
+
+    total_steps  = batches_per_epoch * args.epochs // args.grad_accum
+    warmup_steps = int(total_steps * args.warmup_ratio)
+    optimizer.create_schedulers(tf.get_cosine_schedule_with_warmup, warmup_steps, total_steps)
+
+    if is_main:
+        print(f"  Total steps:  {total_steps}")
+        print(f"  Warmup steps: {warmup_steps}")
+
+    start_epoch   = 0
+    best_val_loss = float('inf')
+
+    if args.checkpoint:
+        ckpt_info     = train_util.load_checkpoint(model, optimizer, None,
+                            args.checkpoint, device)
+        start_epoch   = ckpt_info['epoch']
+        best_val_loss = ckpt_info['best_val_loss']
+
+    # save config
+    if is_main:
+        config = {
+            **vars(args),
+            'model_type':    'GeneBLT',
+            'vocab_size':    tokenizer.vocab_size,
+            'train_samples': total_train,
+            'world_size':    world_size,
+        }
+        with open(output_dir / 'finetune_config.json', 'w') as f:
+            json.dump(config, f, indent=2)
+
+    # training loop
+    if is_main:
+        print(f"\n{'=' * 60}")
+        print('Training...')
+        if args.freeze_global:
+            print('  Stage 1: local modules only (global frozen)')
+        print(f"{'=' * 60}")
+
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+    if args.label_smoothing > 0:
+        loss_fct = LigerCrossEntropyLoss(ignore_index=-100, label_smoothing=args.label_smoothing)
+        if is_main:
+            print(f"  Label smoothing: {args.label_smoothing}")
+    else:
+        loss_fct = None
+
+    if args.gradient_checkpointing:
+        if hasattr(raw_model.global_transformer, 'gradient_checkpointing_enable'):
+            raw_model.global_transformer.gradient_checkpointing_enable()
+        if hasattr(raw_model.local_encoder.encoder, 'gradient_checkpointing_enable'):
+            raw_model.local_encoder.encoder.gradient_checkpointing_enable()
+        if hasattr(raw_model.local_decoder.decoder, 'gradient_checkpointing_enable'):
+            raw_model.local_decoder.decoder.gradient_checkpointing_enable()
+        if is_main:
+            print("  Gradient checkpointing: enabled")
+
+    patience_counter = 0
+    global_step      = 0
+
+    mem_watcher = None
+    if args.memwatch and is_main:
+        mem_watcher = util.create_memory_watcher(output_dir, prefix="memory")
+        mem_watcher.start()
+
+    train_logger = None
+    if is_main:
+        train_logger = util.create_train_logger(output_dir, resume=args.checkpoint is not None)
+        print(f"  Training log: {train_logger.log_path}")
+
+    for epoch in range(start_epoch, args.epochs):
+        if is_main:
+            print(f"\nEpoch {epoch + 1}/{args.epochs}")
+            print('-' * 40)
+
+        model.train()
+        total_train_loss = 0
+
+        optimizer.zero_grad(set_to_none=True)
+
+        num_batches      = batches_per_epoch
+        log_interval     = max(1, num_batches * args.log_every_pct // 100)
+        last_logged_pct  = -1
+        epoch_start_time = time.time()
+
+        for step, batch in enumerate(train_loader):
+            if batch is None:
+                continue
+
+            if step == 0 and is_main:
+                print(f"  First batch: input={batch['input_bytes'].shape}, "
+                      f"target={batch['target_bytes'].shape}, "
+                      f"labels={batch['labels'].shape}")
+
+            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+
+            is_sync_step = (step + 1) % args.grad_accum == 0
+            sync_context = nullcontext() if (not is_dist or is_sync_step) else model.no_sync()
+
+            with sync_context:
+                with torch.amp.autocast('cuda', dtype=dtype):
+                    outputs = model(
+                        input_bytes  = batch['input_bytes'],
+                        target_bytes = batch['target_bytes'],
+                        labels       = batch['labels'] if loss_fct is None else None,
+                    )
+
+                    if loss_fct is not None:
+                        logits = outputs['logits']
+                        loss   = loss_fct(
+                            logits.reshape(-1, raw_model.byte_vocab_size),
+                            batch['labels'].reshape(-1),
+                        )
+                        if outputs.get('moe_loss') is not None:
+                            loss = loss + outputs['moe_loss']
+                        del logits
+                    else:
+                        loss = outputs['loss']
+
+                    loss = loss / args.grad_accum
+
+                loss_val = loss.item() * args.grad_accum
+                loss.backward()
+
+            # scale global gradients for differential LR
+            if args.global_lr_scale != 1.0 and not args.freeze_global:
+                for p in raw_model.global_transformer.parameters():
+                    if p.grad is not None:
+                        p.grad.mul_(args.global_lr_scale)
+
+            del outputs, loss, batch
+
+            if (step + 1) % args.grad_accum == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                optimizer.step()
+                optimizer.step_schedulers()
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+
+                if global_step % 100 == 0 and global_step > 0 and is_main:
+                    elapsed     = time.time() - epoch_start_time
+                    batch_per_s = (step + 1) / elapsed if elapsed > 0 else 0
+                    print(f"  step {global_step} | loss {loss_val:.4f} | "
+                          f"batch {step+1}/{num_batches} | "
+                          f"{batch_per_s:.1f} batch/s")
+
+                if args.save_steps and global_step % args.save_steps == 0:
+                    train_util.save_checkpoint(model, optimizer, None, epoch,
+                        output_dir / f'checkpoint_step_{global_step}.pt',
+                        config={'best_val_loss': best_val_loss},
+                        global_step=global_step)
+                    if is_main:
+                        print(f"  [Step {global_step}] Saved checkpoint")
+
+                if args.empty_cache_steps and global_step % args.empty_cache_steps == 0:
+                    torch.cuda.empty_cache()
+
+            total_train_loss += loss_val
+
+            current_pct = (step + 1) * 100 // num_batches
+            if train_logger and current_pct >= last_logged_pct + args.log_every_pct:
+                last_logged_pct = (current_pct // args.log_every_pct) * args.log_every_pct
+                elapsed         = time.time() - epoch_start_time
+                batch_per_sec   = (step + 1) / elapsed if elapsed > 0 else 0
+                avg_loss        = total_train_loss / (step + 1)
+
+                train_logger.log_step(
+                    epoch         = epoch + 1,
+                    global_step   = global_step,
+                    batch         = step + 1,
+                    num_batches   = num_batches,
+                    loss          = avg_loss,
+                    lr            = optimizer.get_last_lr()[0],
+                    batch_per_sec = batch_per_sec,
+                )
+
+        train_loss = total_train_loss / max(num_batches, 1)
+
+        if is_dist:
+            loss_tensor = torch.tensor([train_loss], device=device)
+            train_util.all_reduce_mean(loss_tensor)
+            train_loss = loss_tensor.item()
+
+        if train_logger:
+            train_logger.log_epoch(epoch + 1, train_loss, float('inf'), optimizer.get_last_lr()[0])
+
+        # checkpointing
+        if train_loss < best_val_loss:
+            best_val_loss    = train_loss
+            patience_counter = 0
+
+            if is_main:
+                print(f"  New best! Saving best_model.pt")
+
+            train_util.save_checkpoint(model, optimizer, None, epoch + 1,
+                output_dir / 'best_model.pt',
+                config={'best_val_loss': best_val_loss, 'best_epoch': epoch + 1})
+            train_util.barrier()
+        else:
+            patience_counter += 1
+            es_str = args.early_stopping if args.early_stopping else 'inf'
+            if is_main:
+                print(f"  No improvement ({patience_counter}/{es_str})")
+
+            if args.early_stopping and patience_counter >= args.early_stopping:
+                if is_main:
+                    print(f"\n  Early stopping!")
+                break
+
+        if (epoch + 1) % args.save_every == 0:
+            train_util.save_checkpoint(model, optimizer, None, epoch + 1,
+                output_dir / 'checkpoint_latest.pt',
+                config={'best_val_loss': best_val_loss})
+
+        train_util.barrier()
+
+    if mem_watcher:
+        mem_watcher.stop()
+    if train_logger:
+        train_logger.close()
+
+    # save final model
+    if is_main:
+        print(f"\n{'=' * 60}")
+        print('Saving final model...')
+
+        final_model = train_util.unwrap_model(model)
+        final_model.save(output_dir / 'pytorch_model.bin')
+
+        blt_config_src = model_path / "blt_config.json"
+        init_blt_cfg   = output_dir / "init_blt" / "blt_config.json"
+
+        if blt_config_src.exists():
+            cfg_path = blt_config_src
+        elif init_blt_cfg.exists():
+            cfg_path = init_blt_cfg
+        else:
+            cfg_path = None
+
+        if cfg_path:
+            with open(cfg_path) as f:
+                blt_cfg = json.load(f)
+            with open(output_dir / 'blt_config.json', 'w') as f:
+                json.dump(blt_cfg, f, indent=2)
+
+        print(f"\n{'=' * 60}")
+        print(f"Complete!")
+        print(f"  Output: {output_dir}")
+        print(f"  Best Loss: {best_val_loss:.4f}")
+        print(f"{'=' * 60}")
+
+    if is_dist:
+        train_util.cleanup_distributed()
+
+
+if __name__ == '__main__':
+    main()

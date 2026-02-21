@@ -20,6 +20,7 @@ class FlashAttentionConfig:
     head_dim:     int   = None
     dropout:      float = 0.0
     use_alibi:    bool  = True
+    window_size:  tuple = (-1, -1)
 
     def __post_init__(self):
 
@@ -123,7 +124,7 @@ class FlashAttention(nn.Module):
                 dropout_p     = drop_p,
                 softmax_scale = self.softmax_scale,
                 causal        = self.is_causal,
-                window_size   = (-1, -1),
+                window_size   = self.config.window_size,
                 alibi_slopes  = alibi,
             )
 

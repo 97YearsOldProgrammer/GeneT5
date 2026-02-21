@@ -19,14 +19,16 @@ class EncoderBlock(nn.Module):
         dropout      = 0.0,
         attn_dropout = 0.0,
         use_alibi    = True,
+        window_size  = (-1, -1),
     ):
         super().__init__()
 
         flash_config = FlashAttentionConfig(
-            embed_dim = embed_dim,
-            num_heads = num_heads,
-            dropout   = attn_dropout,
-            use_alibi = use_alibi
+            embed_dim   = embed_dim,
+            num_heads   = num_heads,
+            dropout     = attn_dropout,
+            use_alibi   = use_alibi,
+            window_size = window_size,
         )
         self.self_attn = FlashAttention(
             config    = flash_config,
@@ -62,6 +64,7 @@ class Encoder(nn.Module):
         dropout      = 0.0,
         attn_dropout = 0.0,
         use_alibi    = True,
+        window_size  = (-1, -1),
     ):
         super().__init__()
 
@@ -75,6 +78,7 @@ class Encoder(nn.Module):
                 dropout      = dropout,
                 attn_dropout = attn_dropout,
                 use_alibi    = use_alibi,
+                window_size  = window_size,
             )
             for _ in range(num_layers)
         ])

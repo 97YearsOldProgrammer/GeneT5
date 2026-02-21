@@ -62,6 +62,14 @@ DEFAULT_MAX_SEQ        = dataload.DEFAULT_MAX_SEQ
 BUDGET_SEQ             = dataload.BUDGET_SEQ
 token_budget_batcher   = dataload.token_budget_batcher
 
+import lib.dataset._blt_dataload as blt_dataload
+
+BytePrefixLMCollator     = blt_dataload.BytePrefixLMCollator
+byte_budget_batcher      = blt_dataload.byte_budget_batcher
+create_blt_train_pipeline = blt_dataload.create_blt_train_pipeline
+BYTE_MAX_SEQ             = blt_dataload.BYTE_MAX_SEQ
+BUDGET_PATCHES           = blt_dataload.BUDGET_PATCHES
+
 
 ###################
 #####  Util   #####
