@@ -33,8 +33,8 @@ def prepare_fasta_index(raw_dir, skip_species=None):
         if species in skip_species:
             continue
 
-        gz_files  = sorted(sp_dir.glob("*.fna.gz"))
-        fna_files = sorted(sp_dir.glob("*.fna"))
+        gz_files  = sorted(sp_dir.glob("*.fna.gz")) or sorted(sp_dir.glob("fna.gz"))
+        fna_files = sorted(sp_dir.glob("*.fna")) or sorted(sp_dir.glob("fna"))
 
         # decompress any .fna.gz that lack a corresponding .fna
         for gz in gz_files:
@@ -111,20 +111,20 @@ class FASTAEntropyDataset(data_utils.IterableDataset):
     def _build_chrom_sampler(self, entry):
         """Build cumulative weights for proportional chromosome sampling"""
 
-        lengths = [length for _, length in entry["chroms"]
-                   if length >= self.max_len]
-        if not lengths:
-            return None, None
+        filtered = [(name, length) for name, length in entry["chroms"]
+                    if length >= self.max_len]
+        if not filtered:
+            return None, None, None
 
-        names   = [name for name, length in entry["chroms"]
-                   if length >= self.max_len]
+        names   = [name for name, _ in filtered]
+        lengths = [length for _, length in filtered]
         cumwt   = []
         total   = 0
         for ln in lengths:
             total += ln
             cumwt.append(total)
 
-        return names, cumwt
+        return names, cumwt, lengths
 
     def __iter__(self):
 
@@ -141,11 +141,11 @@ class FASTAEntropyDataset(data_utils.IterableDataset):
         samplers = {}
         valid_entries = []
         for entry in self.manifest:
-            sp             = entry["species"]
-            names, cumwt   = self._build_chrom_sampler(entry)
+            sp                    = entry["species"]
+            names, cumwt, lengths = self._build_chrom_sampler(entry)
             if names is None:
                 continue
-            samplers[sp]   = (names, cumwt)
+            samplers[sp] = (names, cumwt, lengths)
             valid_entries.append(entry)
 
         if not valid_entries:
@@ -157,7 +157,7 @@ class FASTAEntropyDataset(data_utils.IterableDataset):
             # uniform species sampling
             entry = rng.choice(valid_entries)
             sp    = entry["species"]
-            names, cumwt = samplers[sp]
+            names, cumwt, lengths = samplers[sp]
 
             # proportional chromosome sampling
             r   = rng.random() * cumwt[-1]
@@ -165,7 +165,7 @@ class FASTAEntropyDataset(data_utils.IterableDataset):
             idx = min(idx, len(names) - 1)
 
             chrom_name   = names[idx]
-            chrom_length = entry["chroms"][idx][1]
+            chrom_length = lengths[idx]
 
             # random position
             pos = rng.randint(0, chrom_length - self.max_len)
@@ -193,8 +193,13 @@ def dna_collate(batch):
     labels    = []
 
     for ids in batch:
+        if len(ids) < 2:
+            continue
         input_ids.append(ids[:-1])
         labels.append(ids[1:])
+
+    if not input_ids:
+        return None
 
     return {
         "input_ids": torch.tensor(input_ids, dtype=torch.long),
