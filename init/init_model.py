@@ -1,6 +1,6 @@
 import argparse
 
-from lib.util.build_model import build_gt5
+from lib.model.build import build_gt5
 
 
 parser = argparse.ArgumentParser(

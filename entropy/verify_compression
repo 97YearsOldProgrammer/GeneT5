@@ -8,8 +8,8 @@ import random
 import torch
 import numpy as np
 
-import lib.entropy_model         as entropy
-import lib.dataset._fasta_stream as fasta_stream
+import lib.model.entropy         as entropy
+import lib.data._fasta_stream    as fasta_stream
 
 
 def build_parser():

@@ -5,7 +5,7 @@ import json
 
 import pyfaidx
 
-import lib.dataset as ds
+import lib.data as ds
 
 
 parser = argparse.ArgumentParser(

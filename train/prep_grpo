@@ -5,7 +5,7 @@ import json
 import random
 import pathlib
 
-import lib.dataset as ds
+import lib.data as ds
 
 
 parser = argparse.ArgumentParser(description='Prepare GRPO training data from multiple species')

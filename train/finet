@@ -17,11 +17,11 @@ import transformers         as tf
 from contextlib import nullcontext
 from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
 
-import lib.dataset      as ds
-import lib.tokenizer    as tk
-import lib.model        as mdl
+import lib.data         as ds
+import lib.tokenizer.hf as tk
+import lib.model.seq2seq as mdl
 import lib.util         as util
-import lib.util.train   as train_util
+import lib.train.loop   as train_util
 
 
 DEFAULTS = {

@@ -17,12 +17,12 @@ import transformers       as tf
 from contextlib import nullcontext
 from functools  import partial
 
-import lib.tokenizer    as tk
-import lib.model        as mdl
+import lib.tokenizer.hf as tk
+import lib.model.seq2seq as mdl
 import lib.util         as util
-import lib.util.train   as train_util
-import lib.util._grpo   as grpo
-import lib.util._reward as reward
+import lib.train.loop   as train_util
+import lib.grpo.algo    as grpo
+import lib.grpo.reward  as reward
 
 
 DEFAULTS = {

@@ -1,4 +1,4 @@
-from lib.util._databaker import (
+from lib.bake.databaker import (
     discover_species,
     BakeJob,
     find_genome_files,
@@ -10,7 +10,7 @@ from lib.util._databaker import (
     report_augmentation_status,
 )
 
-from lib.util._inference import (
+from lib.inference.engine import (
     auto_detect_device,
     get_device_info,
     select_dtype,
@@ -21,7 +21,7 @@ from lib.util._inference import (
     read_input,
 )
 
-from lib.util._output import (
+from lib.inference.output import (
     ParsedGene,
     ModelOutputParser,
     parse_model_output,
@@ -30,34 +30,34 @@ from lib.util._output import (
     write_gff3,
 )
 
-from lib.util._time import (
+from lib.bake.time import (
     format_time,
     format_rate,
 )
 
-from lib.util._memwatch import (
+from lib.train.memwatch import (
     MemoryWatcher,
     create_memory_watcher,
 )
 
-from lib.util._logger import (
+from lib.train.logger import (
     TrainLogger,
     create_train_logger,
 )
 
-from lib.util._eval_hook import (
+from lib.train.eval_hook import (
     CheckpointEvaluator,
     EvalLogger,
 )
 
-from lib.util._reward import (
+from lib.grpo.reward import (
     exon_f1,
     gene_f1,
     composite_reward,
     batch_rewards,
 )
 
-from lib.util._grpo import (
+from lib.grpo.algo import (
     GRPODataset,
     grpo_collate,
     compute_log_probs,

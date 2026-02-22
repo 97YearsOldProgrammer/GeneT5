@@ -1,8 +1,8 @@
-import lib.dataset._parser     as parser
-import lib.dataset._binary     as binary
-import lib.dataset._chunking   as chunking
-import lib.dataset._dataload   as dataload
-import lib.dataset._util       as util
+import lib.data._parser     as parser
+import lib.data._binary     as binary
+import lib.data._chunking   as chunking
+import lib.data._dataload   as dataload
+import lib.data._util       as util
 
 
 #####################
@@ -62,7 +62,7 @@ DEFAULT_MAX_SEQ        = dataload.DEFAULT_MAX_SEQ
 BUDGET_SEQ             = dataload.BUDGET_SEQ
 token_budget_batcher   = dataload.token_budget_batcher
 
-import lib.dataset._blt_dataload as blt_dataload
+import lib.data._blt_dataload as blt_dataload
 
 BytePrefixLMCollator     = blt_dataload.BytePrefixLMCollator
 byte_budget_batcher      = blt_dataload.byte_budget_batcher

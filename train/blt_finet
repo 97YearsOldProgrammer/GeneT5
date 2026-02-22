@@ -16,13 +16,13 @@ import transformers         as tf
 from contextlib import nullcontext
 from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
 
-import lib.dataset                  as ds
-import lib.dataset._blt_dataload    as blt_ds
-import lib.blt_tokenizer            as btk
-import lib.blt_model                as blt_mdl
+import lib.data                     as ds
+import lib.data._blt_dataload       as blt_ds
+import lib.tokenizer.byte           as btk
+import lib.model.blt                as blt_mdl
 import lib.util                     as util
-import lib.util.train               as train_util
-import lib.util.build_blt_model     as blt_build
+import lib.train.loop               as train_util
+import lib.model.build              as blt_build
 
 
 DEFAULTS = {

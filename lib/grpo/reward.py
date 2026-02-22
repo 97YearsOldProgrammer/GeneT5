@@ -1,6 +1,6 @@
 from collections import Counter
 
-import lib.util._output as output_lib
+import lib.inference.output as output_lib
 
 
 def exon_f1(parsed_genes, ref_features, sequence):

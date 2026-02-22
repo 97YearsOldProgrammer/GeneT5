@@ -298,7 +298,7 @@ if not args.finalize and heldout_to_process and args.train:
 
 
 if args.train and (args.finalize or args.nnodes == 1):
-    import lib.dataset as ds
+    import lib.data as ds
 
     all_train_names   = {name for name, _ in train_species}
     all_heldout_names = {name for name, _ in heldout_species}
@@ -360,7 +360,7 @@ if args.train and (args.finalize or args.nnodes == 1):
 all_eval_samples = []
 
 if heldout_species and args.eval and (args.finalize or args.nnodes == 1):
-    import lib.dataset as ds
+    import lib.data as ds
 
     print(f"\n{' Generating Eval Samples ':=^60}")
 
@@ -440,7 +440,7 @@ with open(config_path, 'w') as f:
 print(f"\n{' Final Output ':=^60}")
 
 if args.train:
-    import lib.dataset as ds
+    import lib.data as ds
 
     merged_val = output_dir / "validation.bin"
     tar_count  = len(list(output_dir.glob("*/*.tar")))

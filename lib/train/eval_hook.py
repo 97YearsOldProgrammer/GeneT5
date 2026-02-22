@@ -6,7 +6,7 @@ from collections import Counter
 
 import torch
 
-import lib.util._output as output_lib
+import lib.inference.output as output_lib
 
 
 class CheckpointEvaluator:

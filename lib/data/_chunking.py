@@ -6,7 +6,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import pyfaidx
 
-import lib.dataset._binary as binary
+import lib.data._binary as binary
 import lib.nosing.nosing   as nosing
 
 

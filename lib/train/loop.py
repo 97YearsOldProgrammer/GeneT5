@@ -607,7 +607,7 @@ def setup_gene_prediction_model(model_path, tokenizer, device):
 def prepare_tokenizer(model_path):
     """Load tokenizer (tokens already hardcoded during init)"""
 
-    from lib.tokenizer import GeneTokenizer
+    from lib.tokenizer.hf import GeneTokenizer
     return GeneTokenizer(model_path)
 
 

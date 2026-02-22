@@ -1,4 +1,4 @@
-from lib.dataset.wrapper import (
+from lib.data.wrapper import (
 
     # Parser
     lazy_fasta_open,
@@ -37,6 +37,13 @@ from lib.dataset.wrapper import (
     DEFAULT_MAX_SEQ,
     BUDGET_SEQ,
     token_budget_batcher,
+
+    # BLT Dataload
+    BytePrefixLMCollator,
+    byte_budget_batcher,
+    create_blt_train_pipeline,
+    BYTE_MAX_SEQ,
+    BUDGET_PATCHES,
 
     # Util
     format_size,

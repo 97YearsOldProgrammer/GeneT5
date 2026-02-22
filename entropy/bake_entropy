@@ -8,9 +8,9 @@ import struct
 import torch
 import numpy as np
 
-import lib.blt_tokenizer   as btk
-import lib.entropy_model   as entropy
-import lib.dataset._binary as binary
+import lib.tokenizer.byte  as btk
+import lib.model.entropy   as entropy
+import lib.data._binary    as binary
 
 
 def build_parser():

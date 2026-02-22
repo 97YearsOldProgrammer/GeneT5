@@ -6,8 +6,8 @@ from dataclasses import dataclass, field
 
 import torch
 
-import lib.model        as model_lib
-import lib.util._output as output_lib
+import lib.model.seq2seq   as model_lib
+import lib.inference.output as output_lib
 
 
 ##########################
@@ -137,7 +137,7 @@ class GeneT5Inference:
                         device=None, dtype=None):
         """Load model from a training checkpoint .pt file"""
 
-        import lib.tokenizer as tk_lib
+        import lib.tokenizer.hf as tk_lib
 
         target_device = device or auto_detect_device()
         target_dtype  = dtype or select_dtype(target_device)
@@ -189,7 +189,7 @@ class GeneT5Inference:
         """Load tokenizer from path - prefers GeneTokenizer, falls back to alternatives"""
 
         try:
-            import lib.tokenizer as tk_lib
+            import lib.tokenizer.hf as tk_lib
             return tk_lib.GeneTokenizer(tokenizer_path)
         except Exception:
             pass

@@ -6,7 +6,7 @@ import json
 import os
 from dataclasses import dataclass, field
 
-import lib.dataset as ds
+import lib.data as ds
 
 
 ############################

@@ -1,7 +1,7 @@
 import torch
 import webdataset as wds
 
-import lib.dataset._binary as binary
+import lib.data._binary as binary
 
 
 TARGET_AVG_PATCH = 8

@@ -11,9 +11,9 @@ import torch
 import torch.distributed as dist
 import torch.utils.data  as data_utils
 
-import lib.entropy_model         as entropy
-import lib.dataset._fasta_stream as fasta_stream
-import lib.util.train            as train_util
+import lib.model.entropy         as entropy
+import lib.data._fasta_stream    as fasta_stream
+import lib.train.loop            as train_util
 
 
 def build_parser():
