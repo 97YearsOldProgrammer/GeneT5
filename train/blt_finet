@@ -90,6 +90,10 @@ def build_parser():
         help='freeze global transformer (Stage 1: train local modules only)')
     parser.add_argument('--global_lr_scale', required=False, type=float, default=1.0,
         metavar='<float>', help='LR multiplier for global transformer gradients [%(default).1f]')
+    parser.add_argument('--ratio_loss_weight', required=False, type=float, default=0.01,
+        metavar='<float>', help='weight for compression ratio regularization [%(default)g]')
+    parser.add_argument('--target_avg_patch', required=False, type=float, default=8.0,
+        metavar='<float>', help='target average patch size in bp [%(default).1f]')
     return parser
 
 
@@ -350,6 +354,14 @@ def main():
                         del logits
                     else:
                         loss = outputs['loss']
+
+                    # compression ratio regularization
+                    if args.ratio_loss_weight > 0 and outputs.get('target_patch_ids') is not None:
+                        tgt_pids        = outputs['target_patch_ids']
+                        actual_patches  = (tgt_pids.max(dim=1).values + 1).float().mean()
+                        target_patches  = batch['target_bytes'].shape[1] / args.target_avg_patch
+                        ratio_loss      = (actual_patches / max(target_patches, 1.0) - 1.0) ** 2
+                        loss            = loss + args.ratio_loss_weight * ratio_loss
 
                     loss = loss / args.grad_accum
 

@@ -4,14 +4,14 @@ import webdataset as wds
 import lib.dataset._binary as binary
 
 
-PATCH_SIZE       = 8
-BYTE_PAD_BUCKETS = list(range(PATCH_SIZE * 64, PATCH_SIZE * 9217, PATCH_SIZE * 64))
+TARGET_AVG_PATCH = 8
+BYTE_PAD_BUCKETS = list(range(TARGET_AVG_PATCH * 64, TARGET_AVG_PATCH * 9217, TARGET_AVG_PATCH * 64))
 BYTE_MAX_SEQ     = BYTE_PAD_BUCKETS[-1]
 BUDGET_PATCHES   = 8192
 
 
 def _byte_bucket_pad(length):
-    """Round byte length up to nearest bucket boundary (multiple of patch_size)"""
+    """Round byte length up to nearest bucket boundary"""
 
     for b in BYTE_PAD_BUCKETS:
         if length <= b:
@@ -21,15 +21,9 @@ def _byte_bucket_pad(length):
 
 
 def _patch_count(byte_len):
-    """Number of patches for a given byte length"""
+    """Estimated number of patches for a given byte length"""
 
-    return (byte_len + PATCH_SIZE - 1) // PATCH_SIZE
-
-
-def _pad_to_patch(byte_len):
-    """Round byte length up to nearest patch_size multiple"""
-
-    return ((byte_len + PATCH_SIZE - 1) // PATCH_SIZE) * PATCH_SIZE
+    return (byte_len + TARGET_AVG_PATCH - 1) // TARGET_AVG_PATCH
 
 
 def _length_sorted_chunks(source, sort_size=256):
@@ -122,8 +116,8 @@ class BytePrefixLMCollator:
             inputs.append(b["input_ids"][:p])
             targets.append(b["input_ids"][p:])
 
-        max_in_bytes  = _pad_to_patch(max(len(inp) for inp in inputs))
-        max_out_bytes = _pad_to_patch(max(len(tgt) for tgt in targets))
+        max_in_bytes  = max(len(inp) for inp in inputs)
+        max_out_bytes = max(len(tgt) for tgt in targets)
 
         all_input_bytes  = []
         all_target_bytes = []

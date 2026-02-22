@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import math
+import time
+import pathlib
+import functools
+
+import torch
+import torch.distributed as dist
+import torch.utils.data  as data_utils
+
+import lib.entropy_model         as entropy
+import lib.dataset._fasta_stream as fasta_stream
+import lib.util.train            as train_util
+
+
+def build_parser():
+
+    parser = argparse.ArgumentParser(description='Train DNA entropy model on raw FASTA')
+    parser.add_argument('raw_dir', type=str, metavar='<raw>',
+        help='raw FASTA directory with species subdirectories')
+    parser.add_argument('--output', required=True, type=str, metavar='<dir>',
+        help='output directory for model checkpoint')
+    parser.add_argument('--epochs', type=int, default=3, metavar='<int>',
+        help='number of training epochs [%(default)i]')
+    parser.add_argument('--lr', type=float, default=3e-4, metavar='<float>',
+        help='learning rate [%(default)g]')
+    parser.add_argument('--batch_size', type=int, default=64, metavar='<int>',
+        help='batch size [%(default)i]')
+    parser.add_argument('--max_len', type=int, default=512, metavar='<int>',
+        help='DNA window length [%(default)i]')
+    parser.add_argument('--dim', type=int, default=512, metavar='<int>',
+        help='model dimension [%(default)i]')
+    parser.add_argument('--num_layers', type=int, default=8, metavar='<int>',
+        help='number of encoder layers [%(default)i]')
+    parser.add_argument('--num_heads', type=int, default=8, metavar='<int>',
+        help='number of attention heads [%(default)i]')
+    parser.add_argument('--vocab_size', type=int, default=6, metavar='<int>',
+        help='vocabulary size [%(default)i]')
+    parser.add_argument('--window', type=int, default=512, metavar='<int>',
+        help='attention window size [%(default)i]')
+    parser.add_argument('--num_workers', type=int, default=2, metavar='<int>',
+        help='dataloader workers [%(default)i]')
+    parser.add_argument('--grad_accum', type=int, default=1, metavar='<int>',
+        help='gradient accumulation steps [%(default)i]')
+    parser.add_argument('--steps_per_epoch', type=int, default=10000, metavar='<int>',
+        help='training steps per epoch [%(default)i]')
+    parser.add_argument('--val_steps', type=int, default=500, metavar='<int>',
+        help='validation steps per epoch [%(default)i]')
+    parser.add_argument('--val_species', nargs='+', default=['E.coli', 'S.cerevisiae', 'O.latipes'],
+        metavar='<sp>', help='holdout validation species [%(default)s]')
+    parser.add_argument('--seed', type=int, default=42, metavar='<int>',
+        help='random seed [%(default)i]')
+    parser.add_argument('--compile', action='store_true',
+        help='enable torch.compile')
+    return parser
+
+
+def make_loader(manifest, args, seed_offset=0):
+    """Build DataLoader from FASTA manifest"""
+
+    dataset = fasta_stream.FASTAEntropyDataset(
+        manifest = manifest,
+        max_len  = args.max_len,
+        seed     = args.seed + seed_offset,
+    )
+
+    collate = fasta_stream.dna_collate
+
+    loader = data_utils.DataLoader(
+        dataset,
+        batch_size      = args.batch_size,
+        collate_fn      = collate,
+        num_workers     = args.num_workers,
+        pin_memory      = True,
+        persistent_workers = args.num_workers > 0,
+    )
+    return loader
+
+
+def run_validation(model, val_loader, loss_fn, vocab_size, device, dtype, val_steps):
+    """Run validation loop, return average loss"""
+
+    model.eval()
+    total_loss = 0
+    count      = 0
+
+    with torch.no_grad():
+        for step, batch in enumerate(val_loader):
+            if step >= val_steps:
+                break
+
+            input_ids = batch["input_ids"].to(device)
+            labels    = batch["labels"].to(device)
+
+            with torch.amp.autocast('cuda', dtype=dtype):
+                logits = model(input_ids)
+                loss   = loss_fn(logits.reshape(-1, vocab_size), labels.reshape(-1))
+
+            total_loss += loss.item()
+            count      += 1
+
+            del logits, loss, input_ids, labels
+
+    model.train()
+    return total_loss / max(count, 1)
+
+
+def main():
+
+    args = build_parser().parse_args()
+
+    dist_info = train_util.setup_distributed(backend="nccl")
+    is_dist   = dist_info is not None
+    is_main   = train_util.is_main_process()
+
+    if is_main:
+        print(f"\n{' DNA Entropy Model v2 Training ':=^60}")
+
+    if is_dist and is_main:
+        world = dist_info['world_size']
+        print(f"Distributed: {world} nodes, rank {dist_info['rank']}")
+
+    device = train_util.get_device()
+    train_util.set_seeds(args.seed)
+
+    if is_main:
+        print(f"Device: {device}")
+
+    # prepare FASTA index (decompress + build .fai)
+    raw_dir     = pathlib.Path(args.raw_dir)
+    val_species = set(args.val_species)
+
+    if is_main:
+        print(f"  Indexing FASTA files in {raw_dir}...")
+        print(f"  Validation species: {args.val_species}")
+
+    train_manifest = fasta_stream.prepare_fasta_index(raw_dir, skip_species=val_species)
+    val_manifest   = fasta_stream.prepare_fasta_index(raw_dir, skip_species=None)
+    val_manifest   = [e for e in val_manifest if e["species"] in val_species]
+
+    train_species = [e["species"] for e in train_manifest]
+    val_sp_found  = [e["species"] for e in val_manifest]
+
+    if not train_manifest:
+        if is_main:
+            print("ERROR: No training FASTA files found")
+        if is_dist:
+            train_util.cleanup_distributed()
+        return
+
+    if is_main:
+        total_bases = sum(
+            sum(ln for _, ln in e["chroms"]) for e in train_manifest
+        )
+        print(f"  Train species: {len(train_species)}")
+        print(f"  Val species:   {val_sp_found}")
+        print(f"  Total bases:   {total_bases:,}")
+
+    # build dataloaders
+    train_loader = make_loader(train_manifest, args, seed_offset=0)
+    val_loader   = make_loader(val_manifest, args, seed_offset=1000) if val_manifest else None
+
+    vocab_size = args.vocab_size
+
+    if is_main:
+        print(f"  Vocab size: {vocab_size}")
+        print(f"  Window:     {args.max_len}")
+
+    # build model
+    model = entropy.DNAEntropyModel(
+        vocab_size  = vocab_size,
+        dim         = args.dim,
+        num_layers  = args.num_layers,
+        num_heads   = args.num_heads,
+        window_size = args.window,
+    )
+
+    if is_main:
+        print(f"  Params: {model.get_param_count():,}")
+
+    model = model.to(device=device, dtype=torch.bfloat16)
+
+    if args.compile:
+        model = torch.compile(model, mode="default", dynamic=None)
+        if is_main:
+            print("  Compiled model")
+
+    model = train_util.wrap_model_distributed(model, device,
+        find_unused_params=False, static_graph=True)
+
+    # optimizer
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=0.01, betas=(0.9, 0.98),
+    )
+
+    world_size       = train_util.get_world_size()
+    batches_per_epoch = args.steps_per_epoch
+    total_steps       = batches_per_epoch * args.epochs // args.grad_accum
+    warmup_steps      = min(500, total_steps // 10)
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1 + math.cos(progress * math.pi))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    if is_main:
+        print(f"  Steps/epoch: {batches_per_epoch}, total: {total_steps}, warmup: {warmup_steps}")
+
+    # output dir
+    output_dir = pathlib.Path(args.output)
+    if is_main:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
+    dtype   = torch.bfloat16
+
+    if is_main:
+        print(f"\n{'=' * 60}")
+        print("Training...")
+        print(f"{'=' * 60}")
+
+    global_step = 0
+    best_loss   = float('inf')
+
+    for epoch in range(args.epochs):
+        if is_main:
+            print(f"\nEpoch {epoch + 1}/{args.epochs}")
+            print('-' * 40)
+
+        model.train()
+        total_loss  = 0
+        epoch_start = time.time()
+
+        optimizer.zero_grad(set_to_none=True)
+
+        for step, batch in enumerate(train_loader):
+            if step >= batches_per_epoch:
+                break
+
+            input_ids = batch["input_ids"].to(device)
+            labels    = batch["labels"].to(device)
+
+            with torch.amp.autocast('cuda', dtype=dtype):
+                logits = model(input_ids)
+                loss   = loss_fn(logits.reshape(-1, vocab_size), labels.reshape(-1))
+                loss   = loss / args.grad_accum
+
+            loss.backward()
+
+            if (step + 1) % args.grad_accum == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+
+            loss_val    = loss.item() * args.grad_accum
+            total_loss += loss_val
+
+            if is_main and (step + 1) % 200 == 0:
+                elapsed = time.time() - epoch_start
+                avg     = total_loss / (step + 1)
+                bps     = (step + 1) / elapsed if elapsed > 0 else 0
+                lr      = scheduler.get_last_lr()[0]
+                print(f"  step {global_step} | loss {avg:.4f} | "
+                      f"batch {step+1}/{batches_per_epoch} | "
+                      f"{bps:.1f} batch/s | lr {lr:.2e}")
+
+            del logits, loss, input_ids, labels
+
+        epoch_loss = total_loss / max(batches_per_epoch, 1)
+
+        if is_dist:
+            loss_t = torch.tensor([epoch_loss], device=device)
+            train_util.all_reduce_mean(loss_t)
+            epoch_loss = loss_t.item()
+
+        elapsed = time.time() - epoch_start
+        if is_main:
+            print(f"  Train loss: {epoch_loss:.4f} ({elapsed:.0f}s)")
+
+        # validation
+        val_loss = None
+        if val_loader is not None:
+            raw_model = train_util.unwrap_model(model)
+            val_loss  = run_validation(
+                raw_model, val_loader, loss_fn, vocab_size,
+                device, dtype, args.val_steps,
+            )
+            if is_dist:
+                vl_t = torch.tensor([val_loss], device=device)
+                train_util.all_reduce_mean(vl_t)
+                val_loss = vl_t.item()
+
+            if is_main:
+                print(f"  Val loss:   {val_loss:.4f}")
+
+        save_loss = val_loss if val_loss is not None else epoch_loss
+
+        if save_loss < best_loss:
+            best_loss = save_loss
+            if is_main:
+                raw_model = train_util.unwrap_model(model)
+                raw_model.save(output_dir / "pytorch_model.bin")
+
+                config = {
+                    "vocab_size":   vocab_size,
+                    "dim":          args.dim,
+                    "num_layers":   args.num_layers,
+                    "num_heads":    args.num_heads,
+                    "ff_dim":       args.dim * 4,
+                    "window_size":  args.window,
+                    "best_loss":    best_loss,
+                    "epoch":        epoch + 1,
+                    "data_source":  "raw_fasta",
+                    "train_species": train_species,
+                    "val_species":   list(val_species),
+                }
+                with open(output_dir / "entropy_config.json", "w") as f:
+                    json.dump(config, f, indent=2)
+                print(f"  Saved best model (loss={best_loss:.4f})")
+
+        train_util.barrier()
+
+    if is_main:
+        print(f"\n{'=' * 60}")
+        print(f"Complete! Best loss: {best_loss:.4f}")
+        print(f"Model saved to: {output_dir}")
+        print(f"{'=' * 60}")
+
+    if is_dist:
+        train_util.cleanup_distributed()
+
+
+if __name__ == '__main__':
+    main()

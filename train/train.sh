@@ -3,9 +3,9 @@
 # Baked training launcher for GeneT5 fine-tuning
 #
 # Usage:
-#   Single node:  bin/train.sh
-#   Master:       bin/train.sh --nnodes 2 --node-rank 0 --master 192.168.100.10
-#   Worker:       bin/train.sh --nnodes 2 --node-rank 1 --master 192.168.100.10
+#   Single node:  train/train.sh
+#   Master:       train/train.sh --nnodes 2 --node-rank 0 --master 192.168.100.10
+#   Worker:       train/train.sh --nnodes 2 --node-rank 1 --master 192.168.100.10
 
 set -e
 

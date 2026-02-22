@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 
-from lib.blocks.encoder import Encoder
+from lib.blocks.encoder      import Encoder
+from lib.blocks._scatter_ops import scatter_pool, patch_ids_from_boundaries, enforce_patch_constraints
 
 _HASH_PRIME = 31
 
@@ -83,7 +84,7 @@ class NGramEmbedding(nn.Module):
 
 
 class LocalEncoder(nn.Module):
-    """Compress byte sequences to patches via windowed attention + mean-pool"""
+    """Compress byte sequences to patches via windowed attention + dynamic boundaries"""
 
     def __init__(
         self,
@@ -98,10 +99,13 @@ class LocalEncoder(nn.Module):
         dropout          = 0.0,
         ngram_sizes      = tuple(range(3, 21)),
         hash_table_size  = 4096,
+        min_patch_size   = 4,
+        max_patch_size   = 32,
     ):
         super().__init__()
 
-        self.patch_size = patch_size
+        self.min_patch_size = min_patch_size
+        self.max_patch_size = max_patch_size
 
         self.byte_embed  = nn.Embedding(byte_vocab_size, local_dim)
         self.ngram_embed = NGramEmbedding(local_dim, ngram_sizes, hash_table_size)
@@ -116,10 +120,11 @@ class LocalEncoder(nn.Module):
             window_size = window_size,
         )
 
-        self.patch_proj = nn.Linear(local_dim, global_dim, bias=False)
+        self.boundary_head = nn.Linear(local_dim, 1)
+        self.patch_proj    = nn.Linear(local_dim, global_dim, bias=False)
 
-    def forward(self, byte_ids):
-        """byte_ids: [B, L] -> patches: [B, L // patch_size, global_dim]"""
+    def forward(self, byte_ids, patch_ids=None):
+        """byte_ids: [B, L] -> (patches, patch_ids, boundary_logits)"""
 
         byte_emb  = self.byte_embed(byte_ids)
         ngram_emb = self.ngram_embed(byte_ids)
@@ -127,8 +132,21 @@ class LocalEncoder(nn.Module):
         x = byte_emb / self.ngram_embed._num_sizes_plus_1 + ngram_emb
         x = self.encoder(x)
 
-        B, L, D = x.shape
-        P       = self.patch_size
-        x       = x[:, :L // P * P].reshape(B, -1, P, D).mean(dim=2)
+        boundary_logits = self.boundary_head(x).squeeze(-1)
 
-        return self.patch_proj(x)
+        if patch_ids is None:
+            boundary_probs = torch.sigmoid(boundary_logits)
+            boundary_mask  = boundary_probs > 0.5
+            boundary_mask[:, 0] = True
+            boundary_mask  = enforce_patch_constraints(
+                boundary_mask, self.min_patch_size, self.max_patch_size,
+            )
+            patch_ids = patch_ids_from_boundaries(boundary_mask)
+
+        num_patches = patch_ids.max(dim=1).values + 1
+        max_patches = num_patches.max().item()
+
+        patches = scatter_pool(x, patch_ids, max_patches)
+        patches = self.patch_proj(patches)
+
+        return patches, patch_ids, boundary_logits

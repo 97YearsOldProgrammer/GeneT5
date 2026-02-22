@@ -3,6 +3,7 @@ import torch.nn as nn
 from lib.blocks.decoder      import Decoder
 from lib.blocks._blockcross  import CrossAttention, CrossAttentionConfig
 from lib.blocks._component   import LayerNorm
+from lib.blocks._scatter_ops import scatter_unpool
 
 
 class LocalDecoder(nn.Module):
@@ -20,8 +21,6 @@ class LocalDecoder(nn.Module):
         dropout         = 0.0,
     ):
         super().__init__()
-
-        self.patch_size = patch_size
 
         self.patch_unpool = nn.Linear(global_dim, local_dim, bias=False)
         self.byte_embed   = nn.Embedding(byte_vocab_size, local_dim)
@@ -46,14 +45,15 @@ class LocalDecoder(nn.Module):
 
         self.byte_head = nn.Linear(local_dim, byte_vocab_size, bias=False)
 
-    def forward(self, patch_hidden, target_bytes):
+    def forward(self, patch_hidden, target_bytes, patch_ids):
         """
         patch_hidden: [B, P, global_dim] from global transformer
         target_bytes: [B, T] teacher-forced byte IDs (already shifted)
+        patch_ids:    [B, T] patch assignment for each target byte
         """
 
-        context  = self.patch_unpool(patch_hidden)
-        context  = context.repeat_interleave(self.patch_size, dim=1)
+        context = self.patch_unpool(patch_hidden)
+        context = scatter_unpool(context, patch_ids, target_bytes.shape[1])
 
         byte_emb = self.byte_embed(target_bytes)
 

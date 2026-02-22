@@ -10,6 +10,7 @@ from pathlib import Path
 from lib.blocks                import Decoder
 from lib.blocks.local_encoder  import LocalEncoder
 from lib.blocks.local_decoder  import LocalDecoder
+from lib.blocks._scatter_ops   import patch_ids_from_boundaries
 
 from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
 
@@ -18,12 +19,12 @@ class GeneBLT(nn.Module):
 
     def __init__(
         self,
-        byte_vocab_size  = 14,
-        local_dim        = 256,
-        global_dim       = 768,
-        local_num_layers = 4,
-        local_num_heads  = 4,
-        local_ff_dim     = 1024,
+        byte_vocab_size   = 14,
+        local_dim         = 256,
+        global_dim        = 768,
+        local_num_layers  = 4,
+        local_num_heads   = 4,
+        local_ff_dim      = 1024,
         global_num_layers = 12,
         global_num_heads  = 12,
         global_ff_dim     = 3072,
@@ -36,12 +37,15 @@ class GeneBLT(nn.Module):
         num_kv_heads      = None,
         ngram_sizes       = tuple(range(3, 21)),
         hash_table_size   = 4096,
+        min_patch_size    = 4,
+        max_patch_size    = 32,
+        target_avg_patch_size = 8,
     ):
         super().__init__()
 
-        self.byte_vocab_size = byte_vocab_size
-        self.patch_size      = patch_size
-        self.global_dim      = global_dim
+        self.byte_vocab_size      = byte_vocab_size
+        self.global_dim           = global_dim
+        self.target_avg_patch_size = target_avg_patch_size
 
         self.local_encoder = LocalEncoder(
             byte_vocab_size = byte_vocab_size,
@@ -55,6 +59,8 @@ class GeneBLT(nn.Module):
             dropout         = dropout,
             ngram_sizes     = ngram_sizes,
             hash_table_size = hash_table_size,
+            min_patch_size  = min_patch_size,
+            max_patch_size  = max_patch_size,
         )
 
         self.global_transformer = Decoder(
@@ -84,15 +90,24 @@ class GeneBLT(nn.Module):
 
         self.loss_fct = LigerCrossEntropyLoss(ignore_index=-100)
 
-    def forward(self, input_bytes, target_bytes, labels=None):
+    def forward(
+        self, input_bytes, target_bytes, labels=None,
+        input_patch_ids=None, target_patch_ids=None,
+    ):
         """
-        input_bytes:  [B, L_in]  padded to patch_size multiple
-        target_bytes: [B, L_out] padded to patch_size multiple
-        labels:       [B, L_out - 1] byte-level labels (-100 on padding)
+        input_bytes:      [B, L_in]  byte IDs
+        target_bytes:     [B, L_out] byte IDs
+        labels:           [B, L_out - 1] byte-level labels (-100 on padding)
+        input_patch_ids:  [B, L_in]  optional precomputed patch assignments
+        target_patch_ids: [B, L_out] optional precomputed patch assignments
         """
 
-        input_patches  = self.local_encoder(input_bytes)
-        target_patches = self.local_encoder(target_bytes)
+        input_patches, input_pids, input_blog = self.local_encoder(
+            input_bytes, patch_ids=input_patch_ids,
+        )
+        target_patches, target_pids, target_blog = self.local_encoder(
+            target_bytes, patch_ids=target_patch_ids,
+        )
 
         P_in = input_patches.shape[1]
 
@@ -105,7 +120,9 @@ class GeneBLT(nn.Module):
         )
 
         target_out = global_out[:, P_in:]
-        logits     = self.local_decoder(target_out, target_bytes[:, :-1])
+
+        target_dec_pids = target_pids[:, :-1]
+        logits = self.local_decoder(target_out, target_bytes[:, :-1], target_dec_pids)
 
         loss = None
         if labels is not None:
@@ -116,7 +133,15 @@ class GeneBLT(nn.Module):
             if moe_loss is not None:
                 loss = loss + moe_loss
 
-        return {"logits": logits, "loss": loss, "moe_loss": moe_loss}
+        return {
+            "logits":                  logits,
+            "loss":                    loss,
+            "moe_loss":                moe_loss,
+            "input_patch_ids":         input_pids,
+            "target_patch_ids":        target_pids,
+            "input_boundary_logits":   input_blog,
+            "target_boundary_logits":  target_blog,
+        }
 
     @torch.no_grad()
     def generate(
@@ -129,11 +154,7 @@ class GeneBLT(nn.Module):
         eos_token_id = 7,
         pad_token_id = 0,
     ):
-        """Two-level autoregressive generation
-
-        Global: produce patches one group at a time
-        Local: decode bytes within each patch group
-        """
+        """Two-level autoregressive generation with dynamic patches"""
 
         was_training = self.training
         self.eval()
@@ -141,40 +162,39 @@ class GeneBLT(nn.Module):
         try:
             device = input_bytes.device
             B      = input_bytes.size(0)
-            P      = self.patch_size
 
-            input_patches = self.local_encoder(input_bytes)
-            P_in          = input_patches.shape[1]
+            input_patches, input_pids, _ = self.local_encoder(input_bytes)
+            P_in = input_patches.shape[1]
 
             generated = []
             finished  = torch.zeros(B, dtype=torch.bool, device=device)
 
-            target_start = torch.full((B, 1), pad_token_id, dtype=torch.long, device=device)
+            target_start     = torch.full((B, 1), pad_token_id, dtype=torch.long, device=device)
             all_target_bytes = target_start
 
             while len(generated) < max_length:
                 if finished.all():
                     break
 
-                pad_needed    = (P - all_target_bytes.size(1) % P) % P
-                padded_target = F.pad(all_target_bytes, (0, pad_needed), value=pad_token_id)
-
-                target_patches = self.local_encoder(padded_target)
-                all_patches    = torch.cat([input_patches, target_patches], dim=1)
+                target_patches, target_pids, _ = self.local_encoder(all_target_bytes)
+                all_patches = torch.cat([input_patches, target_patches], dim=1)
 
                 global_out, _ = self.global_transformer(
                     all_patches, prefix_len=P_in,
                 )
 
                 target_out = global_out[:, P_in:]
-                logits     = self.local_decoder(target_out, all_target_bytes[:, -1:])
+
+                last_pids = target_pids[:, -1:]
+                logits    = self.local_decoder(target_out, all_target_bytes[:, -1:], last_pids)
                 next_logit = logits[:, -1, :]
 
                 if temperature != 1.0:
                     next_logit = next_logit / temperature
 
                 if top_k > 0:
-                    thresh                    = torch.topk(next_logit, top_k)[0][..., -1, None]
+                    k      = min(top_k, next_logit.size(-1))
+                    thresh = torch.topk(next_logit, k)[0][..., -1, None]
                     next_logit[next_logit < thresh] = float('-inf')
 
                 probs      = F.softmax(next_logit, dim=-1)
@@ -245,24 +265,27 @@ class GeneBLT(nn.Module):
             config = json.load(f)
 
         model = cls(
-            byte_vocab_size   = config.get("byte_vocab_size", 14),
-            local_dim         = config.get("local_dim", 256),
-            global_dim        = config.get("global_dim", 768),
-            local_num_layers  = config.get("local_num_layers", 4),
-            local_num_heads   = config.get("local_num_heads", 4),
-            local_ff_dim      = config.get("local_ff_dim", 1024),
-            global_num_layers = config.get("global_num_layers", 12),
-            global_num_heads  = config.get("global_num_heads", 12),
-            global_ff_dim     = config.get("global_ff_dim", 3072),
-            patch_size        = config.get("patch_size", 8),
-            enc_window_size   = tuple(config.get("enc_window_size", [256, 256])),
-            dropout           = config.get("dropout", 0.1),
-            use_moe           = config.get("use_moe", True),
-            num_experts       = config.get("num_experts", 8),
-            moe_top_k         = config.get("moe_top_k", 2),
-            num_kv_heads      = config.get("num_kv_heads"),
-            ngram_sizes       = tuple(config.get("ngram_sizes", list(range(3, 21)))),
-            hash_table_size   = config.get("hash_table_size", 4096),
+            byte_vocab_size       = config.get("byte_vocab_size", 14),
+            local_dim             = config.get("local_dim", 256),
+            global_dim            = config.get("global_dim", 768),
+            local_num_layers      = config.get("local_num_layers", 4),
+            local_num_heads       = config.get("local_num_heads", 4),
+            local_ff_dim          = config.get("local_ff_dim", 1024),
+            global_num_layers     = config.get("global_num_layers", 12),
+            global_num_heads      = config.get("global_num_heads", 12),
+            global_ff_dim         = config.get("global_ff_dim", 3072),
+            patch_size            = config.get("patch_size", 8),
+            enc_window_size       = tuple(config.get("enc_window_size", [256, 256])),
+            dropout               = config.get("dropout", 0.1),
+            use_moe               = config.get("use_moe", True),
+            num_experts           = config.get("num_experts", 8),
+            moe_top_k             = config.get("moe_top_k", 2),
+            num_kv_heads          = config.get("num_kv_heads"),
+            ngram_sizes           = tuple(config.get("ngram_sizes", list(range(3, 21)))),
+            hash_table_size       = config.get("hash_table_size", 4096),
+            min_patch_size        = config.get("min_patch_size", 4),
+            max_patch_size        = config.get("max_patch_size", 32),
+            target_avg_patch_size = config.get("target_avg_patch_size", 8),
         )
 
         model.load(path / "pytorch_model.bin")

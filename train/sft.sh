@@ -3,13 +3,13 @@
 # Distributed fine-tuning across two DGX Sparks
 #
 # One-click (from master):
-#   bin/sft.sh <data_dir> <output> <model> --worker <WORKER_IP>
+#   train/sft.sh <data_dir> <output> <model> --worker <WORKER_IP>
 #
 # Manual (run on each node separately):
-#   Master: bin/sft.sh <data_dir> <output> <model> --nnodes 2 --node-rank 0 --master <MASTER_IP>
-#   Worker: bin/sft.sh <data_dir> <output> <model> --nnodes 2 --node-rank 1 --master <MASTER_IP>
+#   Master: train/sft.sh <data_dir> <output> <model> --nnodes 2 --node-rank 0 --master <MASTER_IP>
+#   Worker: train/sft.sh <data_dir> <output> <model> --nnodes 2 --node-rank 1 --master <MASTER_IP>
 #
-# All extra flags (--epochs, --lr, --batch_size, etc.) are passed to bin/finet
+# All extra flags (--epochs, --lr, --batch_size, etc.) are passed to train/finet
 #
 
 set -e
@@ -125,7 +125,7 @@ if [ -z "$DATA_DIR" ] || [ -z "$OUTPUT_DIR" ] || [ -z "$MODEL_PATH" ]; then
     echo "  --port PORT         Master port (default: 29500)"
     echo "  --nproc N           Processes per node (default: 1)"
     echo ""
-    echo "All other flags passed to bin/finet (--epochs, --lr, --batch_size, etc.)"
+    echo "All other flags passed to train/finet (--epochs, --lr, --batch_size, etc.)"
     exit 1
 fi
 
@@ -230,7 +230,7 @@ build_torchrun_cmd() {
         --node_rank=$rank \
         --master_addr=$MASTER_ADDR \
         --master_port=$MASTER_PORT \
-        bin/finet \
+        train/finet \
         $DATA_DIR \
         $OUTPUT_DIR \
         $MODEL_PATH \
@@ -344,7 +344,7 @@ if [[ -n "$WORKER_IP" ]]; then
         fi
         # Belt-and-suspenders: pattern kill (catches orphans + data loader workers)
         pkill -9 -f 'torchrun.*finet' 2>/dev/null || true
-        pkill -9 -f 'python.*bin/finet' 2>/dev/null || true
+        pkill -9 -f 'python.*train/finet' 2>/dev/null || true
     }
 
     kill_remote() {
@@ -352,7 +352,7 @@ if [[ -n "$WORKER_IP" ]]; then
         # Use background + wait to avoid blocking on unresponsive worker
         (
             timeout 10 ${SSH_BASE} "${WORKER_USER}@${WORKER_IP}" \
-                "docker exec ${CONTAINER} bash -c 'pkill -9 -f torchrun; pkill -9 -f python.*finet'" \
+                "docker exec ${CONTAINER} bash -c 'pkill -9 -f torchrun; pkill -9 -f python.*train/finet'" \
                 2>/dev/null \
             || timeout 15 ${SSH_BASE} "${WORKER_USER}@${WORKER_IP}" \
                 "docker restart ${CONTAINER}" \
@@ -372,7 +372,7 @@ if [[ -n "$WORKER_IP" ]]; then
 
     verify_clean() {
         for attempt in 1 2 3; do
-            if ! pgrep -f 'python.*bin/finet' >/dev/null 2>&1 && \
+            if ! pgrep -f 'python.*train/finet' >/dev/null 2>&1 && \
                ! pgrep -f 'torchrun.*finet' >/dev/null 2>&1; then
                 return 0
             fi

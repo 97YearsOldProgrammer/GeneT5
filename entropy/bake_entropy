@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import pathlib
+import struct
+
+import torch
+import numpy as np
+
+import lib.blt_tokenizer   as btk
+import lib.entropy_model   as entropy
+import lib.dataset._binary as binary
+
+
+def build_parser():
+
+    parser = argparse.ArgumentParser(description='Precompute entropy-guided patch boundaries')
+    parser.add_argument('data_dir', type=str, metavar='<data>',
+        help='baked data directory with .bin files')
+    parser.add_argument('--entropy_model', required=True, type=str, metavar='<path>',
+        help='trained entropy model checkpoint')
+    parser.add_argument('--threshold', type=float, default=1.5, metavar='<float>',
+        help='entropy threshold [%(default)g]')
+    parser.add_argument('--min_patch', type=int, default=4, metavar='<int>',
+        help='minimum patch size [%(default)i]')
+    parser.add_argument('--max_patch', type=int, default=32, metavar='<int>',
+        help='maximum patch size [%(default)i]')
+    parser.add_argument('--output', required=True, type=str, metavar='<dir>',
+        help='output directory for patch_ids files')
+    parser.add_argument('--batch_size', type=int, default=32, metavar='<int>',
+        help='batch size [%(default)i]')
+    return parser
+
+
+def load_entropy_model(model_path):
+    """Load entropy model from checkpoint directory"""
+
+    model_dir   = pathlib.Path(model_path).parent
+    config_path = model_dir / "entropy_config.json"
+
+    with open(config_path) as f:
+        cfg = json.load(f)
+
+    model = entropy.DNAEntropyModel(
+        vocab_size  = cfg["vocab_size"],
+        dim         = cfg["dim"],
+        num_layers  = cfg["num_layers"],
+        num_heads   = cfg["num_heads"],
+        ff_dim      = cfg.get("ff_dim", cfg["dim"] * 4),
+        window_size = cfg.get("window_size", 512),
+    )
+    model.load(model_path)
+    return model
+
+
+def compute_patch_ids_batch(model, byte_ids_list, threshold, min_patch, max_patch, device):
+    """Compute patch IDs for a batch of byte sequences"""
+
+    max_len = max(len(s) for s in byte_ids_list)
+    padded  = [s + [0] * (max_len - len(s)) for s in byte_ids_list]
+    ids_t   = torch.tensor(padded, dtype=torch.long, device=device)
+
+    with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
+        patch_ids = model.compute_boundaries(ids_t, threshold, min_patch, max_patch)
+
+    results = []
+    for i, seq in enumerate(byte_ids_list):
+        pids = patch_ids[i, :len(seq)].cpu().tolist()
+        results.append(pids)
+
+    return results
+
+
+def write_patch_ids(patch_ids_list, output_path):
+    """Write patch IDs to binary file
+
+    Format: [num_seqs: I] [seq_len: I, patch_ids: [I]*seq_len]*
+    """
+
+    with open(output_path, 'wb') as f:
+        f.write(struct.pack('<I', len(patch_ids_list)))
+
+        for pids in patch_ids_list:
+            f.write(struct.pack('<I', len(pids)))
+            f.write(struct.pack(f'<{len(pids)}i', *pids))
+
+
+def main():
+
+    args = build_parser().parse_args()
+
+    print(f"\n{' Entropy-Guided Boundary Baking ':=^60}")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model  = load_entropy_model(args.entropy_model)
+    model  = model.to(device=device, dtype=torch.bfloat16)
+    model.eval()
+
+    print(f"  Entropy model: {model.get_param_count():,} params")
+
+    tokenizer  = btk.ByteTokenizer()
+    data_dir   = pathlib.Path(args.data_dir)
+    output_dir = pathlib.Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    bake_cfg = data_dir / "bake_config.json"
+    with open(bake_cfg) as f:
+        cfg = json.load(f)
+
+    species_list = cfg.get("train_species", [])
+
+    total_seqs    = 0
+    total_patches = 0
+    total_bytes   = 0
+
+    for sp in species_list:
+        sp_dir = data_dir / sp
+        bin_files = sorted(sp_dir.glob("*.bin"))
+
+        if not bin_files:
+            continue
+
+        sp_out = output_dir / sp
+        sp_out.mkdir(parents=True, exist_ok=True)
+
+        for bf in bin_files:
+            count = binary.get_chunk_count(bf)
+            all_patch_ids = []
+            batch_buf     = []
+            batch_lens    = []
+
+            for idx, chunk in binary.iter_binary(bf):
+                inp_ids = tokenizer.encode(chunk.get_input_text(), add_special_tokens=False)
+                tgt_ids = tokenizer.encode(chunk.get_target_text(), add_special_tokens=False)
+                combined = inp_ids + tgt_ids
+                batch_buf.append(combined)
+                batch_lens.append(len(inp_ids))
+
+                if len(batch_buf) >= args.batch_size:
+                    pids = compute_patch_ids_batch(
+                        model, batch_buf, args.threshold,
+                        args.min_patch, args.max_patch, device,
+                    )
+                    all_patch_ids.extend(zip(pids, batch_lens))
+                    batch_buf = []
+                    batch_lens = []
+
+            if batch_buf:
+                pids = compute_patch_ids_batch(
+                    model, batch_buf, args.threshold,
+                    args.min_patch, args.max_patch, device,
+                )
+                all_patch_ids.extend(zip(pids, batch_lens))
+
+            out_name = bf.stem + "_patchids.bin"
+            patch_data = [p for p, _ in all_patch_ids]
+            write_patch_ids(patch_data, sp_out / out_name)
+
+            for pids, _ in all_patch_ids:
+                total_seqs    += 1
+                total_bytes   += len(pids)
+                total_patches += max(pids) + 1 if pids else 0
+
+            print(f"  {sp}/{bf.name}: {count} chunks -> {out_name}")
+
+    avg_bp = total_bytes / max(total_patches, 1)
+    print(f"\n  Total: {total_seqs:,} sequences")
+    print(f"  Avg bp/patch: {avg_bp:.1f}")
+    print(f"  Output: {output_dir}")
+
+    # save config
+    with open(output_dir / "entropy_bake_config.json", "w") as f:
+        json.dump({
+            "source_data":    str(data_dir),
+            "entropy_model":  args.entropy_model,
+            "threshold":      args.threshold,
+            "min_patch":      args.min_patch,
+            "max_patch":      args.max_patch,
+            "total_seqs":     total_seqs,
+            "total_patches":  total_patches,
+            "total_bytes":    total_bytes,
+            "avg_bp_patch":   avg_bp,
+        }, f, indent=2)
+
+
+if __name__ == '__main__':
+    main()
