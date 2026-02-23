@@ -274,9 +274,17 @@ if [[ -n "$WORKER_IP" ]]; then
             ;;
     esac
 
+    # Detect GeneT5 code path on worker (differs from master mount layout)
+    WORKER_CODE_DIR=$(${SSH_CMD} "docker exec ${CONTAINER} bash -c 'for d in /workspace/Code/GeneT5 /workspace/GeneT5; do [ -f \$d/train/finet ] && echo \$d && break; done'" 2>/dev/null)
+    if [[ -z "$WORKER_CODE_DIR" ]]; then
+        echo "ERROR: Cannot find GeneT5 code directory on worker"
+        exit 1
+    fi
+    echo "[worker] Code directory: ${WORKER_CODE_DIR}"
+
     # Sync requirements on worker (idempotent, picks up webdataset etc.)
     echo "[worker] Syncing pip requirements..."
-    ${SSH_CMD} "docker exec ${CONTAINER} pip install -q -r /workspace/Code/GeneT5/requirements.txt" 2>/dev/null || true
+    ${SSH_CMD} "docker exec ${CONTAINER} pip install -q -r ${WORKER_CODE_DIR}/requirements.txt" 2>/dev/null || true
 
     # Auto-patch NGC triton cluster_dims bug on both nodes (idempotent)
     TRITON_FILE="/usr/local/lib/python3.12/dist-packages/torch/_inductor/runtime/triton_heuristics.py"
@@ -300,7 +308,7 @@ if [[ -n "$WORKER_IP" ]]; then
         esac
     done
     ENV_STR+="export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8; "
-    ENV_STR+="export PYTHONPATH=/workspace/Code/GeneT5; "
+    ENV_STR+="export PYTHONPATH=${WORKER_CODE_DIR}; "
     # Worker detects its own CX7 interface + HCA (may differ from master)
     ENV_STR+="for iface in enP2p1s0f1np1 enP2p1s0f0np0 enp1s0f1np1 enp1s0f0np0; do "
     ENV_STR+="  if [ -d /sys/class/net/\$iface ] && python3 -c \"import socket,struct,fcntl;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);socket.inet_ntoa(fcntl.ioctl(s.fileno(),0x8915,struct.pack('256s',b'\$iface'))[20:24])\" 2>/dev/null; then "
@@ -308,9 +316,9 @@ if [[ -n "$WORKER_IP" ]]; then
     ENV_STR+="    tmp=\${iface#en}; export NCCL_IB_HCA=roce\${tmp%np*}; break; "
     ENV_STR+="  fi; "
     ENV_STR+="done; "
-    ENV_STR+="cd /workspace/Code/GeneT5; "
+    ENV_STR+="cd ${WORKER_CODE_DIR}; "
     # Pre-flight cleanup on worker (pycache, inductor, page cache)
-    ENV_STR+="find /workspace/Code/GeneT5 -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true; "
+    ENV_STR+="find ${WORKER_CODE_DIR} -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true; "
     ENV_STR+="rm -rf /tmp/torchinductor_root/ 2>/dev/null || true; "
     ENV_STR+="sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true; "
 
