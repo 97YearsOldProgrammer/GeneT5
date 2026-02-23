@@ -5,7 +5,7 @@ from lib.model.build import build_gt5
 
 parser = argparse.ArgumentParser(
     description="Initialize GeneT5 weights from DNABERT-2 and save to disk.")
-parser.add_argument("--save_dir", type=str, default="./checkpoints/genet5_init",
+parser.add_argument("--save_dir", type=str, default="/workspace/model/GeneT5/init/genet5_init",
     help="Directory to save the initialized model weights and config.")
 parser.add_argument("--dnabert_path", type=str, default="zhihan1996/DNABERT-2-117M",
     help="HuggingFace model ID or local path to DNABERT-2.")

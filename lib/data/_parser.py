@@ -309,18 +309,31 @@ def extract_biotypes(features):
 
 
 def find_genome_files(species_dir):
-    """Find FASTA and GFF files in species directory"""
+    """Find FASTA and GFF files in species directory, preferring uncompressed"""
 
     species_dir = pathlib.Path(species_dir)
     fna_path    = None
     gff_path    = None
 
+    fna_gz = ('.fna.gz', '.fa.gz', '.fasta.gz')
+    fna_raw = ('.fna', '.fa', '.fasta')
+    gff_gz  = ('.gff.gz', '.gff3.gz')
+    gff_raw = ('.gff', '.gff3')
+
     for f in species_dir.iterdir():
         name = f.name.lower()
-        if name.endswith(('.fna', '.fna.gz', '.fa', '.fa.gz', '.fasta', '.fasta.gz')) or name == 'fna.gz':
+
+        if name.endswith(fna_raw) or name in ('fna',):
             fna_path = f
-        elif name.endswith(('.gff', '.gff.gz', '.gff3', '.gff3.gz')) or name == 'gff.gz':
+        elif name.endswith(fna_gz) or name in ('fna.gz',):
+            if fna_path is None:
+                fna_path = f
+
+        if name.endswith(gff_raw) or name in ('gff',):
             gff_path = f
+        elif name.endswith(gff_gz) or name in ('gff.gz',):
+            if gff_path is None:
+                gff_path = f
 
     if not fna_path:
         raise FileNotFoundError(f"No FASTA file found in {species_dir}")

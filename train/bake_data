@@ -19,9 +19,9 @@ parser = argparse.ArgumentParser(
     description="Bake species data: training bins, validation bins, and eval samples")
 parser.add_argument("raw_dir", type=str, metavar="<raw_dir>",
     help="Directory containing species subdirectories (fna.gz + gff.gz)")
-parser.add_argument("--output_dir", type=str, default="../baked",
+parser.add_argument("--output_dir", type=str, default="/workspace/baked",
     help="Output directory for baked files [%(default)s]")
-parser.add_argument("--log_dir",    type=str, default="../logs/baker",
+parser.add_argument("--log_dir",    type=str, default="/workspace/logs/baker",
     help="Directory for log files [%(default)s]")
 parser.add_argument("--window_size", type=int, default=20000,
     help="Window size in base pairs [%(default)s]")
