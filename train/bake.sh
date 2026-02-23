@@ -124,7 +124,17 @@ sleep 2
 
 # ── Launch host (node 0) locally ──
 echo "[node 0] Launching locally..."
-PYTHONPATH=/workspace/Code/GeneT5 python train/bake_data ${BAKE_ARGS[*]} --train \
+# Auto-detect master code dir
+MASTER_CODE_DIR=""
+for d in /workspace/Code/GeneT5 /workspace/GeneT5; do
+    [ -f "$d/train/bake_data" ] && MASTER_CODE_DIR="$d" && break
+done
+if [[ -z "$MASTER_CODE_DIR" ]]; then
+    MASTER_CODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+fi
+
+cd "$MASTER_CODE_DIR"
+PYTHONPATH="$MASTER_CODE_DIR" python train/bake_data ${BAKE_ARGS[*]} --train \
     --nnodes 2 --node_rank 0 \
     > >(while IFS= read -r line; do echo "[node 0] $line"; done) \
     2>&1 &
@@ -160,7 +170,7 @@ echo "============================================================"
 echo "  Finalizing: merge + eval"
 echo "============================================================"
 
-PYTHONPATH=/workspace/Code/GeneT5 python train/bake_data ${BAKE_ARGS[*]} --finalize
+PYTHONPATH="$MASTER_CODE_DIR" python train/bake_data ${BAKE_ARGS[*]} --finalize
 
 echo ""
 echo "============================================================"

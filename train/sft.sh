@@ -174,7 +174,15 @@ for env in "${NCCL_ENVS[@]}"; do
     export "$env"
 done
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,garbage_collection_threshold:0.8"
-export PYTHONPATH="${PYTHONPATH:-/workspace/Code/GeneT5}"
+# Auto-detect master code dir (same logic as worker detection)
+MASTER_CODE_DIR=""
+for d in /workspace/Code/GeneT5 /workspace/GeneT5; do
+    [ -f "$d/train/finet" ] && MASTER_CODE_DIR="$d" && break
+done
+if [[ -z "$MASTER_CODE_DIR" ]]; then
+    MASTER_CODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+fi
+export PYTHONPATH="$MASTER_CODE_DIR"
 
 
 ####################
@@ -205,8 +213,9 @@ echo "========================================"
 ##################################
 
 
+cd "$MASTER_CODE_DIR"
 echo "[preflight] Clearing stale caches..."
-find /workspace/Code/GeneT5 -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+find "$MASTER_CODE_DIR" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 rm -rf /tmp/torchinductor_root/ 2>/dev/null || true
 sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || echo "[preflight] WARNING: drop_caches failed (need root)"
 
