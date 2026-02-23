@@ -419,7 +419,8 @@ if [[ -n "$WORKER_IP" ]]; then
     }
     trap cleanup EXIT
     trap 'cleanup; exit 130' INT
-    trap 'cleanup; exit 143' TERM HUP PIPE
+    trap 'cleanup; exit 143' TERM PIPE
+    trap '' HUP
 
     # Launch worker via SSH (background)
     echo ""
