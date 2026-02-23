@@ -187,7 +187,7 @@ def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_di
     """Run parse_data.py for a single species"""
 
     cmd = [
-        "python3", "bin/parse_data.py",
+        "python3", "train/parse_data.py",
         str(fasta_path),
         str(gff_path),
         str(output_dir),

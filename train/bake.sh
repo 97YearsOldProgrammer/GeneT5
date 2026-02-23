@@ -96,12 +96,20 @@ if [[ "$WORKER_RUNNING" != "true" ]]; then
     done
 fi
 
+# Detect GeneT5 code path on worker (differs from master mount layout)
+WORKER_CODE_DIR=$(${SSH_CMD} "docker exec ${CONTAINER} bash -c 'for d in /workspace/Code/GeneT5 /workspace/GeneT5; do [ -f \$d/train/bake_data ] && echo \$d && break; done'" 2>/dev/null)
+if [[ -z "$WORKER_CODE_DIR" ]]; then
+    echo "ERROR: Cannot find GeneT5 code directory on worker"
+    exit 1
+fi
+echo "[node 1] Code directory: ${WORKER_CODE_DIR}"
+
 # Sync requirements on worker (idempotent, picks up webdataset etc.)
 echo "[node 1] Syncing pip requirements..."
-${SSH_CMD} "docker exec ${CONTAINER} pip install -q -r /workspace/Code/GeneT5/requirements.txt" 2>/dev/null || true
+${SSH_CMD} "docker exec ${CONTAINER} pip install -q -r ${WORKER_CODE_DIR}/requirements.txt" 2>/dev/null || true
 
 # Build the bake_data command (per-species baking only, no merge/eval)
-BAKE_CMD="cd /workspace/Code/GeneT5 && PYTHONPATH=/workspace/Code/GeneT5 python train/bake_data ${BAKE_ARGS[*]} --train"
+BAKE_CMD="cd ${WORKER_CODE_DIR} && PYTHONPATH=${WORKER_CODE_DIR} python train/bake_data ${BAKE_ARGS[*]} --train"
 
 # ── Launch worker (node 1) via SSH ──
 echo "[node 1] Launching on ${WORKER_IP}..."
