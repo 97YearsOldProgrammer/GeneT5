@@ -151,7 +151,15 @@ for env in "${NCCL_ENVS[@]}"; do
     export "$env"
 done
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,garbage_collection_threshold:0.8"
-export PYTHONPATH="${PYTHONPATH:-/workspace/GeneT5}"
+# Auto-detect code directory (master vs worker may differ)
+if [ -d "/workspace/Code/GeneT5" ]; then
+    CODEDIR="/workspace/Code/GeneT5"
+elif [ -d "/workspace/GeneT5" ]; then
+    CODEDIR="/workspace/GeneT5"
+else
+    CODEDIR="$(pwd)"
+fi
+export PYTHONPATH="$CODEDIR"
 
 
 ####################
@@ -181,7 +189,7 @@ echo "========================================"
 
 
 echo "[preflight] Clearing stale caches..."
-find /workspace/GeneT5 -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+find /workspace/Code/GeneT5 -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 rm -rf /tmp/torchinductor_root/ 2>/dev/null || true
 sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || echo "[preflight] WARNING: drop_caches failed"
 
@@ -237,7 +245,11 @@ if [[ -n "$WORKER_IP" ]]; then
         esac
     done
     ENV_STR+="export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8; "
-    ENV_STR+="export PYTHONPATH=/workspace/GeneT5; "
+    # Worker auto-detects code directory
+    ENV_STR+="if [ -d /workspace/Code/GeneT5 ]; then CODEDIR=/workspace/Code/GeneT5; "
+    ENV_STR+="elif [ -d /workspace/GeneT5 ]; then CODEDIR=/workspace/GeneT5; "
+    ENV_STR+="else CODEDIR=/workspace; fi; "
+    ENV_STR+="export PYTHONPATH=\$CODEDIR; "
     # Worker detects its own CX7 interface + HCA
     ENV_STR+="for iface in enP2p1s0f1np1 enP2p1s0f0np0 enp1s0f1np1 enp1s0f0np0; do "
     ENV_STR+="  if [ -d /sys/class/net/\$iface ] && python3 -c \"import socket,struct,fcntl;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);socket.inet_ntoa(fcntl.ioctl(s.fileno(),0x8915,struct.pack('256s',b'\$iface'))[20:24])\" 2>/dev/null; then "
@@ -245,9 +257,9 @@ if [[ -n "$WORKER_IP" ]]; then
     ENV_STR+="    tmp=\${iface#en}; export NCCL_IB_HCA=roce\${tmp%np*}; break; "
     ENV_STR+="  fi; "
     ENV_STR+="done; "
-    ENV_STR+="cd /workspace/GeneT5; "
+    ENV_STR+="cd \$CODEDIR; "
     # Pre-flight cleanup on worker
-    ENV_STR+="find /workspace/GeneT5 -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true; "
+    ENV_STR+="find \$CODEDIR -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true; "
     ENV_STR+="rm -rf /tmp/torchinductor_root/ 2>/dev/null || true; "
     ENV_STR+="sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true; "
 

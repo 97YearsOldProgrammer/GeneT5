@@ -86,7 +86,7 @@ SSH_CMD="ssh -F /dev/null -o StrictHostKeyChecking=no -o IdentityFile=~/.ssh/id_
 WORKER_RUNNING=$(${SSH_CMD} "docker inspect -f '{{.State.Running}}' ${CONTAINER} 2>/dev/null" || echo "false")
 if [[ "$WORKER_RUNNING" != "true" ]]; then
     echo "[node 1] Container not running, starting in daemon mode..."
-    ${SSH_CMD} "cd /home/cg666/Code/GeneT5 && bash start-worker.sh --daemon"
+    ${SSH_CMD} "cd /home/cg666/Code && bash start-worker.sh --daemon"
     echo "[node 1] Waiting for container setup (pip install)..."
     for i in $(seq 1 30); do
         if ${SSH_CMD} "docker exec ${CONTAINER} python -c 'import liger_kernel' 2>/dev/null"; then
@@ -98,10 +98,10 @@ fi
 
 # Sync requirements on worker (idempotent, picks up webdataset etc.)
 echo "[node 1] Syncing pip requirements..."
-${SSH_CMD} "docker exec ${CONTAINER} pip install -q -r /workspace/GeneT5/requirements.txt" 2>/dev/null || true
+${SSH_CMD} "docker exec ${CONTAINER} pip install -q -r /workspace/Code/GeneT5/requirements.txt" 2>/dev/null || true
 
 # Build the bake_data command (per-species baking only, no merge/eval)
-BAKE_CMD="cd /workspace/GeneT5 && PYTHONPATH=/workspace/GeneT5 python train/bake_data ${BAKE_ARGS[*]} --train"
+BAKE_CMD="cd /workspace/Code/GeneT5 && PYTHONPATH=/workspace/Code/GeneT5 python train/bake_data ${BAKE_ARGS[*]} --train"
 
 # ── Launch worker (node 1) via SSH ──
 echo "[node 1] Launching on ${WORKER_IP}..."
@@ -116,7 +116,7 @@ sleep 2
 
 # ── Launch host (node 0) locally ──
 echo "[node 0] Launching locally..."
-PYTHONPATH=/workspace/GeneT5 python train/bake_data ${BAKE_ARGS[*]} --train \
+PYTHONPATH=/workspace/Code/GeneT5 python train/bake_data ${BAKE_ARGS[*]} --train \
     --nnodes 2 --node_rank 0 \
     > >(while IFS= read -r line; do echo "[node 0] $line"; done) \
     2>&1 &
@@ -152,7 +152,7 @@ echo "============================================================"
 echo "  Finalizing: merge + eval"
 echo "============================================================"
 
-PYTHONPATH=/workspace/GeneT5 python train/bake_data ${BAKE_ARGS[*]} --finalize
+PYTHONPATH=/workspace/Code/GeneT5 python train/bake_data ${BAKE_ARGS[*]} --finalize
 
 echo ""
 echo "============================================================"

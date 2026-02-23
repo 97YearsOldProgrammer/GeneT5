@@ -25,7 +25,7 @@ def build_parser():
         help='minimum patch size [%(default)i]')
     parser.add_argument('--max_patch', type=int, default=None, metavar='<int>',
         help='maximum patch size (None=no limit) [%(default)s]')
-    parser.add_argument('--max_len', type=int, default=512, metavar='<int>',
+    parser.add_argument('--max_len', type=int, default=10240, metavar='<int>',
         help='DNA window length [%(default)i]')
     parser.add_argument('--num_samples', type=int, default=5000, metavar='<int>',
         help='number of samples to analyze [%(default)i]')
@@ -47,7 +47,7 @@ def load_entropy_model(model_path, config_path):
         dim         = cfg["dim"],
         num_layers  = cfg["num_layers"],
         num_heads   = cfg["num_heads"],
-        ff_dim      = cfg.get("ff_dim", cfg["dim"] * 4),
+        ff_dim      = cfg.get("ff_dim", cfg["dim"] * 2),
         window_size = cfg.get("window_size", 512),
     )
     model.load(model_path)

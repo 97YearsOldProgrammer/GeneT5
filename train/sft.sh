@@ -174,7 +174,7 @@ for env in "${NCCL_ENVS[@]}"; do
     export "$env"
 done
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,garbage_collection_threshold:0.8"
-export PYTHONPATH="${PYTHONPATH:-/workspace/GeneT5}"
+export PYTHONPATH="${PYTHONPATH:-/workspace/Code/GeneT5}"
 
 
 ####################
@@ -206,7 +206,7 @@ echo "========================================"
 
 
 echo "[preflight] Clearing stale caches..."
-find /workspace/GeneT5 -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+find /workspace/Code/GeneT5 -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 rm -rf /tmp/torchinductor_root/ 2>/dev/null || true
 sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || echo "[preflight] WARNING: drop_caches failed (need root)"
 
@@ -259,7 +259,7 @@ if [[ -n "$WORKER_IP" ]]; then
             ;;
         *)
             echo "[worker] No container found, creating fresh (will pip install)..."
-            ${SSH_CMD} "cd /home/cg666/Code/GeneT5 && bash start-worker.sh --daemon"
+            ${SSH_CMD} "cd /home/cg666/Code && bash start-worker.sh --daemon"
             echo "[worker] Waiting for pip install..."
             for i in $(seq 1 30); do
                 if ${SSH_CMD} "docker exec ${CONTAINER} python -c 'import liger_kernel' 2>/dev/null"; then
@@ -276,7 +276,7 @@ if [[ -n "$WORKER_IP" ]]; then
 
     # Sync requirements on worker (idempotent, picks up webdataset etc.)
     echo "[worker] Syncing pip requirements..."
-    ${SSH_CMD} "docker exec ${CONTAINER} pip install -q -r /workspace/GeneT5/requirements.txt" 2>/dev/null || true
+    ${SSH_CMD} "docker exec ${CONTAINER} pip install -q -r /workspace/Code/GeneT5/requirements.txt" 2>/dev/null || true
 
     # Auto-patch NGC triton cluster_dims bug on both nodes (idempotent)
     TRITON_FILE="/usr/local/lib/python3.12/dist-packages/torch/_inductor/runtime/triton_heuristics.py"
@@ -300,7 +300,7 @@ if [[ -n "$WORKER_IP" ]]; then
         esac
     done
     ENV_STR+="export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8; "
-    ENV_STR+="export PYTHONPATH=/workspace/GeneT5; "
+    ENV_STR+="export PYTHONPATH=/workspace/Code/GeneT5; "
     # Worker detects its own CX7 interface + HCA (may differ from master)
     ENV_STR+="for iface in enP2p1s0f1np1 enP2p1s0f0np0 enp1s0f1np1 enp1s0f0np0; do "
     ENV_STR+="  if [ -d /sys/class/net/\$iface ] && python3 -c \"import socket,struct,fcntl;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);socket.inet_ntoa(fcntl.ioctl(s.fileno(),0x8915,struct.pack('256s',b'\$iface'))[20:24])\" 2>/dev/null; then "
@@ -308,9 +308,9 @@ if [[ -n "$WORKER_IP" ]]; then
     ENV_STR+="    tmp=\${iface#en}; export NCCL_IB_HCA=roce\${tmp%np*}; break; "
     ENV_STR+="  fi; "
     ENV_STR+="done; "
-    ENV_STR+="cd /workspace/GeneT5; "
+    ENV_STR+="cd /workspace/Code/GeneT5; "
     # Pre-flight cleanup on worker (pycache, inductor, page cache)
-    ENV_STR+="find /workspace/GeneT5 -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true; "
+    ENV_STR+="find /workspace/Code/GeneT5 -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true; "
     ENV_STR+="rm -rf /tmp/torchinductor_root/ 2>/dev/null || true; "
     ENV_STR+="sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true; "
 

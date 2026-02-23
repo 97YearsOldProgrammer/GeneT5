@@ -23,22 +23,26 @@ def build_parser():
         help='raw FASTA directory with species subdirectories')
     parser.add_argument('--output', required=True, type=str, metavar='<dir>',
         help='output directory for model checkpoint')
+    parser.add_argument('--mode', type=str, default='base', choices=['base', 'codon'],
+        help='encoding mode: base (single nt) or codon (3-mer) [%(default)s]')
+    parser.add_argument('--frames', type=str, default='0,1,2',
+        help='reading frames for codon mode, comma-separated [%(default)s]')
     parser.add_argument('--epochs', type=int, default=3, metavar='<int>',
         help='number of training epochs [%(default)i]')
     parser.add_argument('--lr', type=float, default=3e-4, metavar='<float>',
         help='learning rate [%(default)g]')
     parser.add_argument('--batch_size', type=int, default=64, metavar='<int>',
         help='batch size [%(default)i]')
-    parser.add_argument('--max_len', type=int, default=512, metavar='<int>',
-        help='DNA window length [%(default)i]')
+    parser.add_argument('--max_len', type=int, default=10240, metavar='<int>',
+        help='DNA window length in bases [%(default)i]')
     parser.add_argument('--dim', type=int, default=512, metavar='<int>',
         help='model dimension [%(default)i]')
     parser.add_argument('--num_layers', type=int, default=8, metavar='<int>',
         help='number of encoder layers [%(default)i]')
     parser.add_argument('--num_heads', type=int, default=8, metavar='<int>',
         help='number of attention heads [%(default)i]')
-    parser.add_argument('--vocab_size', type=int, default=6, metavar='<int>',
-        help='vocabulary size [%(default)i]')
+    parser.add_argument('--vocab_size', type=int, default=None, metavar='<int>',
+        help='vocabulary size (auto: 6 for base, 66 for codon)')
     parser.add_argument('--window', type=int, default=512, metavar='<int>',
         help='attention window size [%(default)i]')
     parser.add_argument('--num_workers', type=int, default=2, metavar='<int>',
@@ -61,20 +65,29 @@ def build_parser():
 def make_loader(manifest, args, seed_offset=0):
     """Build DataLoader from FASTA manifest"""
 
-    dataset = fasta_stream.FASTAEntropyDataset(
-        manifest = manifest,
-        max_len  = args.max_len,
-        seed     = args.seed + seed_offset,
-    )
-
-    collate = fasta_stream.dna_collate
+    if args.mode == 'codon':
+        frames  = tuple(int(f) for f in args.frames.split(','))
+        dataset = fasta_stream.FASTACodonDataset(
+            manifest   = manifest,
+            max_bases  = args.max_len,
+            frames     = frames,
+            seed       = args.seed + seed_offset,
+        )
+        collate = fasta_stream.codon_collate
+    else:
+        dataset = fasta_stream.FASTAEntropyDataset(
+            manifest = manifest,
+            max_len  = args.max_len,
+            seed     = args.seed + seed_offset,
+        )
+        collate = fasta_stream.dna_collate
 
     loader = data_utils.DataLoader(
         dataset,
-        batch_size      = args.batch_size,
-        collate_fn      = collate,
-        num_workers     = args.num_workers,
-        pin_memory      = True,
+        batch_size         = args.batch_size,
+        collate_fn         = collate,
+        num_workers        = args.num_workers,
+        pin_memory         = False,
         persistent_workers = args.num_workers > 0,
     )
     return loader
@@ -116,8 +129,13 @@ def main():
     is_dist   = dist_info is not None
     is_main   = train_util.is_main_process()
 
+    # auto-set vocab_size based on mode
+    if args.vocab_size is None:
+        args.vocab_size = fasta_stream.CODON_VOCAB_SIZE if args.mode == 'codon' else fasta_stream.DNA_VOCAB_SIZE
+
+    version = "v3 Codon" if args.mode == 'codon' else "v2"
     if is_main:
-        print(f"\n{' DNA Entropy Model v2 Training ':=^60}")
+        print(f"\n{f' DNA Entropy Model {version} Training ':=^60}")
 
     if is_dist and is_main:
         world = dist_info['world_size']
@@ -166,8 +184,13 @@ def main():
     vocab_size = args.vocab_size
 
     if is_main:
+        print(f"  Mode:       {args.mode}")
         print(f"  Vocab size: {vocab_size}")
-        print(f"  Window:     {args.max_len}")
+        if args.mode == 'codon':
+            frames = [int(f) for f in args.frames.split(',')]
+            print(f"  Frames:     {frames}")
+            print(f"  Codons/win: {(args.max_len - 2) // 3}")
+        print(f"  Window:     {args.max_len} bases")
 
     # build model
     model = entropy.DNAEntropyModel(
@@ -320,6 +343,9 @@ def main():
                     "window_size":  args.window,
                     "best_loss":    best_loss,
                     "epoch":        epoch + 1,
+                    "mode":         args.mode,
+                    "frames":       args.frames if args.mode == 'codon' else None,
+                    "max_bases":    args.max_len,
                     "data_source":  "raw_fasta",
                     "train_species": train_species,
                     "val_species":   list(val_species),
