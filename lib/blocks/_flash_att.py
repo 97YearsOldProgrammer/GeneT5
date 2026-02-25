@@ -183,7 +183,3 @@ class FlashAttention(nn.Module):
 
         return out
 
-    def get_kv_cache_size(self, batch_size, seq_len):
-        """Return KV cache size in bytes for float16"""
-
-        return batch_size * seq_len * self.num_kv_heads * self.head_dim * 2 * 2

@@ -198,25 +198,3 @@ class MoE(nn.Module):
 
         return self.load_balance_weight * load_balance_loss + self.router_z_weight * z_loss
 
-    def get_expert_utilization(self, x):
-        """Debug helper: get expert utilization statistics"""
-
-        with torch.no_grad():
-            batch_size, seq_len, embed_dim = x.shape
-            num_tokens                     = batch_size * seq_len
-            x_flat                         = x.view(num_tokens, embed_dim)
-
-            router_logits    = self.gate(x_flat)
-            router_probs     = F.softmax(router_logits, dim=-1)
-            _, top_k_indices = torch.topk(router_probs, self.top_k, dim=-1)
-
-            counts = torch.zeros(self.num_experts, device=x.device)
-            for k in range(self.top_k):
-                for expert_id in range(self.num_experts):
-                    counts[expert_id] += (top_k_indices[:, k] == expert_id).sum()
-
-            return {
-                "counts":     counts.cpu().tolist(),
-                "probs_mean": router_probs.mean(dim=0).cpu().tolist(),
-                "probs_std":  router_probs.std(dim=0).cpu().tolist(),
-            }

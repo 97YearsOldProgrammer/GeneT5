@@ -9,8 +9,3 @@ from lib.bake.databaker import (
     write_bake_summary,
     report_augmentation_status,
 )
-
-from lib.bake.time import (
-    format_time,
-    format_rate,
-)

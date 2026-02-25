@@ -1,4 +1,4 @@
-from lib.train.loop     import (
+from lib.train.distributed import (
     setup_distributed,
     cleanup_distributed,
     is_main_process,
@@ -8,25 +8,26 @@ from lib.train.loop     import (
     broadcast_object,
     wrap_model_distributed,
     unwrap_model,
-    train_epoch,
-    train_epoch_seq2seq,
-    train_epoch_seq2seq_distributed,
-    evaluate,
-    evaluate_seq2seq,
-    evaluate_seq2seq_distributed,
+)
+
+from lib.train.loop import (
     validate_prefixlm,
-    load_checkpoint,
-    save_checkpoint,
-    save_checkpoint_distributed,
-    save_final_model,
     prepare_tokenizer,
     apply_mxfp8,
-    MuonE2E,
-    create_optimizer,
     get_device,
     print_rank0,
-    log_metrics,
     set_seeds,
+)
+
+from lib.train.checkpoint import (
+    load_checkpoint,
+    save_checkpoint,
+    save_final_model,
+)
+
+from lib.train.optimizer import (
+    MuonE2E,
+    create_optimizer,
 )
 
 from lib.train.logger   import TrainLogger, create_train_logger

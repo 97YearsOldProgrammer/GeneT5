@@ -4,7 +4,7 @@ import tempfile
 import shutil
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import lib.data as ds
 
@@ -40,17 +40,17 @@ def decompress_to_temp(gz_path, temp_dir=None):
         # Check if pigz is available
         result = subprocess.run(['which', 'pigz'], capture_output=True)
         if result.returncode == 0:
-            subprocess.run(
-                ['pigz', '-d', '-k', '-c', str(gz_path)],
-                stdout=open(out_path, 'wb'),
-                check=True
-            )
+            with open(out_path, 'wb') as out_f:
+                subprocess.run(
+                    ['pigz', '-d', '-k', '-c', str(gz_path)],
+                    stdout=out_f, check=True,
+                )
         else:
-            subprocess.run(
-                ['gunzip', '-c', str(gz_path)],
-                stdout=open(out_path, 'wb'),
-                check=True
-            )
+            with open(out_path, 'wb') as out_f:
+                subprocess.run(
+                    ['gunzip', '-c', str(gz_path)],
+                    stdout=out_f, check=True,
+                )
         return out_path
     except Exception:
         # Fallback to Python gzip
@@ -183,7 +183,7 @@ def find_genome_files(species_dir):
 #################################
 
 
-def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_dir, token_file=None, tokenizer_path=None, n_workers=1, compress=None):
+def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_dir, tokenizer_path=None, n_workers=1, compress=None):
     """Run parse_data.py for a single species"""
 
     cmd = [
@@ -196,9 +196,6 @@ def run_parse_data(species_name, fasta_path, gff_path, output_dir, limit, log_di
         "--canonical_only",
         "--fast_tokenizer",
     ]
-
-    if token_file:
-        cmd.extend(["--extract_tokens", token_file])
 
     if tokenizer_path:
         cmd.extend(["--tokenizer", str(tokenizer_path)])
@@ -348,7 +345,7 @@ def process_species(job):
 
     result = run_parse_data(
         job.species, fasta_file, gff_file, output_dir, job.window_size,
-        pathlib.Path(job.log_dir), None, job.tokenizer, job.n_workers,
+        pathlib.Path(job.log_dir), job.tokenizer, job.n_workers,
         job.compress,
     )
 
@@ -441,8 +438,6 @@ def run_tokenizer_expansion(token_file, tokenizer_path, output_path=None, dry_ru
 def collect_species_stats(baked_dir, species_name):
     """Collect stats from baked species data"""
     
-    import json
-    
     species_dir = pathlib.Path(baked_dir) / species_name
     train_path  = species_dir / "training.bin"
     val_path    = species_dir / "validation.bin"
@@ -492,7 +487,7 @@ def write_bake_summary(log_path, run_config, species_results, species_stats, tok
     """Write comprehensive bake summary log"""
     
     import datetime
-    
+
     log_path = pathlib.Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -633,7 +628,6 @@ def report_augmentation_status(baked_dir):
 
     eval_path = baked_dir / "eval.json"
     if eval_path.exists():
-        import json
         with open(eval_path, 'r') as f:
             eval_data = json.load(f)
         print(f"  eval:")

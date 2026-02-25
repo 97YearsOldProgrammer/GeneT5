@@ -394,26 +394,6 @@ def _merge_stats(combined, new):
     combined["features_per_chunk"].extend(new.get("features_per_chunk", []))
 
 
-########################################
-#####  Legacy Compatibility        #####
-########################################
-
-
-def dynamic_chunking(fasta_path, gene_index, limit_bp=25000, overlap_bp=5000, anchor_pad=5000, n_workers=None):
-    """Legacy wrapper - redirects to sliding_window_chunking"""
-
-    overlap_ratio = overlap_bp / limit_bp if limit_bp > 0 else 1 / math.e
-
-    return sliding_window_chunking(
-        fasta_path,
-        gene_index,
-        window_size   = limit_bp,
-        overlap_ratio = overlap_ratio,
-        max_n_ratio   = 0.1,
-        n_workers     = n_workers,
-    )
-
-
 ############################
 #####  Quality Filter  #####
 ############################

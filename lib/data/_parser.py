@@ -272,37 +272,6 @@ def _merge_cds_into_exons(gene_index):
                     break
 
 
-###########################
-#####  Token Extract  #####
-###########################
-
-
-def extract_feature_types(features):
-    """Extract unique feature types from features list"""
-
-    types = set()
-    for feat in features:
-        ftype = feat.get("type", "").lower()
-        if ftype:
-            types.add(ftype)
-    return types
-
-
-def extract_biotypes(features):
-    """Extract unique biotypes from features list"""
-
-    biotypes = set()
-    for feat in features:
-        attrs = feat.get("attributes", {})
-
-        for key in ("biotype", "transcript_biotype", "gene_biotype"):
-            bt = attrs.get(key, "")
-            if bt:
-                biotypes.add(bt.lower())
-
-    return biotypes
-
-
 #########################
 #####  File Utils   #####
 #########################

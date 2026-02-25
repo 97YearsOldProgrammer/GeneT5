@@ -4,8 +4,6 @@ from lib.data.wrapper import (
     lazy_fasta_open,
     parse_gff_to_gene_index,
     filter_canonical_transcripts,
-    extract_feature_types,
-    extract_biotypes,
     find_genome_files,
     save_gene_index,
     load_gene_index,
@@ -14,7 +12,6 @@ from lib.data.wrapper import (
     select_diverse_samples,
 
     # Chunking
-    dynamic_chunking,
     sliding_window_chunking,
     augment_with_hints,
     filter_n_heavy_chunks,
@@ -33,7 +30,6 @@ from lib.data.wrapper import (
     create_train_pipeline,
     BinaryTrainDataset,
     PrefixLMCollator,
-    DynamicPaddingCollator,
     DEFAULT_MAX_SEQ,
     BUDGET_SEQ,
     token_budget_batcher,

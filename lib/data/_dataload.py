@@ -1,5 +1,3 @@
-import os
-import math
 import bisect
 import random
 
@@ -34,80 +32,6 @@ def create_train_pipeline(shard_urls, tokenizer, shuffle_buffer=10000):
 #################
 #####  I/O  #####
 #################
-
-
-class BinaryDatasetReader:
-    """Lazy reader for binary training files with batch tokenization support"""
-
-    def __init__(self, binary_path, tokenizer=None):
-
-        self.binary_path = binary_path
-        self.tokenizer   = tokenizer
-        self._info       = binary.get_binary_info(binary_path)
-        self._num_chunks = self._info["num_chunks"]
-        self._lengths    = None
-
-    def __len__(self):
-
-        return self._num_chunks
-
-    @property
-    def lengths(self):
-        """Get actual token lengths using batch tokenization"""
-
-        if self._lengths is None:
-            self._lengths = self._compute_lengths_batched()
-        return self._lengths
-
-    def _compute_lengths_batched(self, batch_size=256):
-        """Read pre-stored lengths from binary chunks, fallback to tokenization if missing"""
-
-        lengths = []
-
-        for i in range(self._num_chunks):
-            chunk = binary.read_chunk_at_index(self.binary_path, i)
-
-            if chunk.input_len is not None:
-                lengths.append(chunk.input_len)
-            else:
-                if self.tokenizer is not None:
-                    text    = chunk.get_input_text()
-                    encoded = self.tokenizer(text, add_special_tokens=False)
-                    lengths.append(len(encoded["input_ids"]))
-                else:
-                    lengths.append(len(chunk.get_input_text()) // 4)
-
-        return lengths
-
-    def _format_sample(self, chunk):
-        """Format chunk as input/target text"""
-
-        return {
-            "input_text":  chunk.get_input_text(),
-            "target_text": chunk.get_target_text(),
-            "gene_ids":    chunk.gene_ids,
-            "seqid":       chunk.seqid,
-            "start":       chunk.start,
-            "end":         chunk.end,
-        }
-
-    def get_chunk(self, idx):
-        """Get raw chunk at index"""
-
-        return binary.read_chunk_at_index(self.binary_path, idx)
-
-    def get_sample(self, idx):
-        """Get formatted sample at index"""
-
-        chunk = self.get_chunk(idx)
-        return self._format_sample(chunk)
-
-    def get_samples_batched(self, indices):
-        """Get multiple samples with batched tokenization"""
-
-        chunks  = [self.get_chunk(i) for i in indices]
-        samples = [self._format_sample(c) for c in chunks]
-        return samples
 
 
 #####################
@@ -326,41 +250,3 @@ class PrefixLMCollator:
         }
 
 
-class DynamicPaddingCollator:
-    """Collator that pads batches dynamically (kept for backward compat)"""
-
-    def __init__(self, pad_token_id, label_pad=-100):
-
-        self.pad_token_id = pad_token_id
-        self.label_pad    = label_pad
-
-    def __call__(self, batch):
-
-        max_input_len  = max(len(b["input_ids"]) for b in batch)
-        max_target_len = max(len(b["labels"]) for b in batch) if "labels" in batch[0] else 0
-
-        input_ids      = []
-        attention_mask = []
-        labels         = []
-
-        for b in batch:
-            inp_len = len(b["input_ids"])
-            pad_len = max_input_len - inp_len
-
-            input_ids.append(b["input_ids"] + [self.pad_token_id] * pad_len)
-            attention_mask.append(b.get("attention_mask", [1] * inp_len) + [0] * pad_len)
-
-            if max_target_len > 0:
-                lbl_len = len(b["labels"])
-                lbl_pad = max_target_len - lbl_len
-                labels.append(b["labels"] + [self.label_pad] * lbl_pad)
-
-        result = {
-            "input_ids":      torch.tensor(input_ids, dtype=torch.long),
-            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-        }
-
-        if labels:
-            result["labels"] = torch.tensor(labels, dtype=torch.long)
-
-        return result

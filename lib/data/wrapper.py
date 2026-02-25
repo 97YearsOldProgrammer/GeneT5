@@ -13,8 +13,6 @@ import lib.data._util       as util
 lazy_fasta_open                = parser.lazy_fasta_open
 parse_gff_to_gene_index        = parser.parse_gff_to_gene_index
 filter_canonical_transcripts   = parser.filter_canonical_transcripts
-extract_feature_types          = parser.extract_feature_types
-extract_biotypes               = parser.extract_biotypes
 find_genome_files              = parser.find_genome_files
 save_gene_index                = parser.save_gene_index
 load_gene_index                = parser.load_gene_index
@@ -43,7 +41,6 @@ merge_binary_files  = binary.merge_binary_files
 #####################
 
 
-dynamic_chunking        = chunking.dynamic_chunking
 sliding_window_chunking = chunking.sliding_window_chunking
 augment_with_hints      = chunking.augment_with_hints
 filter_n_heavy_chunks   = chunking.filter_n_heavy_chunks
@@ -57,7 +54,6 @@ filter_n_heavy_chunks   = chunking.filter_n_heavy_chunks
 create_train_pipeline  = dataload.create_train_pipeline
 BinaryTrainDataset     = dataload.BinaryTrainDataset
 PrefixLMCollator       = dataload.PrefixLMCollator
-DynamicPaddingCollator = dataload.DynamicPaddingCollator
 DEFAULT_MAX_SEQ        = dataload.DEFAULT_MAX_SEQ
 BUDGET_SEQ             = dataload.BUDGET_SEQ
 token_budget_batcher   = dataload.token_budget_batcher

@@ -30,11 +30,6 @@ from lib.inference.output import (
     write_gff3,
 )
 
-from lib.bake.time import (
-    format_time,
-    format_rate,
-)
-
 from lib.train.memwatch import (
     MemoryWatcher,
     create_memory_watcher,

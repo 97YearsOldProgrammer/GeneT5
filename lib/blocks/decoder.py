@@ -33,10 +33,11 @@ class DecoderBlock(nn.Module):
 
         # Self-attention: FlashAttention (causal)
         flash_config = FlashAttentionConfig(
-            embed_dim = embed_dim,
-            num_heads = num_heads,
-            dropout   = attn_dropout,
-            use_alibi = use_alibi,
+            embed_dim    = embed_dim,
+            num_heads    = num_heads,
+            num_kv_heads = num_kv_heads,
+            dropout      = attn_dropout,
+            use_alibi    = use_alibi,
         )
         self.self_attn = FlashAttention(config=flash_config, is_causal=True)
         self.norm1     = LayerNorm(embed_dim)

@@ -122,7 +122,6 @@ def prepare_grpo_inputs(prefix_ids, generated, pad_id, label_pad=-100):
     Returns input_ids [B*G, seq_len-1], labels [B*G, seq_len-1] with prefix masked
     """
 
-    seq_len    = generated.size(1)
     prefix_len = prefix_ids.size(1)
 
     # Model input: all tokens except last (teacher forcing)

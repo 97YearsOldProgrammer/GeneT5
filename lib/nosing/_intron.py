@@ -37,23 +37,6 @@ def compute_introns_from_exons(exons, strand):
     return introns
 
 
-def group_exons_by_parent(features):
-    """Group exons by their parent transcript"""
-
-    groups = {}
-
-    for feat in features:
-        if feat.get("type", "").lower() != "exon":
-            continue
-
-        parent = feat.get("attributes", {}).get("Parent", "unknown")
-        if parent not in groups:
-            groups[parent] = []
-        groups[parent].append(feat)
-
-    return groups
-
-
 def drop_intron_by_anchor(intron, exons, config):
     """Determine if intron should be dropped based on anchor length"""
 
@@ -75,29 +58,6 @@ def drop_intron_by_anchor(intron, exons, config):
     p_drop   = alpha + beta * math.exp(-gamma * L_anchor)
 
     return random.random() < p_drop
-
-
-def noise_real_introns(introns, exons, config, degraded=False):
-    """Apply noise to real introns"""
-
-    surviving = []
-    drop_mult = config.degraded_drop_mult if degraded else 1.0
-
-    for intron in introns:
-        if random.random() < config.intron_drop_base * drop_mult:
-            continue
-
-        if drop_intron_by_anchor(intron, exons, config):
-            continue
-
-        surviving.append({
-            "type":   "intron",
-            "start":  intron["start"],
-            "end":    intron["end"],
-            "strand": intron["strand"],
-        })
-
-    return surviving
 
 
 def find_splice_sites(sequence, site_type="donor"):
