@@ -98,9 +98,10 @@ class MuonE2E:
 
         return {
             'muon_e2e': {
-                'bufs_2d':  [buf.clone() for buf in self._bufs_2d],
-                'bufs_1d':  [buf.clone() for buf in self._bufs_1d],
-                'lr_proxy': self._lr_proxy.state_dict(),
+                'bufs_2d':    [buf.clone() for buf in self._bufs_2d],
+                'bufs_1d':    [buf.clone() for buf in self._bufs_1d],
+                'lr_proxy':   self._lr_proxy.state_dict(),
+                'schedulers': [s.state_dict() for s in self._schedulers],
             }
         }
 
@@ -118,6 +119,16 @@ class MuonE2E:
                 buf.copy_(saved)
         if 'lr_proxy' in s:
             self._lr_proxy.load_state_dict(s['lr_proxy'])
+        if 'schedulers' in s and self._schedulers:
+            for sched, saved in zip(self._schedulers, s['schedulers']):
+                sched.load_state_dict(saved)
+
+    def fast_forward_schedulers(self, target_step):
+        """Advance schedulers to target_step (for old checkpoints without scheduler state)"""
+
+        for s in self._schedulers:
+            for _ in range(target_step - s.last_epoch):
+                s.step()
 
     def create_schedulers(self, schedule_fn, warmup_steps, total_steps):
 

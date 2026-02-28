@@ -10,10 +10,15 @@ from lib.inference.engine import (
 )
 
 from lib.inference.output import (
-    ParsedGene,
+    ParsedExon,
     ModelOutputParser,
     parse_model_output,
     locate_exon_in_input,
-    genes_to_gff3,
+    features_to_gff3,
     write_gff3,
+)
+
+from lib.inference.diffusion_engine import (
+    diffusion_generate,
+    cosine_unmask_schedule,
 )

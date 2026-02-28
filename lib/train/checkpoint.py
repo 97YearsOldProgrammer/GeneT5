@@ -34,7 +34,8 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path, device="cpu"):
     return {
         "epoch":         epoch,
         "best_val_loss": best_val_loss,
-        "config":        checkpoint.get("config", {})
+        "config":        checkpoint.get("config", {}),
+        "global_step":   checkpoint.get("global_step"),
     }
 
 

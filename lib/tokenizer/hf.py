@@ -11,11 +11,10 @@ DNABERT_PATH = "zhihan1996/DNABERT-2-117M"
 
 
 SPECIAL   = ["<bos>", "<eos>"]
-STRUCTURE = ["<exon>", "<+>", "<->"]
-HINT      = ["<hints>", "<hc>", "<lc>"]
+STRUCTURE = ["<exon>", "<UTR>"]
 NMASK     = ["N" * i for i in range(1, 7)]
 
-GFF_TOKENS = SPECIAL + STRUCTURE + HINT + NMASK
+GFF_TOKENS = SPECIAL + STRUCTURE + NMASK
 
 
 #######################
@@ -71,12 +70,24 @@ class GeneTokenizer:
         return self._tok.pad_token_id or 0
 
     @property
+    def mask_token_id(self):
+        return self._tok.convert_tokens_to_ids("[MASK]")
+
+    @property
     def eos_token_id(self):
         return self._tok.convert_tokens_to_ids("<eos>")
 
     @property
     def bos_token_id(self):
         return self._tok.convert_tokens_to_ids("<bos>")
+
+    @property
+    def exon_token_id(self):
+        return self._tok.convert_tokens_to_ids("<exon>")
+
+    @property
+    def utr_token_id(self):
+        return self._tok.convert_tokens_to_ids("<UTR>")
 
     def get_vocab(self):
         return self._tok.get_vocab()

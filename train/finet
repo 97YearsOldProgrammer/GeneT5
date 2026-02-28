@@ -300,12 +300,23 @@ def main():
     # handle checkpoint
     start_epoch   = 0
     best_val_loss = float('inf')
+    global_step   = 0
 
     if args.checkpoint:
         ckpt_info     = train_util.load_checkpoint(model, optimizer, None,
                             args.checkpoint, device)
         start_epoch   = ckpt_info['epoch']
         best_val_loss = ckpt_info['best_val_loss']
+
+        steps_per_epoch = batches_per_epoch // args.grad_accum
+        saved_step      = ckpt_info.get('global_step')
+        global_step     = saved_step if saved_step is not None else start_epoch * steps_per_epoch
+
+        optimizer.fast_forward_schedulers(global_step)
+
+        if is_main:
+            print(f"  Resumed: epoch={start_epoch}, global_step={global_step}, "
+                  f"lr={optimizer.get_last_lr()[0]:.6f}")
 
     # save config
     if is_main:
@@ -354,7 +365,6 @@ def main():
         print("  torch.compile: first batch will be slow (one-time compilation)")
 
     patience_counter = 0
-    global_step      = 0
 
     # Start memory watcher if enabled
     mem_watcher = None
@@ -514,7 +524,8 @@ def main():
 
             train_util.save_checkpoint(model, optimizer, None, epoch + 1,
                 output_dir / 'best_model.pt',
-                config={'best_val_loss': best_val_loss, 'best_epoch': epoch + 1})
+                config={'best_val_loss': best_val_loss, 'best_epoch': epoch + 1},
+                global_step=global_step)
             train_util.barrier()
         else:
             patience_counter += 1
@@ -530,7 +541,8 @@ def main():
         if (epoch + 1) % args.save_every == 0:
             train_util.save_checkpoint(model, optimizer, None, epoch + 1,
                 output_dir / 'checkpoint_latest.pt',
-                config={'best_val_loss': best_val_loss})
+                config={'best_val_loss': best_val_loss},
+                global_step=global_step)
 
         train_util.barrier()
 

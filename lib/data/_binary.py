@@ -197,40 +197,51 @@ class BinaryChunk:
         )
 
     def get_input_text(self):
-        """Format chunk as input text with optional intron hint DNA"""
+        """Format chunk as raw DNA input"""
 
-        input_text = self.sequence
-
-        if self.has_hints and self.hints:
-            input_text += "<hints>"
-            for h in sorted(self.hints, key=lambda x: x.get("start", 0)):
-                htype = h.get("type", "intron_hc")
-                tag   = "<hc>" if "hc" in htype else "<lc>"
-                input_text += tag + self.sequence[h["start"]:h["end"]]
-
-        return input_text
+        return self.sequence
 
     def get_target_text(self):
-        """Format target as exon DNA sequences grouped by gene"""
+        """Format target as flat exon/UTR list in genomic order"""
 
         sorted_features = sorted(self.features, key=lambda x: x.get("start", 0))
 
-        genes = {}
+        parts  = []
+        first  = True
+
         for f in sorted_features:
             if f.get("type", "").lower() != "exon":
                 continue
-            gid = f.get("gene_id", "unknown")
-            if gid not in genes:
-                genes[gid] = {"strand": f.get("strand", "+"), "exons": [], "pos": f["start"]}
-            genes[gid]["exons"].append(f)
+
+            exon_start = f["start"]
+            exon_end   = f["end"]
+            cds_start  = f.get("cds_start")
+            cds_end    = f.get("cds_end")
+
+            if cds_start is not None and cds_end is not None:
+                # Exon has CDS boundaries — split into UTR + CDS regions
+                if cds_start > exon_start:
+                    utr5 = self.sequence[exon_start:cds_start]
+                    if utr5:
+                        parts.append(("<UTR>", utr5))
+
+                cds_dna = self.sequence[cds_start:cds_end]
+                if cds_dna:
+                    parts.append(("<exon>", cds_dna))
+
+                if cds_end < exon_end:
+                    utr3 = self.sequence[cds_end:exon_end]
+                    if utr3:
+                        parts.append(("<UTR>", utr3))
+            else:
+                # No CDS info — entire exon is coding
+                exon_dna = self.sequence[exon_start:exon_end]
+                if exon_dna:
+                    parts.append(("<exon>", exon_dna))
 
         target = "<bos>"
-        for gid, g in sorted(genes.items(), key=lambda x: x[1]["pos"]):
-            target += "<+>" if g["strand"] == "+" else "<->"
-            for i, exon in enumerate(sorted(g["exons"], key=lambda e: e["start"])):
-                if i > 0:
-                    target += "<exon>"
-                target += self.sequence[exon["start"]:exon["end"]]
+        for tag, dna in parts:
+            target += tag + dna
         target += "<eos>"
 
         return target

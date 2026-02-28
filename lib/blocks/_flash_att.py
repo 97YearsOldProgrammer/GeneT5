@@ -104,7 +104,7 @@ class FlashAttention(nn.Module):
         )
         return torch.cat([out_pfx, out_gen], dim=1)
 
-    def forward(self, hidden_states, attention_mask=None, prefix_len=0):
+    def forward(self, hidden_states, attention_mask=None, prefix_len=0, is_diffusion=False):
         """Forward pass with full flash attention"""
 
         B, L, D = hidden_states.shape
@@ -116,7 +116,16 @@ class FlashAttention(nn.Module):
         alibi  = self.alibi_slopes.float() if self.alibi_slopes is not None else None
         drop_p = self.dropout.p if self.training else 0.0
 
-        if prefix_len > 0 and self.is_causal and L > prefix_len:
+        if is_diffusion:
+            # Full bidirectional attention for diffusion
+            out = flash_attn_func(
+                q, k, v,
+                dropout_p     = drop_p,
+                softmax_scale = self.softmax_scale,
+                causal        = False,
+                alibi_slopes  = alibi,
+            )
+        elif prefix_len > 0 and self.is_causal and L > prefix_len:
             out = self._prefix_lm_attention(q, k, v, prefix_len, alibi, drop_p)
         else:
             out = flash_attn_func(

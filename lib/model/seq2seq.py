@@ -61,13 +61,13 @@ class GeneT5(nn.Module):
         # Loss function
         self.loss_fct = LigerCrossEntropyLoss(ignore_index=-100)
 
-    def forward(self, input_ids, labels=None, prefix_len=0):
+    def forward(self, input_ids, labels=None, prefix_len=0, is_diffusion=False):
 
         x      = self.embed(input_ids)
         x      = self.embed_dropout(x)
         torch._dynamo.mark_dynamic(x, 0)
         torch._dynamo.mark_dynamic(x, 1)
-        x, moe = self.decoder(x, prefix_len=prefix_len)
+        x, moe = self.decoder(x, prefix_len=prefix_len, is_diffusion=is_diffusion)
         logits = self.lm_head(x)
 
         loss = None

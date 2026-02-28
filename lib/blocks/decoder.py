@@ -60,11 +60,12 @@ class DecoderBlock(nn.Module):
         self.norm2   = LayerNorm(embed_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, hidden_states, attention_mask=None, prefix_len=0):
+    def forward(self, hidden_states, attention_mask=None, prefix_len=0, is_diffusion=False):
 
         # Self-attention
         normed             = self.norm1(hidden_states)
-        attn_output, _     = self.self_attn(normed, attention_mask, prefix_len=prefix_len)
+        attn_output, _     = self.self_attn(normed, attention_mask, prefix_len=prefix_len,
+                                            is_diffusion=is_diffusion)
         hidden_states      = hidden_states + self.dropout(attn_output)
 
         # Feed-forward
@@ -165,7 +166,7 @@ class Decoder(nn.Module):
     def gradient_checkpointing_disable(self):
         self._gradient_checkpointing = False
 
-    def forward(self, hidden_states, attention_mask=None, prefix_len=0):
+    def forward(self, hidden_states, attention_mask=None, prefix_len=0, is_diffusion=False):
 
         total_moe_loss = 0.0 if self.use_moe else None
 
@@ -176,6 +177,7 @@ class Decoder(nn.Module):
                     hidden_states,
                     attention_mask,
                     prefix_len,
+                    is_diffusion,
                     use_reentrant=False,
                 )
             else:
@@ -183,6 +185,7 @@ class Decoder(nn.Module):
                     hidden_states,
                     attention_mask = attention_mask,
                     prefix_len     = prefix_len,
+                    is_diffusion   = is_diffusion,
                 )
 
             if self.use_moe and moe_aux_loss is not None:

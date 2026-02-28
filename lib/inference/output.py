@@ -4,26 +4,25 @@ from dataclasses import dataclass, field
 
 
 @dataclass
-class ParsedGene:
-    """Single gene parsed from model output"""
+class ParsedExon:
+    """Single exon or UTR parsed from model output"""
 
-    strand: str
-    exons:  list = field(default_factory=list)
+    kind: str
+    dna:  str
 
 
 class ModelOutputParser:
-    """Parser for GeneT5 DNA-to-DNA output format"""
+    """Parser for GeneT5 diffusion output format (flat exon/UTR list)"""
 
     BOS_TOKEN = "<bos>"
     EOS_TOKEN = "<eos>"
 
     def __init__(self, strict=False):
-        """Initialize parser"""
 
         self.strict = strict
 
     def parse_sequence(self, text):
-        """Parse model output into list of ParsedGene"""
+        """Parse model output into list of ParsedExon"""
 
         text = text.strip()
 
@@ -35,28 +34,35 @@ class ModelOutputParser:
         if not text:
             return []
 
-        gene_blocks = re.split(r'(<\+>|<->)', text)
+        # Split on <exon> and <UTR> tokens, keeping delimiters
+        parts  = re.split(r'(<exon>|<UTR>)', text)
+        result = []
 
-        genes   = []
-        i       = 0
-        while i < len(gene_blocks):
-            block = gene_blocks[i].strip()
+        i = 0
+        while i < len(parts):
+            token = parts[i].strip()
 
-            if block in ("<+>", "<->"):
-                strand   = "+" if block == "<+>" else "-"
-                exon_dna = gene_blocks[i + 1] if i + 1 < len(gene_blocks) else ""
-                exons    = [e for e in exon_dna.split("<exon>") if e.strip()]
-                if exons:
-                    genes.append(ParsedGene(strand=strand, exons=exons))
+            if token == "<exon>":
+                dna = parts[i + 1].strip() if i + 1 < len(parts) else ""
+                if dna:
+                    result.append(ParsedExon(kind="exon", dna=dna))
+                i += 2
+            elif token == "<UTR>":
+                dna = parts[i + 1].strip() if i + 1 < len(parts) else ""
+                if dna:
+                    result.append(ParsedExon(kind="utr", dna=dna))
                 i += 2
             else:
+                # Leading DNA before first delimiter (treat as exon)
+                if token:
+                    result.append(ParsedExon(kind="exon", dna=token))
                 i += 1
 
-        return genes
+        return result
 
 
 def parse_model_output(text, strict=False):
-    """Parse model output and return list of ParsedGene"""
+    """Parse model output and return list of ParsedExon"""
 
     parser = ModelOutputParser(strict=strict)
     return parser.parse_sequence(text)
@@ -71,34 +77,25 @@ def locate_exon_in_input(input_sequence, exon_dna):
     return None, None
 
 
-def genes_to_gff3(genes, input_sequence, seqid="seq", source="GeneT5", offset=0):
-    """Convert parsed genes to GFF3 lines by locating exon DNA in input"""
+def features_to_gff3(features, input_sequence, seqid="seq", source="GeneT5", offset=0):
+    """Convert parsed features to GFF3 lines by locating DNA in input"""
 
     lines      = []
-    gene_count = 0
+    exon_count = 0
 
-    for gene in genes:
-        gene_count  += 1
-        gene_id      = f"gene_{gene_count:04d}"
-        exon_coords  = []
+    for feat in features:
+        start, end = locate_exon_in_input(input_sequence, feat.dna)
+        if start is None:
+            continue
 
-        for ei, exon_dna in enumerate(gene.exons, 1):
-            start, end = locate_exon_in_input(input_sequence, exon_dna)
-            if start is None:
-                continue
-            exon_coords.append((start + offset, end + offset))
-            lines.append(
-                f"{seqid}\t{source}\texon\t{start + offset}\t{end + offset}"
-                f"\t.\t{gene.strand}\t.\tID={gene_id}.exon{ei};Parent={gene_id}"
-            )
+        exon_count += 1
+        feat_type   = "CDS" if feat.kind == "exon" else "UTR"
+        feat_id     = f"{feat_type.lower()}_{exon_count:04d}"
 
-        if exon_coords:
-            gene_start = min(s for s, e in exon_coords)
-            gene_end   = max(e for s, e in exon_coords)
-            lines.insert(-len(exon_coords),
-                f"{seqid}\t{source}\tgene\t{gene_start}\t{gene_end}"
-                f"\t.\t{gene.strand}\t.\tID={gene_id}"
-            )
+        lines.append(
+            f"{seqid}\t{source}\t{feat_type}\t{start + offset}\t{end + offset}"
+            f"\t.\t.\t.\tID={feat_id}"
+        )
 
     return lines
 

@@ -290,7 +290,7 @@ class GeneT5Inference:
             ):
                 decoded      = self._clean_output(raw_output)
                 parsed_genes = self.parser.parse_sequence(decoded)
-                gff_lines    = output_lib.genes_to_gff3(
+                gff_lines    = output_lib.features_to_gff3(
                     parsed_genes, seq, seqid=seqid, source=source, offset=offset
                 )
 
@@ -319,9 +319,8 @@ class GeneT5Inference:
         output = output.replace("<EOS>", "<eos>")
         output = output.replace("[BOS]", "<bos>")
         output = output.replace("[EOS]", "<eos>")
-        output = output.replace("[+]", "<+>")
-        output = output.replace("[-]", "<->")
         output = output.replace("[exon]", "<exon>")
+        output = output.replace("[UTR]", "<UTR>")
 
         return output
     

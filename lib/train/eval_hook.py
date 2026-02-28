@@ -6,95 +6,86 @@ from collections import Counter
 
 import torch
 
-import lib.inference.output as output_lib
+import lib.inference.output           as output_lib
+import lib.inference.diffusion_engine as diff_engine
 
 
 class CheckpointEvaluator:
-    """Runs inference on held-out eval data and computes exon/gene F1 metrics"""
+    """Runs diffusion inference on held-out data and computes exon F1 metrics"""
 
-    def __init__(self, eval_data_path, tokenizer, num_samples=20, max_length=512,
-                 temperature=1.0, top_k=50, top_p=0.9):
+    def __init__(self, eval_data_path, tokenizer, num_samples=20,
+                 max_target_len=2048, num_steps=32, temperature=1.0):
 
         with open(eval_data_path, 'r') as f:
             all_samples = json.load(f)
 
-        self.samples     = all_samples[:num_samples]
-        self.tokenizer   = tokenizer
-        self.max_length  = max_length
-        self.temperature = temperature
-        self.top_k       = top_k
-        self.top_p       = top_p
-        self.parser      = output_lib.ModelOutputParser(strict=False)
+        self.samples        = all_samples[:num_samples]
+        self.tokenizer      = tokenizer
+        self.max_target_len = max_target_len
+        self.num_steps      = num_steps
+        self.temperature    = temperature
+        self.parser         = output_lib.ModelOutputParser(strict=False)
 
     @torch.no_grad()
     def evaluate(self, model, device, dtype):
-        """Run inference on eval samples and compute F1 metrics"""
+        """Run diffusion inference on eval samples and compute F1"""
 
         was_training = model.training
-        model.eval()
+        model.train(False)
 
         t0              = time.time()
         all_pred_exons  = []
         all_ref_exons   = []
-        all_pred_genes  = []
-        all_ref_genes   = []
         total_predicted = 0
         total_ref       = 0
 
-        bos_id = self.tokenizer.bos_token_id
-        eos_id = self.tokenizer.eos_token_id
-        pad_id = self.tokenizer.pad_token_id
+        mask_id = self.tokenizer.mask_token_id
+        pad_id  = self.tokenizer.pad_token_id
 
         for sample in self.samples:
             sequence     = sample["sequence"]
             ref_features = sample["ref_features"]
 
-            # Encode input DNA + append bos as prefix
+            # Encode input DNA
             encoded    = self.tokenizer.encode(sequence, add_special_tokens=False)
+            bos_id     = self.tokenizer.bos_token_id
             prefix_ids = encoded + [bos_id]
             prefix_ids = torch.tensor([prefix_ids], dtype=torch.long, device=device)
 
-            # Generate from prefix
+            # Diffusion inference
             with torch.amp.autocast(device.type, dtype=dtype):
-                generated = model.generate(
-                    prefix_ids   = prefix_ids,
-                    max_length   = self.max_length,
-                    temperature  = self.temperature,
-                    top_k        = self.top_k,
-                    top_p        = self.top_p,
-                    eos_token_id = eos_id,
-                    pad_token_id = pad_id,
+                generated = diff_engine.diffusion_generate(
+                    model          = model,
+                    prefix_ids     = prefix_ids,
+                    target_len     = self.max_target_len,
+                    mask_token_id  = mask_id,
+                    pad_token_id   = pad_id,
+                    num_steps      = self.num_steps,
+                    temperature    = self.temperature,
                 )
 
-            # Decode only the generated portion (after prefix)
+            # Decode target portion
             output_ids = generated[0, prefix_ids.size(1):].tolist()
+            # Remove padding
+            output_ids = [t for t in output_ids if t != pad_id]
             raw_output = self.tokenizer.decode(output_ids)
 
-            # Clean and parse
-            cleaned      = self._clean_output(raw_output)
-            parsed_genes = self.parser.parse_sequence(cleaned)
+            # Parse
+            parsed = self.parser.parse_sequence(raw_output)
 
-            # Extract predicted exon DNA strings
+            # Extract predicted exon DNA
             pred_exon_dna = set()
-            pred_gene_map = {}
-            for gi, gene in enumerate(parsed_genes):
-                for exon_seq in gene.exons:
-                    pred_exon_dna.add(exon_seq)
-                if gene.exons:
-                    pred_gene_map[gi] = set(gene.exons)
+            for feat in parsed:
+                if feat.kind == "exon":
+                    pred_exon_dna.add(feat.dna)
 
-            # Extract reference exon DNA from sequence + ref_features
+            # Extract reference exon DNA
             ref_exon_dna = set()
-            ref_gene_map = {}
             for rf in ref_features:
                 if rf.get("type", "exon").lower() != "exon":
                     continue
-                dna  = sequence[rf["start"]:rf["end"]]
+                dna = sequence[rf["start"]:rf["end"]]
                 ref_exon_dna.add(dna)
-                gkey = rf.get("gene_idx", rf.get("gene_id", 0))
-                if gkey not in ref_gene_map:
-                    ref_gene_map[gkey] = set()
-                ref_gene_map[gkey].add(dna)
 
             total_predicted += len(pred_exon_dna)
             total_ref       += len(ref_exon_dna)
@@ -102,18 +93,8 @@ class CheckpointEvaluator:
             all_pred_exons.append(pred_exon_dna)
             all_ref_exons.append(ref_exon_dna)
 
-            # Gene signatures: frozenset of exon DNA strings per gene
-            pred_gene_sigs = Counter(frozenset(exons) for exons in pred_gene_map.values() if exons)
-            ref_gene_sigs  = Counter(frozenset(exons) for exons in ref_gene_map.values() if exons)
-
-            all_pred_genes.append(pred_gene_sigs)
-            all_ref_genes.append(ref_gene_sigs)
-
         # Aggregate exon F1
         exon_metrics = self._compute_aggregate_f1(all_pred_exons, all_ref_exons)
-
-        # Aggregate gene F1
-        gene_metrics = self._compute_aggregate_f1(all_pred_genes, all_ref_genes)
 
         elapsed = time.time() - t0
 
@@ -127,12 +108,12 @@ class CheckpointEvaluator:
             "exon_tp":        exon_metrics["tp"],
             "exon_fp":        exon_metrics["fp"],
             "exon_fn":        exon_metrics["fn"],
-            "gene_f1":        gene_metrics["f1"],
-            "gene_precision": gene_metrics["precision"],
-            "gene_recall":    gene_metrics["recall"],
-            "gene_tp":        gene_metrics["tp"],
-            "gene_fp":        gene_metrics["fp"],
-            "gene_fn":        gene_metrics["fn"],
+            "gene_f1":        0.0,
+            "gene_precision": 0.0,
+            "gene_recall":    0.0,
+            "gene_tp":        0,
+            "gene_fp":        0,
+            "gene_fn":        0,
             "num_samples":    len(self.samples),
             "num_predicted":  total_predicted,
             "num_ref":        total_ref,
@@ -140,7 +121,7 @@ class CheckpointEvaluator:
         }
 
     def _compute_aggregate_f1(self, all_pred, all_ref):
-        """Compute aggregate F1 across all samples (handles set or Counter)"""
+        """Compute aggregate F1 across all samples"""
 
         total_tp = 0
         total_fp = 0
@@ -148,11 +129,10 @@ class CheckpointEvaluator:
 
         for pred_set, ref_set in zip(all_pred, all_ref):
             if isinstance(pred_set, Counter):
-                # Counter intersection: min of counts for matching keys
-                common   = pred_set & ref_set
-                tp       = sum(common.values())
-                fp       = sum((pred_set - ref_set).values())
-                fn       = sum((ref_set - pred_set).values())
+                common = pred_set & ref_set
+                tp     = sum(common.values())
+                fp     = sum((pred_set - ref_set).values())
+                fn     = sum((ref_set - pred_set).values())
             else:
                 tp = len(pred_set & ref_set)
                 fp = len(pred_set - ref_set)
@@ -174,22 +154,9 @@ class CheckpointEvaluator:
             "fn":        total_fn,
         }
 
-    def _clean_output(self, raw_output):
-        """Clean raw model output for parsing"""
-
-        output = raw_output.strip()
-        output = output.replace("<BOS>", "<bos>")
-        output = output.replace("<EOS>", "<eos>")
-        output = output.replace("[BOS]", "<bos>")
-        output = output.replace("[EOS]", "<eos>")
-        output = output.replace("[+]", "<+>")
-        output = output.replace("[-]", "<->")
-        output = output.replace("[exon]", "<exon>")
-        return output
-
 
 class EvalLogger:
-    """CSV logger for eval metrics"""
+    """CSV logger for evaluation metrics"""
 
     FIELDS = [
         "timestamp", "epoch", "global_step",
@@ -214,7 +181,7 @@ class EvalLogger:
             self._writer = csv.DictWriter(self._file, fieldnames=self.FIELDS)
 
     def log(self, epoch, global_step, metrics):
-        """Log eval metrics to CSV"""
+        """Log evaluation metrics to CSV"""
 
         row = {
             "timestamp":      time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -235,7 +202,6 @@ class EvalLogger:
         self._file.flush()
 
     def close(self):
-        """Close the log file"""
 
         if self._file:
             self._file.close()
