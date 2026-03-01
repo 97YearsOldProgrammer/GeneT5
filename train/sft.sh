@@ -9,7 +9,7 @@
 #   Master: train/sft.sh <data_dir> <output> <model> --nnodes 2 --node-rank 0 --master <MASTER_IP>
 #   Worker: train/sft.sh <data_dir> <output> <model> --nnodes 2 --node-rank 1 --master <MASTER_IP>
 #
-# All extra flags (--epochs, --lr, --batch_size, etc.) are passed to train/finet
+# All extra flags (--epochs, --lr, --batch_size, etc.) are passed to train/diffusion_finet
 #
 
 set -e
@@ -125,7 +125,7 @@ if [ -z "$DATA_DIR" ] || [ -z "$OUTPUT_DIR" ] || [ -z "$MODEL_PATH" ]; then
     echo "  --port PORT         Master port (default: 29500)"
     echo "  --nproc N           Processes per node (default: 1)"
     echo ""
-    echo "All other flags passed to train/finet (--epochs, --lr, --batch_size, etc.)"
+    echo "All other flags passed to train/diffusion_finet (--epochs, --lr, --batch_size, etc.)"
     exit 1
 fi
 
@@ -177,7 +177,7 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,garbage_collection_thre
 # Auto-detect master code dir (same logic as worker detection)
 MASTER_CODE_DIR=""
 for d in /workspace/Code/GeneT5 /workspace/GeneT5; do
-    [ -f "$d/train/finet" ] && MASTER_CODE_DIR="$d" && break
+    [ -f "$d/train/diffusion_finet" ] && MASTER_CODE_DIR="$d" && break
 done
 if [[ -z "$MASTER_CODE_DIR" ]]; then
     MASTER_CODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -239,7 +239,7 @@ build_torchrun_cmd() {
         --node_rank=$rank \
         --master_addr=$MASTER_ADDR \
         --master_port=$MASTER_PORT \
-        train/finet \
+        train/diffusion_finet \
         $DATA_DIR \
         $OUTPUT_DIR \
         $MODEL_PATH \
@@ -284,7 +284,7 @@ if [[ -n "$WORKER_IP" ]]; then
     esac
 
     # Detect GeneT5 code path on worker (differs from master mount layout)
-    WORKER_CODE_DIR=$(${SSH_CMD} "docker exec ${CONTAINER} bash -c 'for d in /workspace/Code/GeneT5 /workspace/GeneT5; do [ -f \$d/train/finet ] && echo \$d && break; done'" 2>/dev/null)
+    WORKER_CODE_DIR=$(${SSH_CMD} "docker exec ${CONTAINER} bash -c 'for d in /workspace/Code/GeneT5 /workspace/GeneT5; do [ -f \$d/train/diffusion_finet ] && echo \$d && break; done'" 2>/dev/null)
     if [[ -z "$WORKER_CODE_DIR" ]]; then
         echo "ERROR: Cannot find GeneT5 code directory on worker"
         exit 1
@@ -361,7 +361,7 @@ if [[ -n "$WORKER_IP" ]]; then
         fi
         # Belt-and-suspenders: pattern kill (catches orphans + data loader workers)
         pkill -9 -f 'torchrun.*finet' 2>/dev/null || true
-        pkill -9 -f 'python.*train/finet' 2>/dev/null || true
+        pkill -9 -f 'python.*train/diffusion_finet' 2>/dev/null || true
     }
 
     kill_remote() {
@@ -369,7 +369,7 @@ if [[ -n "$WORKER_IP" ]]; then
         # Use background + wait to avoid blocking on unresponsive worker
         (
             timeout 10 ${SSH_BASE} "${WORKER_USER}@${WORKER_IP}" \
-                "docker exec ${CONTAINER} bash -c 'pkill -9 -f torchrun; pkill -9 -f python.*train/finet'" \
+                "docker exec ${CONTAINER} bash -c 'pkill -9 -f torchrun; pkill -9 -f python.*train/diffusion_finet'" \
                 2>/dev/null \
             || timeout 15 ${SSH_BASE} "${WORKER_USER}@${WORKER_IP}" \
                 "docker restart ${CONTAINER}" \
@@ -389,7 +389,7 @@ if [[ -n "$WORKER_IP" ]]; then
 
     verify_clean() {
         for attempt in 1 2 3; do
-            if ! pgrep -f 'python.*train/finet' >/dev/null 2>&1 && \
+            if ! pgrep -f 'python.*train/diffusion_finet' >/dev/null 2>&1 && \
                ! pgrep -f 'torchrun.*finet' >/dev/null 2>&1; then
                 return 0
             fi
