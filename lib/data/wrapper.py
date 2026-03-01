@@ -53,7 +53,6 @@ filter_n_heavy_chunks   = chunking.filter_n_heavy_chunks
 
 create_train_pipeline  = dataload.create_train_pipeline
 BinaryTrainDataset     = dataload.BinaryTrainDataset
-PrefixLMCollator       = dataload.PrefixLMCollator
 DEFAULT_MAX_SEQ        = dataload.DEFAULT_MAX_SEQ
 BUDGET_SEQ             = dataload.BUDGET_SEQ
 token_budget_batcher   = dataload.token_budget_batcher

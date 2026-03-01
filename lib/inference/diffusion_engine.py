@@ -38,7 +38,7 @@ def diffusion_generate(model, prefix_ids, target_len, mask_token_id,
 
     for step_idx, unmask_frac in enumerate(schedule):
         # Forward pass (full bidirectional)
-        outputs = model(input_ids=input_ids, prefix_len=P, is_diffusion=True)
+        outputs = model(input_ids=input_ids)
         logits  = outputs['logits'][:, P:]
 
         # Suppress mask and pad tokens from predictions
@@ -83,7 +83,7 @@ def diffusion_generate(model, prefix_ids, target_len, mask_token_id,
 
     # Final pass: fill any remaining masks
     if is_masked.any():
-        outputs = model(input_ids=input_ids, prefix_len=P, is_diffusion=True)
+        outputs = model(input_ids=input_ids)
         logits  = outputs['logits'][:, P:]
         logits[:, :, mask_token_id] = float('-inf')
         final_pred = logits.argmax(dim=-1)

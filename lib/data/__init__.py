@@ -29,7 +29,6 @@ from lib.data.wrapper import (
     # Dataload
     create_train_pipeline,
     BinaryTrainDataset,
-    PrefixLMCollator,
     DEFAULT_MAX_SEQ,
     BUDGET_SEQ,
     token_budget_batcher,

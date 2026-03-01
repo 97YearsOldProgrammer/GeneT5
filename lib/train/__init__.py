@@ -11,7 +11,6 @@ from lib.train.distributed import (
 )
 
 from lib.train.loop import (
-    validate_prefixlm,
     prepare_tokenizer,
     apply_mxfp8,
     get_device,

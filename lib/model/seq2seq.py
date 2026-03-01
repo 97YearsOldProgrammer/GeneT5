@@ -1,7 +1,5 @@
 import torch
-import torch._dynamo
 import torch.nn             as nn
-import torch.nn.functional  as F
 import json
 
 from pathlib    import Path
@@ -36,7 +34,7 @@ class GeneT5(nn.Module):
         self.embed         = nn.Embedding(vocab_size, embed_dim)
         self.embed_dropout = nn.Dropout(dropout)
 
-        # Single causal decoder stack
+        # Bidirectional encoder stack
         self.decoder = Decoder(
             num_layers   = num_layers,
             embed_dim    = embed_dim,
@@ -61,13 +59,11 @@ class GeneT5(nn.Module):
         # Loss function
         self.loss_fct = LigerCrossEntropyLoss(ignore_index=-100)
 
-    def forward(self, input_ids, labels=None, prefix_len=0, is_diffusion=False):
+    def forward(self, input_ids, labels=None):
 
         x      = self.embed(input_ids)
         x      = self.embed_dropout(x)
-        torch._dynamo.mark_dynamic(x, 0)
-        torch._dynamo.mark_dynamic(x, 1)
-        x, moe = self.decoder(x, prefix_len=prefix_len, is_diffusion=is_diffusion)
+        x, moe = self.decoder(x)
         logits = self.lm_head(x)
 
         loss = None
@@ -77,108 +73,6 @@ class GeneT5(nn.Module):
                 loss = loss + moe
 
         return {"logits": logits, "loss": loss, "moe_loss": moe}
-
-    def _allocate_kv_caches(self, batch_size, max_seq_len, device, dtype):
-        """Allocate KV cache tensors for each decoder layer"""
-
-        caches = []
-        for layer in self.decoder.layers:
-            attn    = layer.self_attn
-            k_cache = torch.zeros(batch_size, max_seq_len, attn.num_kv_heads, attn.head_dim,
-                                  device=device, dtype=dtype)
-            v_cache = torch.zeros(batch_size, max_seq_len, attn.num_kv_heads, attn.head_dim,
-                                  device=device, dtype=dtype)
-            caches.append((k_cache, v_cache))
-        return caches
-
-    def _populate_kv_caches(self, kv_caches, kv_list):
-        """Copy prefill K/V into pre-allocated cache tensors"""
-
-        for (k_cache, v_cache), (k, v) in zip(kv_caches, kv_list):
-            L = k.size(1)
-            k_cache[:, :L] = k
-            v_cache[:, :L] = v
-
-    def _sample_token(self, logits, temperature, top_k, top_p):
-        """Temperature + top-k + top-p sampling"""
-
-        if temperature != 1.0:
-            logits = logits / temperature
-
-        if top_k > 0:
-            indices_to_remove        = logits < torch.topk(logits, top_k)[0][..., -1, None]
-            logits[indices_to_remove] = float('-inf')
-
-        if top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            cumulative_probs              = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-            sorted_indices_to_remove      = cumulative_probs > top_p
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0]  = 0
-            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-            logits[indices_to_remove] = float('-inf')
-
-        probs = F.softmax(logits, dim=-1)
-        return torch.multinomial(probs, num_samples=1)
-
-    @torch.no_grad()
-    def generate(
-        self,
-        prefix_ids,
-        max_length   = 100,
-        temperature  = 1.0,
-        top_k        = 50,
-        top_p        = 0.9,
-        eos_token_id = 2,
-        pad_token_id = 0,
-    ):
-        """KV-cached autoregressive generation with bidirectional prefill"""
-
-        was_training = self.training
-        self.eval()
-
-        try:
-            device   = prefix_ids.device
-            B        = prefix_ids.size(0)
-            prefix_L = prefix_ids.size(1)
-            max_seq  = prefix_L + max_length
-            dtype    = self.embed.weight.dtype
-
-            # Allocate KV caches
-            kv_caches = self._allocate_kv_caches(B, max_seq, device, dtype)
-
-            # Prefill: bidirectional over entire prefix
-            x          = self.embed(prefix_ids)
-            x, kv_list = self.decoder.prefill(x)
-            self._populate_kv_caches(kv_caches, kv_list)
-
-            # Sample first token from last prefill position
-            logits       = self.lm_head(x[:, -1, :])
-            next_token   = self._sample_token(logits, temperature, top_k, top_p)
-            generated    = [next_token]
-            finished     = next_token.squeeze(-1) == eos_token_id
-            cache_seqlens = torch.full((B,), prefix_L, dtype=torch.int32, device=device)
-
-            # Decode loop
-            for _ in range(max_length - 1):
-                if finished.all():
-                    break
-
-                x = self.embed(next_token)
-                x = self.decoder.decode_step(x, kv_caches, cache_seqlens)
-                cache_seqlens += 1
-
-                logits               = self.lm_head(x[:, -1, :])
-                next_token           = self._sample_token(logits, temperature, top_k, top_p)
-                next_token[finished] = pad_token_id
-                generated.append(next_token)
-
-                finished = finished | (next_token.squeeze(-1) == eos_token_id)
-
-            generated = torch.cat(generated, dim=1)
-            return torch.cat([prefix_ids, generated], dim=1)
-        finally:
-            self.train(was_training)
 
     def get_param_stats(self):
 

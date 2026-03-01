@@ -6,47 +6,6 @@ import torch
 from lib.train.distributed import is_main_process, all_reduce_mean
 
 
-################################
-#####  Training Functions  #####
-################################
-
-
-def validate_prefixlm(model, val_loader, device, dtype, is_dist=False):
-    """Run validation loop for prefix-LM models with distributed sync"""
-
-    model.eval()
-    total_val_loss = 0
-    num_batches    = 0
-
-    with torch.no_grad():
-        for batch in val_loader:
-            if batch is None:
-                continue
-            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
-
-            with torch.amp.autocast('cuda', dtype=dtype):
-                outputs = model(
-                    input_ids  = batch['input_ids'],
-                    labels     = batch['labels'],
-                    prefix_len = batch.get('prefix_len', 0),
-                )
-
-            total_val_loss += outputs['loss'].item()
-            num_batches    += 1
-
-            del outputs, batch
-
-    val_loss = total_val_loss / max(num_batches, 1)
-
-    if is_dist:
-        val_tensor = torch.tensor([val_loss], device=device)
-        all_reduce_mean(val_tensor)
-        val_loss = val_tensor.item()
-
-    model.train()
-    return val_loss
-
-
 ###################################
 #####  Model Setup Functions  #####
 ###################################

@@ -6,6 +6,7 @@ import json
 import time
 import pathlib
 import torch
+import torch._dynamo
 import torch.distributed    as dist
 import webdataset           as wds
 
@@ -25,14 +26,14 @@ import lib.diffusion    as diffusion
 
 DEFAULTS = {
     'batch_size':     8,
-    'lr':             1e-4,
+    'lr':             3e-4,
     'epochs':         3,
-    'weight_decay':   0.1,
+    'weight_decay':   0.0,
     'warmup_ratio':   0.03,
     'grad_accum':     64,
     'max_grad_norm':  1.0,
     'num_workers':    2,
-    'diffusion_steps': 0,
+    'diffusion_steps': 16,
 }
 
 
@@ -406,7 +407,8 @@ def main():
         if is_main:
             print("  Gradient checkpointing: enabled")
 
-    patience_counter = 0
+    patience_counter  = 0
+    _mark_dynamic_done = False
 
     # Memory watcher
     mem_watcher = None
@@ -453,6 +455,11 @@ def main():
                 tokenizer.pad_token_id,
             )
 
+            if not _mark_dynamic_done:
+                torch._dynamo.mark_dynamic(masked_ids, 0)
+                torch._dynamo.mark_dynamic(masked_ids, 1)
+                _mark_dynamic_done = True
+
             if step == 0 and is_main:
                 n_masked = (labels != -100).sum().item()
                 n_target = (batch['input_ids'][:, batch['prefix_len']:] != tokenizer.pad_token_id).sum().item()
@@ -465,12 +472,7 @@ def main():
 
             with sync_context:
                 with torch.amp.autocast('cuda', dtype=dtype):
-                    outputs = model(
-                        input_ids    = masked_ids,
-                        labels       = None,
-                        prefix_len   = batch.get('prefix_len', 0),
-                        is_diffusion = True,
-                    )
+                    outputs = model(input_ids=masked_ids)
 
                     logits = outputs['logits']
 
@@ -644,13 +646,8 @@ def validate_diffusion(model, val_loader, device, dtype, is_dist,
         )
 
         with torch.amp.autocast('cuda', dtype=dtype):
-            outputs = model(
-                input_ids    = masked_ids,
-                labels       = None,
-                prefix_len   = batch.get('prefix_len', 0),
-                is_diffusion = True,
-            )
-            logits = outputs['logits']
+            outputs = model(input_ids=masked_ids)
+            logits  = outputs['logits']
             loss   = loss_fct(logits.reshape(-1, vocab_size), labels.reshape(-1))
 
         total_loss  += loss.item()
