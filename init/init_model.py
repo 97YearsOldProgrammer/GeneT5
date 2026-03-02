@@ -14,7 +14,7 @@ parser.add_argument("--layers", type=int, default=None,
 parser.add_argument("--heads", type=int, default=None,
     help="Number of attention heads. Defaults to matching DNABERT-2.")
 parser.add_argument("--ff_dim", type=int, default=None,
-    help="Feed-forward dimension. Defaults to matching DNABERT-2.")
+    help="Feed-forward dimension per expert. Defaults to matching DNABERT-2.")
 parser.add_argument("--dropout", type=float, default=0.1,
     help="Dropout rate.")
 parser.add_argument("--tie_weights", action="store_true", default=True,
@@ -27,18 +27,10 @@ parser.add_argument("--no_moe", action="store_false", dest="use_moe",
     help="Disable Mixture of Experts.")
 parser.add_argument("--num_experts", type=int, default=16,
     help="Number of experts for MoE.")
-parser.add_argument("--moe_top_k", type=int, default=2,
+parser.add_argument("--moe_top_k", type=int, default=4,
     help="Top-K routing for MoE.")
-parser.add_argument("--init_std", type=float, default=0.02,
-    help="Default standard deviation for random parameter initialization.")
-parser.add_argument("--init_embed_std", type=float, default=None,
-    help="Std for embedding layers (defaults to --init_std).")
-parser.add_argument("--init_ffn_std", type=float, default=None,
-    help="Std for FFN layers (defaults to --init_std).")
-parser.add_argument("--init_attn_std", type=float, default=None,
-    help="Std for attention layers (defaults to --init_std).")
-parser.add_argument("--init_moe_router_std", type=float, default=0.006,
-    help="Std for MoE router.")
+parser.add_argument("--init_std", type=float, default=0.006,
+    help="Standard deviation for all random init (DeepSeek).")
 
 args = parser.parse_args()
 
@@ -57,10 +49,6 @@ saved_path = build_gt5(
     moe_top_k           = args.moe_top_k,
     tie_weights         = args.tie_weights,
     init_std            = args.init_std,
-    init_embed_std      = args.init_embed_std,
-    init_ffn_std        = args.init_ffn_std,
-    init_attn_std       = args.init_attn_std,
-    init_moe_router_std = args.init_moe_router_std,
 )
 
 print(f"\nSUCCESS: Model initialized and saved to:")

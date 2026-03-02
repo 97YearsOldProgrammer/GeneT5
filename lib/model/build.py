@@ -14,16 +14,9 @@ DEFAULTS = {
     "dropout":      0.1,
     "use_alibi":    True,
     "use_moe":      True,
-    "num_experts":  8,
-    "moe_top_k":    2,
-}
-
-INIT_DEFAULTS = {
-    "std":        0.02,
-    "embed_std":  0.02,
-    "ffn_std":    0.02,
-    "attn_std":   0.02,
-    "router_std": 0.006,
+    "num_experts":  16,
+    "moe_top_k":    4,
+    "init_std":     0.006,
 }
 
 def build_gt5(
@@ -42,25 +35,14 @@ def build_gt5(
     vocab_size          = None,
     tie_weights         = True,
     # Init
-    init_std            = INIT_DEFAULTS["std"],
-    init_embed_std      = INIT_DEFAULTS["embed_std"],
-    init_ffn_std        = INIT_DEFAULTS["ffn_std"],
-    init_attn_std       = INIT_DEFAULTS["attn_std"],
-    init_moe_router_std = INIT_DEFAULTS["router_std"],
+    init_std            = DEFAULTS["init_std"],
 ):
     """Build decoder-only GeneT5 from DNABERT-2 and save clean checkpoint"""
-
-    if init_embed_std is None:
-        init_embed_std = init_std
-    if init_ffn_std is None:
-        init_ffn_std = init_std
-    if init_attn_std is None:
-        init_attn_std = init_std
 
     print("=" * 60)
     print("Building GeneT5 (decoder-only) from DNABERT-2")
     print("=" * 60)
-    print(f"\nInit std: {init_std}, embed: {init_embed_std}, ffn: {init_ffn_std}, attn: {init_attn_std}, router: {init_moe_router_std}")
+    print(f"\nInit std: {init_std}")
 
     # Build tokenizer
     print(f"\n[1] Building tokenizer from DNABERT-2: {dnabert_model_name}")
@@ -84,7 +66,7 @@ def build_gt5(
     dna_num_layers  = dna_config.num_hidden_layers
 
     print(f"\n    DNABERT-2: hidden={embed_dim}, layers={dna_num_layers}, heads={dna_config.num_attention_heads}")
-    print(f"    Decoder:   layers={num_layers}, heads={num_heads}, moe={use_moe}, experts={num_experts}")
+    print(f"    Decoder:   layers={num_layers}, heads={num_heads}, moe={use_moe}, experts={num_experts}, ff_dim={ff_dim}")
 
     # Load raw state dict
     print(f"\n[2] Loading DNABERT-2 weights")
@@ -100,7 +82,7 @@ def build_gt5(
     copy_size  = min(orig_embed.shape[0], vocab_size)
     embed.weight.data[:copy_size].copy_(orig_embed[:copy_size])
     if vocab_size > orig_embed.shape[0]:
-        nn.init.normal_(embed.weight.data[orig_embed.shape[0]:], mean=0.0, std=init_embed_std)
+        nn.init.normal_(embed.weight.data[orig_embed.shape[0]:], mean=0.0, std=init_std)
     print(f"    copied {copy_size}, random init {max(0, vocab_size - copy_size)} new")
 
     # Build decoder stack
@@ -138,20 +120,17 @@ def build_gt5(
         # Post-attention LayerNorm
         layer.norm1.weight.data.copy_(sd[f"{prefix}.attention.output.LayerNorm.weight"])
 
-        # MoE: clone DNABERT-2 FFN into ALL experts
-        gated            = sd[f"{prefix}.mlp.gated_layers.weight"]
-        gate_w, up_w     = gated.chunk(2, dim=0)
-        down_w           = sd[f"{prefix}.mlp.wo.weight"]
-
+        # FFN weights
         if use_moe:
-            for e in range(num_experts):
-                layer.ff.expert_weights.gate_weights.data[e].copy_(gate_w.T)
-                layer.ff.expert_weights.up_weights.data[e].copy_(up_w.T)
-                layer.ff.expert_weights.down_weights.data[e].copy_(down_w.T)
-
-            # Router: random small init
-            nn.init.normal_(layer.ff.gate.weight, std=init_moe_router_std)
+            # MoE experts: random init (dimensions differ from DNABERT-2 FFN)
+            nn.init.normal_(layer.ff.expert_weights.gate_weights, std=init_std)
+            nn.init.normal_(layer.ff.expert_weights.up_weights, std=init_std)
+            nn.init.normal_(layer.ff.expert_weights.down_weights, std=init_std)
+            nn.init.normal_(layer.ff.gate.weight, std=init_std)
         else:
+            gated        = sd[f"{prefix}.mlp.gated_layers.weight"]
+            gate_w, up_w = gated.chunk(2, dim=0)
+            down_w       = sd[f"{prefix}.mlp.wo.weight"]
             layer.ff.wi_0.weight.data.copy_(gate_w)
             layer.ff.wi_1.weight.data.copy_(up_w)
             layer.ff.wo.weight.data.copy_(down_w)
@@ -160,7 +139,7 @@ def build_gt5(
         layer.norm2.weight.data.copy_(sd[f"{prefix}.mlp.layernorm.weight"])
 
     nn.init.ones_(decoder.final_norm.weight)
-    print(f"    transferred {num_copy} layers (self-attn + FFN cloned to {num_experts} experts)")
+    print(f"    transferred {num_copy} layers (self-attn + norms from DNABERT-2, MoE experts random init)")
 
     del sd
     gc.collect()
@@ -173,7 +152,7 @@ def build_gt5(
         lm_head.weight = embed.weight
         print("    weights tied")
     else:
-        nn.init.normal_(lm_head.weight, mean=0.0, std=init_embed_std)
+        nn.init.normal_(lm_head.weight, mean=0.0, std=init_std)
         print("    separate weights")
 
     # Save

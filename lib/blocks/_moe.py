@@ -17,9 +17,9 @@ from liger_kernel.ops.swiglu import LigerSiLUMulFunction
 @dataclass
 class MoEConfig:
     embed_dim:            int   = 768
-    ff_dim:               int   = 3072
-    num_experts:          int   = 8
-    top_k:                int   = 2
+    ff_dim:               int   = 384
+    num_experts:          int   = 16
+    top_k:                int   = 4
     dropout:              float = 0.0
     load_balance_weight:  float = 0.01
     router_z_loss_weight: float = 0.001
@@ -44,17 +44,16 @@ class FusedExpertWeights(nn.Module):
 
     def _init_weights(self):
 
-        std = 0.02
+        std = 0.006
         nn.init.normal_(self.gate_weights, std=std)
         nn.init.normal_(self.up_weights, std=std)
         nn.init.normal_(self.down_weights, std=std)
 
 
 class MoE(nn.Module):
-    """Mixture of Experts with grouped GEMM or PyTorch loop fallback
+    """Mixture of Experts with bmm, grouped GEMM, or loop fallback
 
-    Uses torch._grouped_mm when available (3 kernel launches total),
-    otherwise falls back to per-expert PyTorch matmuls.
+    Dispatch priority: triton > grouped_mm (Hopper/Blackwell) > bmm > loop
     """
 
     def __init__(self, config):
@@ -73,7 +72,19 @@ class MoE(nn.Module):
         self.expert_weights = FusedExpertWeights(config.num_experts, config.embed_dim, config.ff_dim)
         self.dropout        = nn.Dropout(config.dropout)
 
-        self._grouped_mm_available = hasattr(torch, '_grouped_mm')
+        self._grouped_mm_available = (
+            hasattr(torch, '_grouped_mm')
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability() in ((9, 0), (10, 0))
+        )
+
+        self._triton_available = False
+        try:
+            from lib.blocks._triton_moe import triton_grouped_gemm
+            self._triton_grouped_gemm = triton_grouped_gemm
+            self._triton_available    = True
+        except ImportError:
+            pass
 
     @torch.compiler.disable
     def _prepare_expert_batches(self, top_k_indices, top_k_probs, num_tokens, device):
@@ -126,6 +137,87 @@ class MoE(nn.Module):
 
         return output
 
+    @torch.compiler.disable
+    def _forward_bmm(self, x_flat, top_k_indices, top_k_probs):
+        """Batched matmul — 3 bmm calls instead of 3×num_experts matmuls"""
+
+        num_tokens, embed_dim = x_flat.shape
+        device                = x_flat.device
+
+        sorted_experts, sorted_tokens, sorted_weights, expert_offsets, expert_counts = \
+            self._prepare_expert_batches(top_k_indices, top_k_probs, num_tokens, device)
+
+        output = torch.zeros_like(x_flat)
+
+        if sorted_tokens.shape[0] == 0:
+            return output
+
+        max_count = expert_counts.max().item()
+        positions = torch.arange(max_count, device=device)
+        mask      = positions.unsqueeze(0) < expert_counts.unsqueeze(1)
+
+        flat_idx  = expert_offsets[:-1].unsqueeze(1) + positions.unsqueeze(0)
+        flat_idx  = flat_idx.clamp(max=sorted_tokens.shape[0] - 1)
+
+        token_ids    = sorted_tokens[flat_idx.reshape(-1)].reshape(self.num_experts, max_count)
+        padded_input = x_flat[token_ids] * mask.unsqueeze(-1).to(x_flat.dtype)
+
+        gate_out   = torch.bmm(padded_input, self.expert_weights.gate_weights)
+        up_out     = torch.bmm(padded_input, self.expert_weights.up_weights)
+        hidden     = LigerSiLUMulFunction.apply(gate_out, up_out)
+        expert_out = torch.bmm(hidden, self.expert_weights.down_weights)
+
+        padded_w = sorted_weights[flat_idx.reshape(-1)].reshape(self.num_experts, max_count, 1)
+        weighted = (expert_out * padded_w * mask.unsqueeze(-1).to(expert_out.dtype)).to(output.dtype)
+
+        flat_out  = weighted.reshape(-1, embed_dim)
+        flat_ids  = token_ids.reshape(-1)
+        flat_mask = mask.reshape(-1)
+
+        output.scatter_add_(
+            0,
+            flat_ids[flat_mask].unsqueeze(-1).expand(-1, embed_dim),
+            flat_out[flat_mask],
+        )
+
+        return output
+
+    @torch.compiler.disable
+    def _forward_triton(self, x_flat, top_k_indices, top_k_probs):
+        """Triton grouped GEMM — single kernel per matmul, works on all GPUs"""
+
+        num_tokens, embed_dim = x_flat.shape
+        device                = x_flat.device
+
+        sorted_experts, sorted_tokens, sorted_weights, expert_offsets, expert_counts = \
+            self._prepare_expert_batches(top_k_indices, top_k_probs, num_tokens, device)
+
+        output = torch.zeros_like(x_flat)
+
+        if sorted_tokens.shape[0] == 0:
+            return output
+
+        sorted_input = x_flat[sorted_tokens]
+        offs         = expert_offsets.to(torch.int32)
+
+        gate_w = self.expert_weights.gate_weights
+        up_w   = self.expert_weights.up_weights
+        down_w = self.expert_weights.down_weights
+
+        gate_out = self._triton_grouped_gemm(sorted_input, gate_w, offs)
+        up_out   = self._triton_grouped_gemm(sorted_input, up_w, offs)
+        hidden   = LigerSiLUMulFunction.apply(gate_out, up_out)
+        out      = self._triton_grouped_gemm(hidden, down_w, offs)
+
+        weighted = (out * sorted_weights.unsqueeze(-1)).to(output.dtype)
+        output.scatter_add_(
+            0,
+            sorted_tokens.unsqueeze(-1).expand(-1, embed_dim),
+            weighted,
+        )
+
+        return output
+
     def _forward_pytorch(self, x_flat, top_k_indices, top_k_probs):
         """Loop-based PyTorch fallback"""
 
@@ -162,7 +254,6 @@ class MoE(nn.Module):
 
         return output
 
-
     def forward(self, x):
 
         batch_size, seq_len, embed_dim = x.shape
@@ -174,8 +265,12 @@ class MoE(nn.Module):
         top_k_probs, top_k_indices = torch.topk(router_probs, self.top_k, dim=-1)
         top_k_probs                = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
 
-        if self._grouped_mm_available and x_flat.is_cuda:
+        if self._triton_available and x_flat.is_cuda:
+            output = self._forward_triton(x_flat, top_k_indices, top_k_probs)
+        elif self._grouped_mm_available and x_flat.is_cuda:
             output = self._forward_grouped(x_flat, top_k_indices, top_k_probs)
+        elif x_flat.is_cuda:
+            output = self._forward_bmm(x_flat, top_k_indices, top_k_probs)
         else:
             output = self._forward_pytorch(x_flat, top_k_indices, top_k_probs)
 
