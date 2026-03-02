@@ -26,7 +26,7 @@ class MoEConfig:
 
 
 class FusedExpertWeights(nn.Module):
-    """Fused expert weights for batched computation"""
+    """Fused expert weights — gate+up merged into single [E, K, 2*ff_dim] parameter"""
 
     def __init__(self, num_experts, embed_dim, ff_dim):
 
@@ -36,18 +36,26 @@ class FusedExpertWeights(nn.Module):
         self.embed_dim   = embed_dim
         self.ff_dim      = ff_dim
 
-        self.gate_weights = nn.Parameter(torch.empty(num_experts, embed_dim, ff_dim))
-        self.up_weights   = nn.Parameter(torch.empty(num_experts, embed_dim, ff_dim))
-        self.down_weights = nn.Parameter(torch.empty(num_experts, ff_dim, embed_dim))
+        self.gate_up_weights = nn.Parameter(torch.empty(num_experts, embed_dim, 2 * ff_dim))
+        self.down_weights    = nn.Parameter(torch.empty(num_experts, ff_dim, embed_dim))
 
         self._init_weights()
 
     def _init_weights(self):
 
         std = 0.006
-        nn.init.normal_(self.gate_weights, std=std)
-        nn.init.normal_(self.up_weights, std=std)
+        nn.init.normal_(self.gate_up_weights, std=std)
         nn.init.normal_(self.down_weights, std=std)
+
+    @property
+    def gate_weights(self):
+        """Backward-compat view into fused gate_up_weights[:, :, :ff_dim]"""
+        return self.gate_up_weights[:, :, :self.ff_dim]
+
+    @property
+    def up_weights(self):
+        """Backward-compat view into fused gate_up_weights[:, :, ff_dim:]"""
+        return self.gate_up_weights[:, :, self.ff_dim:]
 
 
 class MoE(nn.Module):
@@ -81,8 +89,14 @@ class MoE(nn.Module):
         self._triton_available = False
         try:
             from lib.blocks._triton_moe import triton_grouped_gemm
-            self._triton_grouped_gemm = triton_grouped_gemm
-            self._triton_available    = True
+            from lib.blocks._triton_moe import triton_fused_swiglu_gemm
+            from lib.blocks._triton_moe import triton_grouped_gemm_scatter
+            from lib.blocks._triton_moe import triton_counting_sort
+            self._triton_grouped_gemm         = triton_grouped_gemm
+            self._triton_fused_swiglu_gemm    = triton_fused_swiglu_gemm
+            self._triton_grouped_gemm_scatter = triton_grouped_gemm_scatter
+            self._triton_counting_sort        = triton_counting_sort
+            self._triton_available            = True
         except ImportError:
             pass
 
@@ -93,6 +107,17 @@ class MoE(nn.Module):
         flat_indices = top_k_indices.reshape(-1)
         flat_probs   = top_k_probs.reshape(-1)
         flat_tokens  = torch.arange(num_tokens, device=device).unsqueeze(1).expand(-1, self.top_k).reshape(-1)
+        total_M      = flat_indices.shape[0]
+
+        if self._triton_available and total_M <= 256 and device.type == 'cuda':
+            sorted_tokens, sorted_weights, expert_offsets = \
+                self._triton_counting_sort(flat_indices.to(torch.int32), flat_tokens.to(torch.int64),
+                                           flat_probs, self.num_experts)
+            expert_offsets_long = expert_offsets.to(torch.long)
+            expert_counts      = expert_offsets_long[1:] - expert_offsets_long[:-1]
+            sorted_experts     = torch.repeat_interleave(
+                torch.arange(self.num_experts, device=device), expert_counts)
+            return sorted_experts, sorted_tokens, sorted_weights, expert_offsets_long, expert_counts
 
         sorted_idx     = torch.argsort(flat_indices, stable=True)
         sorted_experts = flat_indices[sorted_idx]
@@ -184,7 +209,7 @@ class MoE(nn.Module):
 
     @torch.compiler.disable
     def _forward_triton(self, x_flat, top_k_indices, top_k_probs):
-        """Triton grouped GEMM — single kernel per matmul, works on all GPUs"""
+        """Triton fused MoE — SwiGLU GEMM + scatter GEMM, works on all GPUs"""
 
         num_tokens, embed_dim = x_flat.shape
         device                = x_flat.device
@@ -192,29 +217,18 @@ class MoE(nn.Module):
         sorted_experts, sorted_tokens, sorted_weights, expert_offsets, expert_counts = \
             self._prepare_expert_batches(top_k_indices, top_k_probs, num_tokens, device)
 
-        output = torch.zeros_like(x_flat)
-
         if sorted_tokens.shape[0] == 0:
-            return output
+            return torch.zeros_like(x_flat)
 
         sorted_input = x_flat[sorted_tokens]
         offs         = expert_offsets.to(torch.int32)
 
-        gate_w = self.expert_weights.gate_weights
-        up_w   = self.expert_weights.up_weights
-        down_w = self.expert_weights.down_weights
+        gate_up_w = self.expert_weights.gate_up_weights
+        down_w    = self.expert_weights.down_weights
 
-        gate_out = self._triton_grouped_gemm(sorted_input, gate_w, offs)
-        up_out   = self._triton_grouped_gemm(sorted_input, up_w, offs)
-        hidden   = LigerSiLUMulFunction.apply(gate_out, up_out)
-        out      = self._triton_grouped_gemm(hidden, down_w, offs)
-
-        weighted = (out * sorted_weights.unsqueeze(-1)).to(output.dtype)
-        output.scatter_add_(
-            0,
-            sorted_tokens.unsqueeze(-1).expand(-1, embed_dim),
-            weighted,
-        )
+        hidden = self._triton_fused_swiglu_gemm(sorted_input, gate_up_w, offs)
+        output = self._triton_grouped_gemm_scatter(
+            hidden, down_w, offs, sorted_weights, sorted_tokens, num_tokens)
 
         return output
 
