@@ -91,40 +91,28 @@ class MoE(nn.Module):
             from lib.blocks._triton_moe import triton_grouped_gemm
             from lib.blocks._triton_moe import triton_fused_swiglu_gemm
             from lib.blocks._triton_moe import triton_grouped_gemm_scatter
-            from lib.blocks._triton_moe import triton_counting_sort
             self._triton_grouped_gemm         = triton_grouped_gemm
             self._triton_fused_swiglu_gemm    = triton_fused_swiglu_gemm
             self._triton_grouped_gemm_scatter = triton_grouped_gemm_scatter
-            self._triton_counting_sort        = triton_counting_sort
             self._triton_available            = True
         except ImportError:
             pass
 
-    @torch.compiler.disable
     def _prepare_expert_batches(self, top_k_indices, top_k_probs, num_tokens, device):
         """Prepare sorted token batches for fused expert computation"""
 
         flat_indices = top_k_indices.reshape(-1)
         flat_probs   = top_k_probs.reshape(-1)
         flat_tokens  = torch.arange(num_tokens, device=device).unsqueeze(1).expand(-1, self.top_k).reshape(-1)
-        total_M      = flat_indices.shape[0]
-
-        if self._triton_available and total_M <= 256 and device.type == 'cuda':
-            sorted_tokens, sorted_weights, expert_offsets = \
-                self._triton_counting_sort(flat_indices.to(torch.int32), flat_tokens.to(torch.int64),
-                                           flat_probs, self.num_experts)
-            expert_offsets_long = expert_offsets.to(torch.long)
-            expert_counts      = expert_offsets_long[1:] - expert_offsets_long[:-1]
-            sorted_experts     = torch.repeat_interleave(
-                torch.arange(self.num_experts, device=device), expert_counts)
-            return sorted_experts, sorted_tokens, sorted_weights, expert_offsets_long, expert_counts
 
         sorted_idx     = torch.argsort(flat_indices, stable=True)
         sorted_experts = flat_indices[sorted_idx]
         sorted_tokens  = flat_tokens[sorted_idx]
         sorted_weights = flat_probs[sorted_idx]
 
-        expert_counts  = torch.bincount(sorted_experts, minlength=self.num_experts)
+        ones           = torch.ones(sorted_experts.shape[0], dtype=torch.long, device=device)
+        expert_counts  = torch.zeros(self.num_experts, dtype=torch.long, device=device)
+        expert_counts.scatter_add_(0, sorted_experts.long(), ones)
         expert_offsets = torch.zeros(self.num_experts + 1, dtype=torch.long, device=device)
         expert_offsets[1:] = expert_counts.cumsum(0)
 
@@ -207,7 +195,6 @@ class MoE(nn.Module):
 
         return output
 
-    @torch.compiler.disable
     def _forward_triton(self, x_flat, top_k_indices, top_k_probs):
         """Triton fused MoE — SwiGLU GEMM + scatter GEMM, works on all GPUs"""
 

@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from torch.library import triton_op, wrap_triton
+
 
 BLOCK_M    = 64
 BLOCK_N    = 64
@@ -14,7 +16,7 @@ DW_BLOCK_M = 64
 
 
 # ──────────────────────────────────────────────────────────────────────
-#  Base grouped GEMM kernels (unchanged)
+#  Triton JIT kernels (unchanged)
 # ──────────────────────────────────────────────────────────────────────
 
 
@@ -147,80 +149,8 @@ def _compute_fwd_grid(offsets, num_experts, block_m, block_n, N):
     return (m_blocks * n_blocks,)
 
 
-class GroupedGEMM(torch.autograd.Function):
-    """Triton grouped GEMM with full backward support"""
-
-    @staticmethod
-    def forward(ctx, A, B, offsets):
-
-        total_M, K = A.shape
-        E, _, N    = B.shape
-        C          = torch.empty(total_M, N, device=A.device, dtype=A.dtype)
-
-        grid = _compute_fwd_grid(offsets, E, BLOCK_M, BLOCK_N, N)
-
-        _grouped_gemm_kernel[grid](
-            A, B, C, offsets,
-            K, N,
-            A.stride(0), A.stride(1),
-            B.stride(0), B.stride(1), B.stride(2),
-            C.stride(0), C.stride(1),
-            NUM_EXPERTS=E,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        )
-
-        ctx.save_for_backward(A, B, offsets)
-        ctx.K = K
-        ctx.N = N
-        ctx.E = E
-        return C
-
-    @staticmethod
-    def backward(ctx, dC):
-
-        A, B, offsets = ctx.saved_tensors
-        K, N, E       = ctx.K, ctx.N, ctx.E
-        dC            = dC.to(A.dtype)
-
-        dA = torch.empty_like(A)
-        dB = torch.empty_like(B)
-
-        grid_dA = _compute_fwd_grid(offsets, E, BLOCK_M, BLOCK_N, K)
-
-        _grouped_gemm_kernel[grid_dA](
-            dC, B, dA, offsets,
-            N, K,
-            dC.stride(0), dC.stride(1),
-            B.stride(0), B.stride(2), B.stride(1),
-            dA.stride(0), dA.stride(1),
-            NUM_EXPERTS=E,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        )
-
-        k_tile_count = math.ceil(K / BLOCK_K)
-        n_tile_count = math.ceil(N / BLOCK_N)
-        grid_dB      = (E * k_tile_count, n_tile_count)
-
-        _grouped_gemm_dw_kernel[grid_dB](
-            A, dC, dB, offsets,
-            K, N,
-            A.stride(0), A.stride(1),
-            dC.stride(0), dC.stride(1),
-            dB.stride(0), dB.stride(1), dB.stride(2),
-            BLOCK_M=DW_BLOCK_M, BLOCK_K=BLOCK_K, BLOCK_N=BLOCK_N,
-        )
-
-        return dA, dB, None
-
-
-def triton_grouped_gemm(A, B, offsets):
-    """Drop-in replacement for torch._grouped_mm with full backward support"""
-
-    return GroupedGEMM.apply(A, B, offsets)
-
-
 # ──────────────────────────────────────────────────────────────────────
-#  Phase 1: Fused SwiGLU GEMM — gate+up matmul with SiLU*mul in epilogue
+#  Fused SwiGLU GEMM kernel
 # ──────────────────────────────────────────────────────────────────────
 
 
@@ -380,192 +310,245 @@ def _swiglu_bwd_kernel(
     )
 
 
-class FusedSwiGLUGEMM(torch.autograd.Function):
-    """Fused gate+up GEMM with SiLU activation and full backward"""
+# ──────────────────────────────────────────────────────────────────────
+#  triton_op wrappers — torch.compile traces through these
+# ──────────────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def forward(ctx, A, B, offsets):
 
-        total_M, K = A.shape
-        E          = B.shape[0]
-        FF_DIM     = B.shape[2] // 2
-        C          = torch.empty(total_M, FF_DIM, device=A.device, dtype=A.dtype)
-        gate_save  = torch.empty(total_M, FF_DIM, device=A.device, dtype=A.dtype)
-        up_save    = torch.empty(total_M, FF_DIM, device=A.device, dtype=A.dtype)
+@triton_op("genet5::swiglu_bwd", mutates_args=())
+def _swiglu_bwd_op(d_hidden: torch.Tensor, gate_save: torch.Tensor, up_save: torch.Tensor) -> torch.Tensor:
+    total_M, FF_DIM = d_hidden.shape
+    d_fused  = torch.empty(total_M, 2 * FF_DIM, device=d_hidden.device, dtype=d_hidden.dtype)
+    m_blocks = math.ceil(total_M / BLOCK_M)
+    n_blocks = math.ceil(FF_DIM / BLOCK_N)
 
-        grid = _compute_fwd_grid(offsets, E, BLOCK_M, BLOCK_N, FF_DIM)
+    wrap_triton(_swiglu_bwd_kernel)[(m_blocks, n_blocks)](
+        d_hidden, gate_save, up_save, d_fused,
+        FF_DIM,
+        d_hidden.stride(0), d_hidden.stride(1),
+        gate_save.stride(0), gate_save.stride(1),
+        up_save.stride(0), up_save.stride(1),
+        d_fused.stride(0), d_fused.stride(1),
+        TOTAL_M=total_M, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+    )
+    return d_fused
 
-        _fused_swiglu_gemm_kernel[grid](
-            A, B, C, gate_save, up_save, offsets,
-            K, FF_DIM,
-            A.stride(0), A.stride(1),
-            B.stride(0), B.stride(1), B.stride(2),
-            C.stride(0), C.stride(1),
-            gate_save.stride(0), gate_save.stride(1),
-            up_save.stride(0), up_save.stride(1),
-            NUM_EXPERTS=E,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        )
 
-        ctx.save_for_backward(A, B, offsets, gate_save, up_save)
-        ctx.K      = K
-        ctx.FF_DIM = FF_DIM
-        ctx.E      = E
-        return C
+@_swiglu_bwd_op.register_fake
+def _(d_hidden, gate_save, up_save):
+    total_M, FF_DIM = d_hidden.shape
+    return d_hidden.new_empty(total_M, 2 * FF_DIM)
 
-    @staticmethod
-    def backward(ctx, d_hidden):
 
-        A, B, offsets, gate_save, up_save = ctx.saved_tensors
-        K, FF_DIM, E                      = ctx.K, ctx.FF_DIM, ctx.E
-        total_M                           = A.shape[0]
-        d_hidden                          = d_hidden.to(A.dtype)
+@triton_op("genet5::grouped_gemm_dw", mutates_args=())
+def _grouped_gemm_dw_op(A: torch.Tensor, dC: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+    K = A.shape[1]
+    N = dC.shape[1]
+    E = offsets.shape[0] - 1
+    dB = torch.empty(E, K, N, device=A.device, dtype=A.dtype)
 
-        d_fused = torch.empty(total_M, 2 * FF_DIM, device=A.device, dtype=A.dtype)
+    k_tile_count = math.ceil(K / BLOCK_K)
+    n_tile_count = math.ceil(N / BLOCK_N)
+    grid         = (E * k_tile_count, n_tile_count)
 
-        m_blocks = math.ceil(total_M / BLOCK_M)
-        n_blocks = math.ceil(FF_DIM / BLOCK_N)
+    wrap_triton(_grouped_gemm_dw_kernel)[grid](
+        A, dC, dB, offsets,
+        K, N,
+        A.stride(0), A.stride(1),
+        dC.stride(0), dC.stride(1),
+        dB.stride(0), dB.stride(1), dB.stride(2),
+        BLOCK_M=DW_BLOCK_M, BLOCK_K=BLOCK_K, BLOCK_N=BLOCK_N,
+    )
+    return dB
 
-        _swiglu_bwd_kernel[(m_blocks, n_blocks)](
-            d_hidden, gate_save, up_save, d_fused,
-            FF_DIM,
-            d_hidden.stride(0), d_hidden.stride(1),
-            gate_save.stride(0), gate_save.stride(1),
-            up_save.stride(0), up_save.stride(1),
-            d_fused.stride(0), d_fused.stride(1),
-            TOTAL_M=total_M,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        )
 
-        dA = torch.empty_like(A)
-        dB = torch.empty_like(B)
+@_grouped_gemm_dw_op.register_fake
+def _(A, dC, offsets):
+    E = offsets.shape[0] - 1
+    K = A.shape[1]
+    N = dC.shape[1]
+    return A.new_empty(E, K, N)
 
-        N_full = 2 * FF_DIM
-        grid_dA = _compute_fwd_grid(offsets, E, BLOCK_M, BLOCK_N, K)
 
-        _grouped_gemm_kernel[grid_dA](
-            d_fused, B, dA, offsets,
-            N_full, K,
-            d_fused.stride(0), d_fused.stride(1),
-            B.stride(0), B.stride(2), B.stride(1),
-            dA.stride(0), dA.stride(1),
-            NUM_EXPERTS=E,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        )
+@triton_op("genet5::grouped_gemm", mutates_args=())
+def _grouped_gemm_fwd(A: torch.Tensor, B: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+    total_M, K = A.shape
+    E, _, N    = B.shape
+    C          = torch.empty(total_M, N, device=A.device, dtype=A.dtype)
+    grid       = _compute_fwd_grid(offsets, E, BLOCK_M, BLOCK_N, N)
 
-        k_tile_count = math.ceil(K / BLOCK_K)
-        n_tile_count = math.ceil(N_full / BLOCK_N)
-        grid_dB      = (E * k_tile_count, n_tile_count)
+    wrap_triton(_grouped_gemm_kernel)[grid](
+        A, B, C, offsets,
+        K, N,
+        A.stride(0), A.stride(1),
+        B.stride(0), B.stride(1), B.stride(2),
+        C.stride(0), C.stride(1),
+        NUM_EXPERTS=E,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    return C
 
-        _grouped_gemm_dw_kernel[grid_dB](
-            A, d_fused, dB, offsets,
-            K, N_full,
-            A.stride(0), A.stride(1),
-            d_fused.stride(0), d_fused.stride(1),
-            dB.stride(0), dB.stride(1), dB.stride(2),
-            BLOCK_M=DW_BLOCK_M, BLOCK_K=BLOCK_K, BLOCK_N=BLOCK_N,
-        )
 
-        return dA, dB, None
+@_grouped_gemm_fwd.register_fake
+def _(A, B, offsets):
+    total_M = A.shape[0]
+    N       = B.shape[2]
+    return A.new_empty(total_M, N)
+
+
+def _grouped_gemm_setup_ctx(ctx, inputs, output):
+    A, B, offsets = inputs
+    ctx.save_for_backward(A, B, offsets)
+
+
+def _grouped_gemm_bwd(ctx, dC):
+    A, B, offsets = ctx.saved_tensors
+    dC = dC.to(A.dtype)
+    dA = _grouped_gemm_fwd(dC, B.mT, offsets)
+    dB = _grouped_gemm_dw_op(A, dC, offsets)
+    return dA, dB, None
+
+
+_grouped_gemm_fwd.register_autograd(_grouped_gemm_bwd, setup_context=_grouped_gemm_setup_ctx)
+
+
+@triton_op("genet5::fused_swiglu_gemm_fwd", mutates_args=(),
+           schema="(Tensor A, Tensor B, Tensor offsets) -> (Tensor, Tensor, Tensor)")
+def _fused_swiglu_gemm_fwd(A: torch.Tensor, B: torch.Tensor,
+                           offsets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    total_M, K = A.shape
+    E          = B.shape[0]
+    FF_DIM     = B.shape[2] // 2
+    C          = torch.empty(total_M, FF_DIM, device=A.device, dtype=A.dtype)
+    gate_save  = torch.empty(total_M, FF_DIM, device=A.device, dtype=A.dtype)
+    up_save    = torch.empty(total_M, FF_DIM, device=A.device, dtype=A.dtype)
+    grid       = _compute_fwd_grid(offsets, E, BLOCK_M, BLOCK_N, FF_DIM)
+
+    wrap_triton(_fused_swiglu_gemm_kernel)[grid](
+        A, B, C, gate_save, up_save, offsets,
+        K, FF_DIM,
+        A.stride(0), A.stride(1),
+        B.stride(0), B.stride(1), B.stride(2),
+        C.stride(0), C.stride(1),
+        gate_save.stride(0), gate_save.stride(1),
+        up_save.stride(0), up_save.stride(1),
+        NUM_EXPERTS=E,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    return C, gate_save, up_save
+
+
+@_fused_swiglu_gemm_fwd.register_fake
+def _(A, B, offsets):
+    total_M = A.shape[0]
+    FF_DIM  = B.shape[2] // 2
+    return (A.new_empty(total_M, FF_DIM),
+            A.new_empty(total_M, FF_DIM),
+            A.new_empty(total_M, FF_DIM))
+
+
+def _fused_swiglu_setup_ctx(ctx, inputs, output):
+    A, B, offsets          = inputs
+    C, gate_save, up_save  = output
+    ctx.save_for_backward(A, B, offsets, gate_save, up_save)
+
+
+def _fused_swiglu_bwd(ctx, dC, _dg, _du):
+    A, B, offsets, gate_save, up_save = ctx.saved_tensors
+    dC      = dC.to(A.dtype)
+    d_fused = _swiglu_bwd_op(dC, gate_save, up_save)
+    dA      = _grouped_gemm_fwd(d_fused, B.mT, offsets)
+    dB      = _grouped_gemm_dw_op(A, d_fused, offsets)
+    return dA, dB, None
+
+
+_fused_swiglu_gemm_fwd.register_autograd(_fused_swiglu_bwd, setup_context=_fused_swiglu_setup_ctx)
+
+
+@triton_op("genet5::grouped_gemm_scatter_fwd", mutates_args=(),
+           schema="(Tensor A, Tensor B, Tensor offsets, Tensor sorted_weights, "
+                  "Tensor sorted_tokens, int num_tokens) -> (Tensor, Tensor)")
+def _grouped_gemm_scatter_fwd(A: torch.Tensor, B: torch.Tensor, offsets: torch.Tensor,
+                              sorted_weights: torch.Tensor, sorted_tokens: torch.Tensor,
+                              num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+    total_M, K = A.shape
+    E, _, N    = B.shape
+    gemm_out   = torch.empty(total_M, N, device=A.device, dtype=A.dtype)
+    grid       = _compute_fwd_grid(offsets, E, BLOCK_M, BLOCK_N, N)
+
+    wrap_triton(_grouped_gemm_kernel)[grid](
+        A, B, gemm_out, offsets,
+        K, N,
+        A.stride(0), A.stride(1),
+        B.stride(0), B.stride(1), B.stride(2),
+        gemm_out.stride(0), gemm_out.stride(1),
+        NUM_EXPERTS=E,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+
+    idx_e    = sorted_tokens.unsqueeze(-1).expand(-1, N)
+    weighted = gemm_out.float() * sorted_weights.float().unsqueeze(-1)
+    output   = torch.zeros(num_tokens, N, device=A.device, dtype=torch.float32)
+    output.scatter_add_(0, idx_e, weighted)
+    output   = output.to(A.dtype)
+
+    return output, gemm_out
+
+
+@_grouped_gemm_scatter_fwd.register_fake
+def _(A, B, offsets, sorted_weights, sorted_tokens, num_tokens):
+    N = B.shape[2]
+    return (A.new_empty(num_tokens, N), A.new_empty(A.shape[0], N))
+
+
+def _scatter_setup_ctx(ctx, inputs, output):
+    A, B, offsets, sorted_weights, sorted_tokens, num_tokens = inputs
+    final_output, gemm_out                                   = output
+    ctx.save_for_backward(A, B, offsets, sorted_weights, sorted_tokens, gemm_out)
+
+
+def _scatter_bwd(ctx, d_output, _d_gemm):
+    A, B, offsets, sorted_weights, sorted_tokens, gemm_out = ctx.saved_tensors
+    N            = B.shape[2]
+    d_output     = d_output.to(A.dtype)
+
+    idx_e     = sorted_tokens.unsqueeze(-1).expand(-1, N)
+    d_gather  = torch.gather(d_output, 0, idx_e)
+    d_scaled  = (d_gather * sorted_weights.unsqueeze(-1)).to(A.dtype)
+    d_weights = (d_gather * gemm_out).sum(dim=-1)
+
+    dA = _grouped_gemm_fwd(d_scaled, B.mT, offsets)
+    dB = _grouped_gemm_dw_op(A, d_scaled, offsets)
+
+    return dA, dB, None, d_weights, None, None
+
+
+_grouped_gemm_scatter_fwd.register_autograd(_scatter_bwd, setup_context=_scatter_setup_ctx)
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Public API (unchanged signatures)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def triton_grouped_gemm(A, B, offsets):
+    """Drop-in replacement for torch._grouped_mm with full backward support"""
+
+    return _grouped_gemm_fwd(A, B, offsets)
 
 
 def triton_fused_swiglu_gemm(A, B, offsets):
     """Fused gate+up GEMM with SiLU: A @ B[:,:,:ff] * silu(A @ B[:,:,ff:])"""
 
-    return FusedSwiGLUGEMM.apply(A, B, offsets)
-
-
-# ──────────────────────────────────────────────────────────────────────
-#  Phase 2: Down GEMM + deterministic weighted scatter (no atomics)
-# ──────────────────────────────────────────────────────────────────────
-
-
-class GroupedGEMMScatter(torch.autograd.Function):
-    """Down GEMM + fp32 weighted scatter — deterministic, no atomic contention"""
-
-    @staticmethod
-    def forward(ctx, A, B, offsets, sorted_weights, sorted_tokens, num_tokens):
-
-        total_M, K = A.shape
-        E, _, N    = B.shape
-
-        gemm_out = torch.empty(total_M, N, device=A.device, dtype=A.dtype)
-
-        grid = _compute_fwd_grid(offsets, E, BLOCK_M, BLOCK_N, N)
-
-        _grouped_gemm_kernel[grid](
-            A, B, gemm_out, offsets,
-            K, N,
-            A.stride(0), A.stride(1),
-            B.stride(0), B.stride(1), B.stride(2),
-            gemm_out.stride(0), gemm_out.stride(1),
-            NUM_EXPERTS=E,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        )
-
-        idx_e    = sorted_tokens.unsqueeze(-1).expand(-1, N)
-        weighted = gemm_out.float() * sorted_weights.float().unsqueeze(-1)
-        output   = torch.zeros(num_tokens, N, device=A.device, dtype=torch.float32)
-        output.scatter_add_(0, idx_e, weighted)
-        output   = output.to(A.dtype)
-
-        ctx.save_for_backward(A, B, offsets, sorted_weights, sorted_tokens, gemm_out)
-        ctx.K          = K
-        ctx.N          = N
-        ctx.E          = E
-        ctx.num_tokens = num_tokens
-        return output
-
-    @staticmethod
-    def backward(ctx, d_output):
-
-        A, B, offsets, sorted_weights, sorted_tokens, gemm_save = ctx.saved_tensors
-        K, N, E, num_tokens = ctx.K, ctx.N, ctx.E, ctx.num_tokens
-        total_M             = A.shape[0]
-        target_dtype        = A.dtype
-        d_output            = d_output.to(target_dtype)
-
-        idx_e     = sorted_tokens.unsqueeze(-1).expand(-1, N)
-        d_gather  = torch.gather(d_output, 0, idx_e)
-        d_scaled  = (d_gather * sorted_weights.unsqueeze(-1)).to(target_dtype)
-
-        d_weights = (d_gather * gemm_save).sum(dim=-1)
-
-        dA = torch.empty_like(A)
-        dB = torch.empty_like(B)
-
-        grid_dA = _compute_fwd_grid(offsets, E, BLOCK_M, BLOCK_N, K)
-
-        _grouped_gemm_kernel[grid_dA](
-            d_scaled, B, dA, offsets,
-            N, K,
-            d_scaled.stride(0), d_scaled.stride(1),
-            B.stride(0), B.stride(2), B.stride(1),
-            dA.stride(0), dA.stride(1),
-            NUM_EXPERTS=E,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        )
-
-        k_tile_count = math.ceil(K / BLOCK_K)
-        n_tile_count = math.ceil(N / BLOCK_N)
-        grid_dB      = (E * k_tile_count, n_tile_count)
-
-        _grouped_gemm_dw_kernel[grid_dB](
-            A, d_scaled, dB, offsets,
-            K, N,
-            A.stride(0), A.stride(1),
-            d_scaled.stride(0), d_scaled.stride(1),
-            dB.stride(0), dB.stride(1), dB.stride(2),
-            BLOCK_M=DW_BLOCK_M, BLOCK_K=BLOCK_K, BLOCK_N=BLOCK_N,
-        )
-
-        return dA, dB, None, d_weights, None, None
+    C, _, _ = _fused_swiglu_gemm_fwd(A, B, offsets)
+    return C
 
 
 def triton_grouped_gemm_scatter(A, B, offsets, sorted_weights, sorted_tokens, num_tokens):
     """Down GEMM + fp32 weighted scatter — deterministic, no atomics"""
 
-    return GroupedGEMMScatter.apply(A, B, offsets, sorted_weights, sorted_tokens, num_tokens)
+    output, _ = _grouped_gemm_scatter_fwd(A, B, offsets, sorted_weights, sorted_tokens, num_tokens)
+    return output
 
 
 # ──────────────────────────────────────────────────────────────────────
