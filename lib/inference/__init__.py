@@ -16,6 +16,15 @@ from lib.inference.output import (
     locate_exon_in_input,
     features_to_gff3,
     write_gff3,
+    features_to_fasta,
+    features_to_protein,
+    features_to_gtf,
+    features_to_bed,
+    write_fasta,
+    write_gtf,
+    write_bed,
+    write_all_formats,
+    FORMAT_WRITERS,
 )
 
 from lib.inference.diffusion_engine import (
