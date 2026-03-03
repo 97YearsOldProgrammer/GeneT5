@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from torch.library import triton_op, wrap_triton
+from torch.library import triton_op, wrap_triton, custom_op
 
 
 BLOCK_M    = 64
@@ -311,7 +311,7 @@ def _swiglu_bwd_kernel(
 
 
 # ──────────────────────────────────────────────────────────────────────
-#  triton_op wrappers — torch.compile traces through these
+#  Op wrappers: custom_op (opaque to inductor) for fwd, triton_op for bwd
 # ──────────────────────────────────────────────────────────────────────
 
 
@@ -342,6 +342,7 @@ def _(d_hidden, gate_save, up_save):
 
 @triton_op("genet5::grouped_gemm_dw", mutates_args=())
 def _grouped_gemm_dw_op(A: torch.Tensor, dC: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+    offsets = offsets.int()
     K = A.shape[1]
     N = dC.shape[1]
     E = offsets.shape[0] - 1
@@ -370,10 +371,11 @@ def _(A, dC, offsets):
     return A.new_empty(E, K, N)
 
 
-@triton_op("genet5::grouped_gemm", mutates_args=())
+@custom_op("genet5::grouped_gemm", mutates_args=())
 def _grouped_gemm_fwd(A: torch.Tensor, B: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
     total_M, K = A.shape
     E, _, N    = B.shape
+    offsets    = offsets.int()
     C          = torch.empty(total_M, N, device=A.device, dtype=A.dtype)
     grid       = _compute_fwd_grid(offsets, E, BLOCK_M, BLOCK_N, N)
 
@@ -412,13 +414,13 @@ def _grouped_gemm_bwd(ctx, dC):
 _grouped_gemm_fwd.register_autograd(_grouped_gemm_bwd, setup_context=_grouped_gemm_setup_ctx)
 
 
-@triton_op("genet5::fused_swiglu_gemm_fwd", mutates_args=(),
-           schema="(Tensor A, Tensor B, Tensor offsets) -> (Tensor, Tensor, Tensor)")
+@custom_op("genet5::fused_swiglu_gemm_fwd", mutates_args=())
 def _fused_swiglu_gemm_fwd(A: torch.Tensor, B: torch.Tensor,
                            offsets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     total_M, K = A.shape
     E          = B.shape[0]
     FF_DIM     = B.shape[2] // 2
+    offsets    = offsets.int()
     C          = torch.empty(total_M, FF_DIM, device=A.device, dtype=A.dtype)
     gate_save  = torch.empty(total_M, FF_DIM, device=A.device, dtype=A.dtype)
     up_save    = torch.empty(total_M, FF_DIM, device=A.device, dtype=A.dtype)
@@ -465,14 +467,13 @@ def _fused_swiglu_bwd(ctx, dC, _dg, _du):
 _fused_swiglu_gemm_fwd.register_autograd(_fused_swiglu_bwd, setup_context=_fused_swiglu_setup_ctx)
 
 
-@triton_op("genet5::grouped_gemm_scatter_fwd", mutates_args=(),
-           schema="(Tensor A, Tensor B, Tensor offsets, Tensor sorted_weights, "
-                  "Tensor sorted_tokens, int num_tokens) -> (Tensor, Tensor)")
+@custom_op("genet5::grouped_gemm_scatter_fwd", mutates_args=())
 def _grouped_gemm_scatter_fwd(A: torch.Tensor, B: torch.Tensor, offsets: torch.Tensor,
                               sorted_weights: torch.Tensor, sorted_tokens: torch.Tensor,
                               num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
     total_M, K = A.shape
     E, _, N    = B.shape
+    offsets    = offsets.int()
     gemm_out   = torch.empty(total_M, N, device=A.device, dtype=A.dtype)
     grid       = _compute_fwd_grid(offsets, E, BLOCK_M, BLOCK_N, N)
 

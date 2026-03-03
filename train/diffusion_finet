@@ -249,10 +249,11 @@ def main():
     if args.compile:
         if is_main:
             print("\nCompiling model regions...")
+        torch._dynamo.config.recompile_limit = 32
         compile_opts = {"mode": "default", "dynamic": None}
         model.decoder = torch.compile(model.decoder, **compile_opts)
         if is_main:
-            print("  Compiled: decoder")
+            print("  Compiled: decoder (recompile_limit=32)")
 
     model = train_util.wrap_model_distributed(
         model, device, find_unused_params=False, static_graph=False

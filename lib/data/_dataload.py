@@ -112,7 +112,7 @@ class BinaryTrainDataset:
 #####################
 
 
-PAD_BUCKETS     = list(range(512, 9217, 512))
+PAD_BUCKETS     = [2048, 4096, 5120, 6656, 8192]
 DEFAULT_MAX_SEQ = PAD_BUCKETS[-1]
 BUDGET_SEQ      = 8192
 
