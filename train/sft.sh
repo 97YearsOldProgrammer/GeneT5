@@ -216,7 +216,6 @@ echo "========================================"
 cd "$MASTER_CODE_DIR"
 echo "[preflight] Clearing stale caches..."
 find "$MASTER_CODE_DIR" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
-rm -rf /tmp/torchinductor_root/ 2>/dev/null || true
 sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || echo "[preflight] WARNING: drop_caches failed (need root)"
 
 # Warn if swap is active (should be disabled on host: sudo swapoff -a && sudo sed -i '/swap/s/^/#/' /etc/fstab)
@@ -328,7 +327,6 @@ if [[ -n "$WORKER_IP" ]]; then
     ENV_STR+="cd ${WORKER_CODE_DIR}; "
     # Pre-flight cleanup on worker (pycache, inductor, page cache)
     ENV_STR+="find ${WORKER_CODE_DIR} -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true; "
-    ENV_STR+="rm -rf /tmp/torchinductor_root/ 2>/dev/null || true; "
     ENV_STR+="sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true; "
 
     WORKER_CMD="${ENV_STR}$(build_torchrun_cmd 1)"

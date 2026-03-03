@@ -253,9 +253,12 @@ def _chunk_chromosome_genecentric(args):
 
             # Feature must be COMPLETELY inside window
             if feat["start"] >= window_start and feat["end"] <= window_end:
+                # GFF 1-based inclusive → 0-based half-open within chunk:
+                # start: subtract 1 for 1→0 conversion, then subtract window offset
+                # end: 1-based inclusive→0-based exclusive cancels the -1
                 adj_feat = {
                     "type":          feat["type"],
-                    "start":         feat["start"] - window_start,
+                    "start":         feat["start"] - 1 - window_start,
                     "end":           feat["end"] - window_start,
                     "strand":        feat["strand"],
                     "phase":         feat["phase"],
@@ -264,9 +267,9 @@ def _chunk_chromosome_genecentric(args):
                     "biotype":       feat["biotype"],
                 }
 
-                # Adjust CDS coordinates if present
+                # Adjust CDS coordinates (same 1-based→0-based logic)
                 if feat.get("cds_start") is not None:
-                    adj_feat["cds_start"] = feat["cds_start"] - window_start
+                    adj_feat["cds_start"] = feat["cds_start"] - 1 - window_start
                 if feat.get("cds_end") is not None:
                     adj_feat["cds_end"] = feat["cds_end"] - window_start
 

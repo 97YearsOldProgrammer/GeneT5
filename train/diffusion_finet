@@ -14,8 +14,6 @@ import torch.utils.data     as data_utils
 import transformers         as tf
 
 from contextlib import nullcontext
-from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
-
 import lib.data         as ds
 import lib.tokenizer.hf as tk
 import lib.model.seq2seq as mdl
@@ -387,12 +385,6 @@ def main():
         with open(output_dir / 'finetune_config.json', 'w') as f:
             json.dump(config, f, indent=2)
 
-    # Loss function
-    loss_fct = LigerCrossEntropyLoss(
-        ignore_index    = -100,
-        label_smoothing = args.label_smoothing,
-    )
-
     # Training loop
     if is_main:
         print(f"\n{'=' * 60}")
@@ -476,17 +468,17 @@ def main():
 
                     logits = outputs['logits']
 
-                    # Per-sample weighted loss (MDLM)
-                    B = weights.shape[0]
-                    per_sample_loss = torch.zeros(B, device=device)
-                    for i in range(B):
-                        sample_mask = labels[i] != -100
-                        if sample_mask.any():
-                            sample_logits = logits[i][sample_mask]
-                            sample_labels = labels[i][sample_mask]
-                            sample_loss   = loss_fct(sample_logits, sample_labels)
-                            per_sample_loss[i] = sample_loss * weights[i]
-                    loss = per_sample_loss.mean()
+                    # Vectorized per-sample weighted loss (MDLM)
+                    B, S, V = logits.shape
+                    per_token = torch.nn.functional.cross_entropy(
+                        logits.reshape(-1, V), labels.reshape(-1),
+                        ignore_index=-100, reduction='none',
+                        label_smoothing=args.label_smoothing,
+                    ).reshape(B, S)
+
+                    counts          = (labels != -100).sum(dim=-1).clamp(min=1).float()
+                    per_sample_loss = per_token.sum(dim=-1) / counts
+                    loss            = (per_sample_loss * weights).mean()
 
                     if outputs.get('moe_loss') is not None:
                         loss = loss + outputs['moe_loss']
@@ -546,6 +538,10 @@ def main():
                 )
 
         train_loss = total_train_loss / max(num_batches, 1)
+
+        if is_main and collator._dropped > 0:
+            print(f"  Collator dropped {collator._dropped:,} samples this epoch")
+            collator._dropped = 0
 
         if is_dist:
             loss_tensor = torch.tensor([train_loss], device=device)
@@ -625,14 +621,13 @@ def main():
 @torch.no_grad()
 def validate_diffusion(model, val_loader, device, dtype, is_dist,
                        mask_token_id, pad_token_id, vocab_size):
-    """Validate with random masking and compute average loss"""
+    """Validate with MDLM-weighted loss (same computation as training)"""
 
     model_was_training = model.training
     model.train(False)
 
     total_loss  = 0
     num_batches = 0
-    loss_fct    = LigerCrossEntropyLoss(ignore_index=-100)
 
     for batch in val_loader:
         if batch is None:
@@ -640,7 +635,7 @@ def validate_diffusion(model, val_loader, device, dtype, is_dist,
 
         batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
 
-        masked_ids, labels, _ = diffusion.apply_diffusion_mask(
+        masked_ids, labels, weights = diffusion.apply_diffusion_mask(
             batch['input_ids'], batch['prefix_len'],
             mask_token_id, pad_token_id,
         )
@@ -648,12 +643,21 @@ def validate_diffusion(model, val_loader, device, dtype, is_dist,
         with torch.amp.autocast('cuda', dtype=dtype):
             outputs = model(input_ids=masked_ids)
             logits  = outputs['logits']
-            loss   = loss_fct(logits.reshape(-1, vocab_size), labels.reshape(-1))
+
+            B, S, V = logits.shape
+            per_token = torch.nn.functional.cross_entropy(
+                logits.reshape(-1, V), labels.reshape(-1),
+                ignore_index=-100, reduction='none',
+            ).reshape(B, S)
+
+            counts          = (labels != -100).sum(dim=-1).clamp(min=1).float()
+            per_sample_loss = per_token.sum(dim=-1) / counts
+            loss            = (per_sample_loss * weights).mean()
 
         total_loss  += loss.item()
         num_batches += 1
 
-        del outputs, logits, loss, batch, masked_ids, labels
+        del outputs, logits, loss, batch, masked_ids, labels, weights
 
     avg_loss = total_loss / max(num_batches, 1)
 

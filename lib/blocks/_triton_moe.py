@@ -180,6 +180,7 @@ class GroupedGEMM(torch.autograd.Function):
 
         A, B, offsets = ctx.saved_tensors
         K, N, E       = ctx.K, ctx.N, ctx.E
+        dC            = dC.to(A.dtype)
 
         dA = torch.empty_like(A)
         dB = torch.empty_like(B)
@@ -418,6 +419,7 @@ class FusedSwiGLUGEMM(torch.autograd.Function):
         A, B, offsets, gate_save, up_save = ctx.saved_tensors
         K, FF_DIM, E                      = ctx.K, ctx.FF_DIM, ctx.E
         total_M                           = A.shape[0]
+        d_hidden                          = d_hidden.to(A.dtype)
 
         d_fused = torch.empty(total_M, 2 * FF_DIM, device=A.device, dtype=A.dtype)
 
@@ -474,93 +476,12 @@ def triton_fused_swiglu_gemm(A, B, offsets):
 
 
 # ──────────────────────────────────────────────────────────────────────
-#  Phase 2: Epilogue fusion — down GEMM + weight multiply + scatter
+#  Phase 2: Down GEMM + deterministic weighted scatter (no atomics)
 # ──────────────────────────────────────────────────────────────────────
 
 
-@triton.jit
-def _grouped_gemm_scatter_kernel(
-    A_ptr, B_ptr, out_ptr, gemm_save_ptr, offsets_ptr,
-    weights_ptr, token_ids_ptr,
-    K: tl.constexpr, N: tl.constexpr,
-    stride_am, stride_ak,
-    stride_be, stride_bk, stride_bn,
-    stride_om, stride_on,
-    stride_gsm, stride_gsn,
-    NUM_EXPERTS: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-):
-    """C[e] = A[e] @ B[e], then weight * atomic_scatter to output"""
-
-    pid      = tl.program_id(0)
-    n_blocks = tl.cdiv(N, BLOCK_N)
-
-    global_m_block = pid // n_blocks
-    n_block_id     = pid % n_blocks
-
-    acc_blocks   = 0
-    expert_id    = 0
-    expert_start = 0
-    expert_end   = 0
-    local_m      = 0
-
-    for e in tl.static_range(NUM_EXPERTS):
-        e_start  = tl.load(offsets_ptr + e)
-        e_end    = tl.load(offsets_ptr + e + 1)
-        e_count  = e_end - e_start
-        e_blocks = tl.cdiv(e_count, BLOCK_M)
-
-        if global_m_block >= acc_blocks and global_m_block < acc_blocks + e_blocks:
-            expert_id    = e
-            expert_start = e_start
-            expert_end   = e_end
-            local_m      = global_m_block - acc_blocks
-
-        acc_blocks += e_blocks
-
-    m_offs = expert_start + local_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    n_offs = n_block_id * BLOCK_N + tl.arange(0, BLOCK_N)
-    m_mask = m_offs < expert_end
-    n_mask = n_offs < N
-
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-    for k_start in range(0, K, BLOCK_K):
-        k_offs = k_start + tl.arange(0, BLOCK_K)
-        k_mask = k_offs < K
-
-        a = tl.load(
-            A_ptr + m_offs[:, None] * stride_am + k_offs[None, :] * stride_ak,
-            mask=m_mask[:, None] & k_mask[None, :], other=0.0,
-        )
-        b = tl.load(
-            B_ptr + expert_id * stride_be + k_offs[:, None] * stride_bk + n_offs[None, :] * stride_bn,
-            mask=k_mask[:, None] & n_mask[None, :], other=0.0,
-        )
-
-        acc = tl.dot(a, b, acc)
-
-    out_dtype = out_ptr.dtype.element_ty
-    gemm_val  = acc.to(out_dtype)
-
-    tl.store(
-        gemm_save_ptr + m_offs[:, None] * stride_gsm + n_offs[None, :] * stride_gsn,
-        gemm_val,
-        mask=m_mask[:, None] & n_mask[None, :],
-    )
-
-    w = tl.load(weights_ptr + m_offs, mask=m_mask, other=0.0)
-    weighted = (acc * w[:, None]).to(out_dtype)
-
-    tok_ids = tl.load(token_ids_ptr + m_offs, mask=m_mask, other=0)
-
-    scatter_ptrs = out_ptr + tok_ids[:, None] * stride_om + n_offs[None, :] * stride_on
-
-    tl.atomic_add(scatter_ptrs, weighted, mask=m_mask[:, None] & n_mask[None, :], sem="relaxed")
-
-
 class GroupedGEMMScatter(torch.autograd.Function):
-    """Down GEMM + weight multiply + scatter in one kernel"""
+    """Down GEMM + fp32 weighted scatter — deterministic, no atomic contention"""
 
     @staticmethod
     def forward(ctx, A, B, offsets, sorted_weights, sorted_tokens, num_tokens):
@@ -568,27 +489,30 @@ class GroupedGEMMScatter(torch.autograd.Function):
         total_M, K = A.shape
         E, _, N    = B.shape
 
-        output    = torch.zeros(num_tokens, N, device=A.device, dtype=A.dtype)
-        gemm_save = torch.empty(total_M, N, device=A.device, dtype=A.dtype)
+        gemm_out = torch.empty(total_M, N, device=A.device, dtype=A.dtype)
 
         grid = _compute_fwd_grid(offsets, E, BLOCK_M, BLOCK_N, N)
 
-        _grouped_gemm_scatter_kernel[grid](
-            A, B, output, gemm_save, offsets,
-            sorted_weights, sorted_tokens,
+        _grouped_gemm_kernel[grid](
+            A, B, gemm_out, offsets,
             K, N,
             A.stride(0), A.stride(1),
             B.stride(0), B.stride(1), B.stride(2),
-            output.stride(0), output.stride(1),
-            gemm_save.stride(0), gemm_save.stride(1),
+            gemm_out.stride(0), gemm_out.stride(1),
             NUM_EXPERTS=E,
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
         )
 
-        ctx.save_for_backward(A, B, offsets, sorted_weights, sorted_tokens, gemm_save)
-        ctx.K = K
-        ctx.N = N
-        ctx.E = E
+        idx_e    = sorted_tokens.unsqueeze(-1).expand(-1, N)
+        weighted = gemm_out.float() * sorted_weights.float().unsqueeze(-1)
+        output   = torch.zeros(num_tokens, N, device=A.device, dtype=torch.float32)
+        output.scatter_add_(0, idx_e, weighted)
+        output   = output.to(A.dtype)
+
+        ctx.save_for_backward(A, B, offsets, sorted_weights, sorted_tokens, gemm_out)
+        ctx.K          = K
+        ctx.N          = N
+        ctx.E          = E
         ctx.num_tokens = num_tokens
         return output
 
@@ -598,10 +522,12 @@ class GroupedGEMMScatter(torch.autograd.Function):
         A, B, offsets, sorted_weights, sorted_tokens, gemm_save = ctx.saved_tensors
         K, N, E, num_tokens = ctx.K, ctx.N, ctx.E, ctx.num_tokens
         total_M             = A.shape[0]
+        target_dtype        = A.dtype
+        d_output            = d_output.to(target_dtype)
 
         idx_e     = sorted_tokens.unsqueeze(-1).expand(-1, N)
         d_gather  = torch.gather(d_output, 0, idx_e)
-        d_scaled  = d_gather * sorted_weights.unsqueeze(-1)
+        d_scaled  = (d_gather * sorted_weights.unsqueeze(-1)).to(target_dtype)
 
         d_weights = (d_gather * gemm_save).sum(dim=-1)
 
@@ -637,7 +563,7 @@ class GroupedGEMMScatter(torch.autograd.Function):
 
 
 def triton_grouped_gemm_scatter(A, B, offsets, sorted_weights, sorted_tokens, num_tokens):
-    """Down GEMM + weight + scatter fused into single kernel"""
+    """Down GEMM + fp32 weighted scatter — deterministic, no atomics"""
 
     return GroupedGEMMScatter.apply(A, B, offsets, sorted_weights, sorted_tokens, num_tokens)
 
@@ -708,29 +634,22 @@ def triton_counting_sort(flat_indices, flat_tokens, flat_weights, num_experts):
 #  Phase 4: Persistent kernel (design outline — not implemented)
 # ──────────────────────────────────────────────────────────────────────
 #
-#  Goal: single dispatch with grid=(num_SMs,) that fuses the entire MoE
-#  forward: gather -> SwiGLU GEMM -> down GEMM -> scatter
+#  Goal: single dispatch with grid=(num_SMs,) that fuses SwiGLU GEMM + down GEMM
 #
-#  Design:
-#    1. Pre-compute work list on CPU: [(expert, m_block, n_block, phase), ...]
-#       sorted column-major for L2 locality (same n_block consecutive)
-#    2. Each SM loops: work_id = atomicAdd(global_counter, 1)
-#       Load (expert, m_block, n_block, phase) from work list
-#    3. Phase 0 (gate+up GEMM): gather input, compute acc_gate/acc_up,
-#       apply SiLU, store hidden to scratch [total_M, ff_dim]
-#    4. Phase 1 (down GEMM): read hidden from scratch, compute down GEMM,
-#       multiply routing weight, atomic_add scatter to output
-#    5. Tile dependency: phase-1 tile (m, n) must wait for ALL phase-0
-#       tiles (m, *) to complete. Use per-m-block atomic counter:
-#       after phase-0 tile stores, atomicAdd(m_done[m_block], 1)
-#       phase-1 tile spins until m_done[m_block] == n_blocks_phase0
-#    6. Scratch memory: [total_M, ff_dim] intermediate, allocated once
+#  Approach (cooperative grid sync — deadlock-free on sm121):
+#    1. Launch cooperative kernel, grid=(48,) on GB10
+#    2. All SMs do phase-0 tiles (SwiGLU GEMM) via grid-stride loop
+#    3. grid.sync() barrier
+#    4. All SMs do phase-1 tiles (down GEMM + scatter) via grid-stride loop
+#    5. Scratch: [total_M, ff_dim] intermediate, allocated once
 #
-#  Expected savings: ~0.05-0.10ms from eliminating kernel launch overhead
-#  Complexity: two-stage dependency, scratch management, SM scheduling
-#  Prerequisite: phases 1+2 working and benchmarked first
+#  Expected savings: ~5µs from eliminating 1 kernel launch — marginal for training
+#  Not worth pursuing on GB10 (273 GB/s BW makes spin-waits expensive)
+#  Revisit for inference latency optimization or H100+ migration
 #
 #  References:
-#    - FlashAttention persistent kernel (Tri Dao)
-#    - SonicMoE (88% BW utilization on H100 via TMA + persistent)
-#    - Note: GB10 sm121 lacks TMA, so use global memory loads instead
+#    - FlashAttention-3 persistent kernel (Tri Dao) — warp-specialized, Hopper-only
+#    - SonicMoE (88% BW on H100 via TMA + persistent) — sm90+ only
+#    - cuSync (Microsoft) — two-stream pipeline with global semaphores
+#    - Mirage MPK (arxiv 2512.22219) — device-memory event queues, works on Ampere+
+#    - Triton persistent matmul tutorial — grid-stride loop, no inter-block sync
