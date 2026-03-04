@@ -305,8 +305,14 @@ def convert_binary_to_tar(binary_path, species_name, maxcount=50000):
 
 
 def convert_binary_to_packed_tar(binary_path, species_name, tokenizer,
-                                  max_seq_len=8192, maxcount=50000):
-    """Tokenize + pack binary chunks into fixed-length tar shards"""
+                                  max_seq_len=12288, maxcount=50000,
+                                  sort_buffer=2000):
+    """Tokenize + FFD-pack binary chunks into fixed-length tar shards
+
+    Buffers sort_buffer samples, sorts by length descending, packs with
+    first-fit-decreasing for high utilization, writes, then repeats
+    RAM bounded to O(sort_buffer × max_seq_len)
+    """
 
     import numpy as np
     import webdataset as wds
@@ -314,56 +320,76 @@ def convert_binary_to_packed_tar(binary_path, species_name, tokenizer,
     binary_path = pathlib.Path(binary_path)
     shard_dir   = binary_path.parent
     pattern     = str(shard_dir / f"{species_name}-%06d.tar")
+    pad_id      = tokenizer.pad_token_id
 
-    # Phase 1: tokenize all chunks
-    samples = []
+    total_written = 0
+    total_raw     = 0
+
+    sink = wds.ShardWriter(pattern, maxcount=maxcount)
+
+    def _write_pack(pack_ids, pack_seq_lens, pack_pfx_lens):
+        nonlocal total_written
+
+        pad = max_seq_len - len(pack_ids)
+        pack_ids.extend([pad_id] * pad)
+        sink.write({
+            "__key__":    f"pack_{total_written:06d}",
+            "packed.npy": np.array(pack_ids, dtype=np.int32),
+            "meta.json":  json.dumps({"seq_lens": pack_seq_lens,
+                                      "prefix_lens": pack_pfx_lens}),
+        })
+        total_written += 1
+
+    def _ffd_pack_and_write(samples):
+        """First-fit-decreasing bin packing on a buffer of samples"""
+
+        samples.sort(key=lambda s: len(s[0]), reverse=True)
+
+        # bins: list of (ids_list, seq_lens, pfx_lens, current_len)
+        bins = []
+        for ids, plen in samples:
+            slen   = len(ids)
+            placed = False
+
+            for b in bins:
+                if b[3] + slen <= max_seq_len:
+                    b[0].extend(ids)
+                    b[1].append(slen)
+                    b[2].append(plen)
+                    b[3] += slen
+                    placed = True
+                    break
+
+            if not placed:
+                bins.append([list(ids), [slen], [plen], slen])
+
+        for b in bins:
+            _write_pack(b[0], b[1], b[2])
+
+    pool = []
+
     for idx, chunk in ds.iter_binary(binary_path):
-        input_ids  = tokenizer.encode(chunk.get_input_text(), add_special_tokens=False)
+        input_ids  = tokenizer.encode(chunk.get_input_text(),  add_special_tokens=False)
         target_ids = tokenizer.encode(chunk.get_target_text(), add_special_tokens=False)
         full_ids   = input_ids + target_ids
+
         if len(full_ids) > max_seq_len:
-            full_ids   = full_ids[:max_seq_len]
-            input_ids  = input_ids[:min(len(input_ids), max_seq_len)]
-        samples.append({"input_ids": full_ids, "prefix_len": len(input_ids)})
+            full_ids  = full_ids[:max_seq_len]
+            input_ids = input_ids[:min(len(input_ids), max_seq_len)]
 
-    # Phase 2: greedy pack into max_seq_len sequences
-    packs        = []
-    buf_ids      = []
-    buf_seq_lens = []
-    buf_pfx_lens = []
+        pool.append((full_ids, len(input_ids)))
+        total_raw += 1
 
-    for s in samples:
-        ids  = s["input_ids"]
-        plen = s["prefix_len"]
+        if len(pool) >= sort_buffer:
+            _ffd_pack_and_write(pool)
+            pool = []
 
-        if len(buf_ids) + len(ids) > max_seq_len:
-            pad = max_seq_len - len(buf_ids)
-            buf_ids.extend([tokenizer.pad_token_id] * pad)
-            packs.append((buf_ids, buf_seq_lens, buf_pfx_lens))
-            buf_ids, buf_seq_lens, buf_pfx_lens = [], [], []
+    if pool:
+        _ffd_pack_and_write(pool)
 
-        buf_ids.extend(ids)
-        buf_seq_lens.append(len(ids))
-        buf_pfx_lens.append(plen)
-
-    if buf_ids:
-        pad = max_seq_len - len(buf_ids)
-        buf_ids.extend([tokenizer.pad_token_id] * pad)
-        packs.append((buf_ids, buf_seq_lens, buf_pfx_lens))
-
-    # Phase 3: write packed tar shards
-    total_written = 0
-    with wds.ShardWriter(pattern, maxcount=maxcount) as sink:
-        for i, (ids, seq_lens, pfx_lens) in enumerate(packs):
-            sink.write({
-                "__key__":    f"pack_{i:06d}",
-                "packed.npy": np.array(ids, dtype=np.int32),
-                "meta.json":  json.dumps({"seq_lens": seq_lens, "prefix_lens": pfx_lens}),
-            })
-            total_written += 1
-
+    sink.close()
     binary_path.unlink()
-    return total_written, len(samples)
+    return total_written, total_raw
 
 
 def process_species(job):
@@ -438,7 +464,7 @@ def process_species(job):
                 import lib.tokenizer.hf as tk_mod
                 tokenizer    = tk_mod.GeneTokenizer(pathlib.Path(job.tokenizer))
                 packed, raw  = convert_binary_to_packed_tar(
-                    binary_path, job.species, tokenizer, max_seq_len=8192,
+                    binary_path, job.species, tokenizer, max_seq_len=12288,
                 )
                 result["total_packed_samples"] = packed
                 result["total_raw_samples"]    = raw

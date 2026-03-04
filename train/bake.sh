@@ -65,6 +65,7 @@ if [[ -z "$WORKER_IP" ]]; then
     echo "      --tokenizer ../model/GeneT5/init \\"
     echo "      --output_dir ../baked/GeneT5/w20k \\"
     echo "      --window_size 20000 \\"
+    echo "      --packed \\"
     echo "      --val_species B.taurus,S.lycopersicum"
     exit 1
 fi

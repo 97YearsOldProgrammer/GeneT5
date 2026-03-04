@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import pathlib
+import time
+import numpy as np
+import webdataset as wds
+import concurrent.futures
+
+import lib.tokenizer.hf as tk
+
+PACK_SEQ_LEN = 8192
+BATCH_SIZE   = 512
+
+
+def _pack_tokens(input_ids, target_ids, max_seq_len, pad_id, packs, buf_ids, buf_seq_lens, buf_pfx_lens):
+    """Greedy-pack a single tokenized sample into current buffer"""
+
+    full_ids = input_ids + target_ids
+    if len(full_ids) > max_seq_len:
+        full_ids  = full_ids[:max_seq_len]
+        input_ids = input_ids[:min(len(input_ids), max_seq_len)]
+
+    plen = len(input_ids)
+
+    if len(buf_ids) + len(full_ids) > max_seq_len:
+        pad = max_seq_len - len(buf_ids)
+        buf_ids.extend([pad_id] * pad)
+        packs.append((buf_ids[:], buf_seq_lens[:], buf_pfx_lens[:]))
+        buf_ids.clear()
+        buf_seq_lens.clear()
+        buf_pfx_lens.clear()
+
+    buf_ids.extend(full_ids)
+    buf_seq_lens.append(len(full_ids))
+    buf_pfx_lens.append(plen)
+
+
+def repack_species(args_tuple):
+    """Read existing unpacked tars, tokenize, greedy-pack into packed tars"""
+
+    species_dir, species_name, tokenizer_path, max_seq_len = args_tuple
+    species_dir = pathlib.Path(species_dir)
+    tar_files   = sorted(species_dir.glob(f"{species_name}-*.tar"))
+
+    if not tar_files:
+        return species_name, 0, 0
+
+    # Skip already-packed tars (contain .npy, not .txt)
+    import tarfile
+    with tarfile.open(tar_files[0]) as tf:
+        first_names = [m.name for m in tf.getmembers()[:3]]
+    if any(".npy" in n for n in first_names):
+        return species_name, -1, 0
+
+    tokenizer = tk.GeneTokenizer(pathlib.Path(tokenizer_path))
+    pad_id    = tokenizer.pad_token_id
+
+    # Phase 1: batch-tokenize + greedy pack
+    packs        = []
+    buf_ids      = []
+    buf_seq_lens = []
+    buf_pfx_lens = []
+    raw_count    = 0
+
+    batch_inputs  = []
+    batch_targets = []
+
+    dataset = wds.WebDataset([str(f) for f in tar_files], empty_check=False, shardshuffle=False).decode()
+    for sample in dataset:
+        batch_inputs.append(sample.get("input.txt", ""))
+        batch_targets.append(sample.get("target.txt", ""))
+
+        if len(batch_inputs) >= BATCH_SIZE:
+            enc_in  = tokenizer._tok(batch_inputs,  add_special_tokens=False)["input_ids"]
+            enc_tgt = tokenizer._tok(batch_targets, add_special_tokens=False)["input_ids"]
+            for inp, tgt in zip(enc_in, enc_tgt):
+                _pack_tokens(inp, tgt, max_seq_len, pad_id, packs, buf_ids, buf_seq_lens, buf_pfx_lens)
+            raw_count += len(batch_inputs)
+            batch_inputs.clear()
+            batch_targets.clear()
+
+    # Flush remainder
+    if batch_inputs:
+        enc_in  = tokenizer._tok(batch_inputs,  add_special_tokens=False)["input_ids"]
+        enc_tgt = tokenizer._tok(batch_targets, add_special_tokens=False)["input_ids"]
+        for inp, tgt in zip(enc_in, enc_tgt):
+            _pack_tokens(inp, tgt, max_seq_len, pad_id, packs, buf_ids, buf_seq_lens, buf_pfx_lens)
+        raw_count += len(batch_inputs)
+
+    if buf_ids:
+        pad = max_seq_len - len(buf_ids)
+        buf_ids.extend([pad_id] * pad)
+        packs.append((buf_ids, buf_seq_lens, buf_pfx_lens))
+
+    if raw_count == 0:
+        return species_name, 0, 0
+
+    # Phase 2: remove old tars, write packed tars
+    for f in tar_files:
+        f.unlink()
+
+    pattern = str(species_dir / f"{species_name}-%06d.tar")
+    with wds.ShardWriter(pattern, maxcount=50000) as sink:
+        for i, (ids, seq_lens, pfx_lens) in enumerate(packs):
+            sink.write({
+                "__key__":    f"pack_{i:06d}",
+                "packed.npy": np.array(ids, dtype=np.int32),
+                "meta.json":  json.dumps({"seq_lens": seq_lens, "prefix_lens": pfx_lens}),
+            })
+
+    return species_name, len(packs), raw_count
+
+
+def main():
+
+    parser = argparse.ArgumentParser(description="Repack existing unpacked tars into packed format")
+    parser.add_argument("data_dir", type=str, help="Baked data directory")
+    parser.add_argument("--tokenizer", type=str, required=True, help="Tokenizer path")
+    parser.add_argument("--max_seq_len", type=int, default=PACK_SEQ_LEN, help="Pack sequence length [%(default)s]")
+    parser.add_argument("--workers", type=int, default=8, help="Parallel workers [%(default)s]")
+    args = parser.parse_args()
+
+    data_dir  = pathlib.Path(args.data_dir)
+    bake_cfg  = data_dir / "bake_config.json"
+
+    if not bake_cfg.exists():
+        print(f"ERROR: {bake_cfg} not found")
+        return
+
+    with open(bake_cfg) as f:
+        cfg = json.load(f)
+
+    species_list = cfg.get("train_species", [])
+
+    # Quick vocab check
+    tokenizer = tk.GeneTokenizer(pathlib.Path(args.tokenizer))
+
+    print(f"\n{'='*60}")
+    print(f"{'Repack to Packed Format':^60}")
+    print(f"{'='*60}")
+    print(f"  Data dir:     {data_dir}")
+    print(f"  Tokenizer:    {args.tokenizer}")
+    print(f"  Pack length:  {args.max_seq_len}")
+    print(f"  Species:      {len(species_list)}")
+    print(f"  Workers:      {args.workers}")
+    print(f"  Vocab size:   {len(tokenizer)}")
+    del tokenizer
+
+    # Build work items
+    work = []
+    for sp in species_list:
+        sp_dir = data_dir / sp
+        if sp_dir.exists():
+            work.append((str(sp_dir), sp, args.tokenizer, args.max_seq_len))
+        else:
+            print(f"  SKIP: {sp} (not found)")
+
+    total_packed = 0
+    total_raw    = 0
+    done         = 0
+    t0           = time.time()
+
+    print(f"\n  Processing {len(work)} species...", flush=True)
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as executor:
+        futures = {executor.submit(repack_species, w): w[1] for w in work}
+
+        for future in concurrent.futures.as_completed(futures):
+            sp_name = futures[future]
+            try:
+                name, packed, raw = future.result()
+                done += 1
+                if packed == -1:
+                    print(f"  [{done}/{len(work)}] {name}: already packed, skipping", flush=True)
+                    continue
+                total_packed += packed
+                total_raw    += raw
+                elapsed       = time.time() - t0
+                rate          = done / elapsed * 60
+                print(f"  [{done}/{len(work)}] {name}: {raw:,} -> {packed:,} packs "
+                      f"({elapsed:.0f}s, {rate:.1f} sp/min)", flush=True)
+            except Exception as e:
+                done += 1
+                print(f"  [{done}/{len(work)}] {sp_name}: FAILED ({e})", flush=True)
+
+    # Update bake_config
+    cfg["output_format"]        = "packed_tar"
+    cfg["pack_seq_len"]         = args.max_seq_len
+    cfg["total_train_samples"]  = total_packed
+    cfg["total_raw_samples"]    = total_raw
+
+    with open(bake_cfg, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+    elapsed = time.time() - t0
+
+    print(f"\n{' Summary ':=^60}")
+    print(f"  Raw samples:    {total_raw:,}")
+    print(f"  Packed samples: {total_packed:,}")
+    print(f"  Compression:    {total_packed/max(total_raw,1)*100:.1f}% of original count")
+    print(f"  Time:           {elapsed/60:.1f} min")
+    print(f"  Updated:        {bake_cfg}")
+    print(f"{'='*60}")
+
+
+if __name__ == "__main__":
+    main()

@@ -53,7 +53,7 @@ parser.add_argument("--finalize", action="store_true",
 parser.add_argument("--force", action="store_true",
     help="Re-bake all species even if output already exists")
 parser.add_argument("--packed", action="store_true",
-    help="Bake in packed tar format (tokenize + pack into fixed 8192-token sequences)")
+    help="Bake in packed tar format (tokenize + FFD-pack into fixed 12288-token sequences)")
 
 args = parser.parse_args()
 
@@ -63,6 +63,14 @@ if args.finalize:
     args.eval      = True
     args.nnodes    = 1
     args.node_rank = 0
+    # Inherit --packed from node configs if not explicitly set
+    if not args.packed:
+        for cfg_path in pathlib.Path(args.output_dir).glob("bake_config_node*.json"):
+            with open(cfg_path) as f:
+                node_cfg = json.load(f)
+            if node_cfg.get("output_format") == "packed_tar":
+                args.packed = True
+                break
 elif not args.train and not args.eval:
     args.train = True
     args.eval  = True
@@ -297,6 +305,9 @@ if not args.finalize and heldout_to_process and args.train:
 ##############################
 
 
+if 'train_totals' not in dir():
+    train_totals = {}
+
 if args.train and (args.finalize or args.nnodes == 1):
     import lib.data as ds
 
@@ -307,14 +318,24 @@ if args.train and (args.finalize or args.nnodes == 1):
     all_tar_files  = sorted(output_dir.glob("*/*.tar"))
     training_tars  = [f for f in all_tar_files if f.parent.name in all_train_names]
 
-    # Count total training samples from stats.json (written by parse_data.py)
+    # Count total training samples
+    # For packed format: use train_totals from this run, or sum node configs (finalize)
+    # For unpacked: read raw counts from stats.json
     total_train_samples = 0
-    for sp_name in all_train_names:
-        stats_path = output_dir / sp_name / "stats.json"
-        if stats_path.exists():
-            with open(stats_path) as f:
-                sp_stats = json.load(f)
-            total_train_samples += sp_stats.get("run_stats", {}).get("total_samples", 0)
+    if args.packed and train_totals:
+        total_train_samples = sum(train_totals.values())
+    elif args.packed and args.finalize:
+        for cfg_path in sorted(output_dir.glob("bake_config_node*.json")):
+            with open(cfg_path) as f:
+                node_cfg = json.load(f)
+            total_train_samples += node_cfg.get("total_train_samples", 0)
+    else:
+        for sp_name in all_train_names:
+            stats_path = output_dir / sp_name / "stats.json"
+            if stats_path.exists():
+                with open(stats_path) as f:
+                    sp_stats = json.load(f)
+                total_train_samples += sp_stats.get("run_stats", {}).get("total_samples", 0)
 
     print(f"\n{' Per-Species Training Shards (tar) ':=^60}")
     total_bytes = 0
@@ -425,7 +446,7 @@ bake_config = {
 }
 
 if args.packed:
-    bake_config["pack_seq_len"] = 8192
+    bake_config["pack_seq_len"] = 12288
 
 if args.nnodes > 1 and not args.finalize:
     config_path = output_dir / f"bake_config_node{args.node_rank}.json"

@@ -103,14 +103,17 @@ def load_packed_sample(sample):
     import numpy as np
     meta = sample["meta.json"] if isinstance(sample["meta.json"], dict) else json.loads(sample["meta.json"])
     return {
-        "input_ids":   torch.from_numpy(np.array(sample["packed.npy"], dtype=np.int32)).long(),
+        "input_ids":   torch.from_numpy(np.array(sample["packed.npy"], dtype=np.int32)),
         "seq_lens":    meta["seq_lens"],
         "prefix_lens": meta["prefix_lens"],
     }
 
 
 def compute_packed_loss(logits, labels, cu_seqlens, num_real, weights, label_smoothing=0.0):
-    """Per-sub-sequence weighted MDLM loss for packed batches"""
+    """Per-sub-sequence weighted MDLM loss for packed batches
+
+    Vectorized: builds real-segment starts/ends without Python loop .item() syncs
+    """
 
     B, S, V    = logits.shape
     per_token  = torch.nn.functional.cross_entropy(
@@ -121,21 +124,26 @@ def compute_packed_loss(logits, labels, cu_seqlens, num_real, weights, label_smo
     labels_flat = labels.reshape(-1)
     N_real      = weights.shape[0]
 
-    real_idx = 0
-    seg_idx  = 0
-    loss_sum = torch.zeros(1, device=logits.device, dtype=logits.dtype)
-
+    # Build real-segment index pairs (skip padding segments)
+    cu  = cu_seqlens.cpu()
+    nr  = num_real.cpu()
+    seg = 0
+    starts = []
+    ends   = []
     for b in range(B):
-        n = num_real[b].item()
+        n = nr[b].item()
         for j in range(n):
-            start     = cu_seqlens[seg_idx].item()
-            end       = cu_seqlens[seg_idx + 1].item()
-            seg_idx  += 1
-            seg_loss  = per_token[start:end]
-            seg_count = (labels_flat[start:end] != -100).sum().clamp(min=1).float()
-            loss_sum += (seg_loss.sum() / seg_count) * weights[real_idx]
-            real_idx += 1
-        seg_idx += 1  # skip padding segment
+            starts.append(cu[seg].item())
+            ends.append(cu[seg + 1].item())
+            seg += 1
+        seg += 1
+
+    loss_sum = torch.zeros(1, device=logits.device, dtype=logits.dtype)
+    for i in range(N_real):
+        s, e      = starts[i], ends[i]
+        seg_loss  = per_token[s:e]
+        seg_count = (labels_flat[s:e] != -100).sum().clamp(min=1).float()
+        loss_sum += (seg_loss.sum() / seg_count) * weights[i]
 
     return loss_sum / max(N_real, 1)
 
@@ -493,6 +501,8 @@ def main():
                 continue
 
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+            if batch['input_ids'].dtype != torch.long:
+                batch['input_ids'] = batch['input_ids'].long()
 
             # Apply diffusion masking (packed vs unpacked)
             if is_packed:
@@ -502,7 +512,7 @@ def main():
                     mask_token_id, tokenizer.pad_token_id,
                 )
                 cu_seqlens = batch['cu_seqlens']
-                max_seqlen = ds.PACK_SEQ_LEN
+                max_seqlen = cfg.get("pack_seq_len", ds.PACK_SEQ_LEN)
             else:
                 masked_ids, labels, weights = diffusion.apply_diffusion_mask(
                     batch['input_ids'], batch['prefix_len'],
