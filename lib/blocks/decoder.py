@@ -59,11 +59,11 @@ class DecoderBlock(nn.Module):
         self.norm2   = LayerNorm(embed_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, cu_seqlens=None, max_seqlen=None):
 
         # Self-attention
         normed             = self.norm1(hidden_states)
-        attn_output, _     = self.self_attn(normed)
+        attn_output, _     = self.self_attn(normed, cu_seqlens, max_seqlen)
         hidden_states      = hidden_states + self.dropout(attn_output)
 
         # Feed-forward
@@ -131,7 +131,7 @@ class Decoder(nn.Module):
     def gradient_checkpointing_disable(self):
         self._gradient_checkpointing = False
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, cu_seqlens=None, max_seqlen=None):
 
         total_moe_loss = 0.0 if self.use_moe else None
 
@@ -140,10 +140,12 @@ class Decoder(nn.Module):
                 hidden_states, moe_aux_loss = ckpt.checkpoint(
                     layer,
                     hidden_states,
+                    cu_seqlens,
+                    max_seqlen,
                     use_reentrant=False,
                 )
             else:
-                hidden_states, moe_aux_loss = layer(hidden_states)
+                hidden_states, moe_aux_loss = layer(hidden_states, cu_seqlens, max_seqlen)
 
             if self.use_moe and moe_aux_loss is not None:
                 total_moe_loss = total_moe_loss + moe_aux_loss

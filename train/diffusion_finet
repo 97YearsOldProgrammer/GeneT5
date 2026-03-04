@@ -97,6 +97,49 @@ class DiffusionCollator:
         }
 
 
+def load_packed_sample(sample):
+    """Decode a packed WebDataset sample into tensors"""
+
+    import numpy as np
+    meta = sample["meta.json"] if isinstance(sample["meta.json"], dict) else json.loads(sample["meta.json"])
+    return {
+        "input_ids":   torch.from_numpy(np.array(sample["packed.npy"], dtype=np.int32)).long(),
+        "seq_lens":    meta["seq_lens"],
+        "prefix_lens": meta["prefix_lens"],
+    }
+
+
+def compute_packed_loss(logits, labels, cu_seqlens, num_real, weights, label_smoothing=0.0):
+    """Per-sub-sequence weighted MDLM loss for packed batches"""
+
+    B, S, V    = logits.shape
+    per_token  = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, V), labels.reshape(-1),
+        ignore_index=-100, reduction='none',
+        label_smoothing=label_smoothing,
+    )
+    labels_flat = labels.reshape(-1)
+    N_real      = weights.shape[0]
+
+    real_idx = 0
+    seg_idx  = 0
+    loss_sum = torch.zeros(1, device=logits.device, dtype=logits.dtype)
+
+    for b in range(B):
+        n = num_real[b].item()
+        for j in range(n):
+            start     = cu_seqlens[seg_idx].item()
+            end       = cu_seqlens[seg_idx + 1].item()
+            seg_idx  += 1
+            seg_loss  = per_token[start:end]
+            seg_count = (labels_flat[start:end] != -100).sum().clamp(min=1).float()
+            loss_sum += (seg_loss.sum() / seg_count) * weights[real_idx]
+            real_idx += 1
+        seg_idx += 1  # skip padding segment
+
+    return loss_sum / max(N_real, 1)
+
+
 ############################
 #####  CLI             #####
 ############################
@@ -272,40 +315,59 @@ def main():
     if is_main:
         print(f"\nLoading datasets...")
 
-    world_size = train_util.get_world_size()
-
-    train_dataset = ds.create_train_pipeline(shard_urls, tokenizer)
+    world_size  = train_util.get_world_size()
+    is_packed   = cfg.get("output_format") == "packed_tar"
+    persistent  = args.num_workers > 0
 
     val_dataset = None
     if has_val:
         val_dataset = ds.BinaryTrainDataset(str(val_bin), tokenizer, args.seed)
 
     if is_main:
-        print(f"  Train: {total_train:,} samples")
+        print(f"  Train: {total_train:,} samples ({'packed' if is_packed else 'unpacked'})")
         if val_dataset:
             print(f"  Val:   {len(val_dataset):,}")
 
-    # Dataloaders with DiffusionCollator
-    collator     = DiffusionCollator(tokenizer.pad_token_id, max_seq_len=ds.DEFAULT_MAX_SEQ)
-    val_collator = DiffusionCollator(tokenizer.pad_token_id, max_seq_len=ds.DEFAULT_MAX_SEQ)
-    budget       = args.batch_size * ds.BUDGET_SEQ
-    persistent   = args.num_workers > 0
+    if is_packed:
+        # Packed pipeline: fixed 8192-token sequences, no token budget batcher
+        train_dataset = (
+            wds.WebDataset(shard_urls, resampled=True, nodesplitter=wds.split_by_node)
+            .shuffle(10000)
+            .decode()
+            .map(load_packed_sample)
+        )
+        train_loader = wds.WebLoader(
+            train_dataset,
+            batch_size         = None,
+            num_workers        = args.num_workers,
+            pin_memory         = not args.no_pin_memory,
+            persistent_workers = persistent,
+        ).batched(args.batch_size, collation_fn=ds.packed_collate)
 
-    train_loader = wds.WebLoader(
-        train_dataset,
-        batch_size         = None,
-        num_workers        = args.num_workers,
-        pin_memory         = not args.no_pin_memory,
-        persistent_workers = persistent,
-    ).compose(
-        lambda src: ds.token_budget_batcher(src, budget, args.batch_size, collator)
-    )
+        batches_per_epoch = total_train // (args.batch_size * world_size)
+        train_loader      = train_loader.with_epoch(batches_per_epoch)
+    else:
+        # Legacy unpacked pipeline
+        train_dataset = ds.create_train_pipeline(shard_urls, tokenizer)
+        collator      = DiffusionCollator(tokenizer.pad_token_id, max_seq_len=ds.DEFAULT_MAX_SEQ)
+        budget        = args.batch_size * ds.BUDGET_SEQ
 
-    avg_seq               = cfg.get("avg_seq_len", ds.DEFAULT_MAX_SEQ // 2)
-    est_samples_per_batch = max(1, min(args.batch_size, budget // avg_seq))
-    batches_per_epoch     = total_train // (est_samples_per_batch * world_size)
-    train_loader          = train_loader.with_epoch(batches_per_epoch)
+        train_loader = wds.WebLoader(
+            train_dataset,
+            batch_size         = None,
+            num_workers        = args.num_workers,
+            pin_memory         = not args.no_pin_memory,
+            persistent_workers = persistent,
+        ).compose(
+            lambda src: ds.token_budget_batcher(src, budget, args.batch_size, collator)
+        )
 
+        avg_seq               = cfg.get("avg_seq_len", ds.DEFAULT_MAX_SEQ // 2)
+        est_samples_per_batch = max(1, min(args.batch_size, budget // avg_seq))
+        batches_per_epoch     = total_train // (est_samples_per_batch * world_size)
+        train_loader          = train_loader.with_epoch(batches_per_epoch)
+
+    val_collator     = DiffusionCollator(tokenizer.pad_token_id, max_seq_len=ds.DEFAULT_MAX_SEQ)
     val_dist_sampler = None
     val_loader       = None
     if val_dataset:
@@ -373,6 +435,7 @@ def main():
             'train_samples':  total_train,
             'val_samples':    len(val_dataset) if val_dataset else 0,
             'world_size':     world_size,
+            'packed':         is_packed,
         }
         with open(output_dir / 'finetune_config.json', 'w') as f:
             json.dump(config, f, indent=2)
@@ -431,46 +494,74 @@ def main():
 
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
 
-            # Apply diffusion masking
-            masked_ids, labels, weights = diffusion.apply_diffusion_mask(
-                batch['input_ids'],
-                batch['prefix_len'],
-                mask_token_id,
-                tokenizer.pad_token_id,
-            )
+            # Apply diffusion masking (packed vs unpacked)
+            if is_packed:
+                masked_ids, labels, weights = diffusion.apply_diffusion_mask_packed(
+                    batch['input_ids'], batch['cu_seqlens'],
+                    batch['prefix_lens'], batch['num_real'],
+                    mask_token_id, tokenizer.pad_token_id,
+                )
+                cu_seqlens = batch['cu_seqlens']
+                max_seqlen = ds.PACK_SEQ_LEN
+            else:
+                masked_ids, labels, weights = diffusion.apply_diffusion_mask(
+                    batch['input_ids'], batch['prefix_len'],
+                    mask_token_id, tokenizer.pad_token_id,
+                )
+                cu_seqlens = None
+                max_seqlen = None
 
             if not _mark_dynamic_done:
-                torch._dynamo.mark_dynamic(masked_ids, 0)
-                torch._dynamo.mark_dynamic(masked_ids, 1)
+                if not is_packed:
+                    torch._dynamo.mark_dynamic(masked_ids, 0)
+                    torch._dynamo.mark_dynamic(masked_ids, 1)
                 _mark_dynamic_done = True
 
             if step == 0 and is_main:
                 n_masked = (labels != -100).sum().item()
-                n_target = (batch['input_ids'][:, batch['prefix_len']:] != tokenizer.pad_token_id).sum().item()
-                print(f"  First batch: shape={masked_ids.shape}, "
-                      f"prefix_len={batch['prefix_len']}, "
-                      f"masked={n_masked}/{n_target}")
+                if is_packed:
+                    n_target = (batch['input_ids'] != tokenizer.pad_token_id).sum().item()
+                    n_real   = batch['num_real'].sum().item()
+                    print(f"  First batch: shape={masked_ids.shape}, "
+                          f"packed={n_real} sub-seqs, "
+                          f"masked={n_masked}/{n_target}")
+                else:
+                    n_target = (batch['input_ids'][:, batch['prefix_len']:] != tokenizer.pad_token_id).sum().item()
+                    print(f"  First batch: shape={masked_ids.shape}, "
+                          f"prefix_len={batch['prefix_len']}, "
+                          f"masked={n_masked}/{n_target}")
 
             is_sync_step = (step + 1) % args.grad_accum == 0
             sync_context = nullcontext() if (not is_dist or is_sync_step) else model.no_sync()
 
             with sync_context:
                 with torch.amp.autocast('cuda', dtype=dtype):
-                    outputs = model(input_ids=masked_ids)
+                    outputs = model(
+                        input_ids=masked_ids,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=max_seqlen,
+                    )
 
                     logits = outputs['logits']
 
-                    # Vectorized per-sample weighted loss (MDLM)
-                    B, S, V = logits.shape
-                    per_token = torch.nn.functional.cross_entropy(
-                        logits.reshape(-1, V), labels.reshape(-1),
-                        ignore_index=-100, reduction='none',
-                        label_smoothing=args.label_smoothing,
-                    ).reshape(B, S)
+                    if is_packed:
+                        loss = compute_packed_loss(
+                            logits, labels,
+                            batch['cu_seqlens'], batch['num_real'],
+                            weights, label_smoothing=args.label_smoothing,
+                        )
+                    else:
+                        # Vectorized per-sample weighted loss (MDLM)
+                        B, S, V = logits.shape
+                        per_token = torch.nn.functional.cross_entropy(
+                            logits.reshape(-1, V), labels.reshape(-1),
+                            ignore_index=-100, reduction='none',
+                            label_smoothing=args.label_smoothing,
+                        ).reshape(B, S)
 
-                    counts          = (labels != -100).sum(dim=-1).clamp(min=1).float()
-                    per_sample_loss = per_token.sum(dim=-1) / counts
-                    loss            = (per_sample_loss * weights).mean()
+                        counts          = (labels != -100).sum(dim=-1).clamp(min=1).float()
+                        per_sample_loss = per_token.sum(dim=-1) / counts
+                        loss            = (per_sample_loss * weights).mean()
 
                     if outputs.get('moe_loss') is not None:
                         loss = loss + outputs['moe_loss']
@@ -531,7 +622,7 @@ def main():
 
         train_loss = total_train_loss / max(num_batches, 1)
 
-        if is_main and collator._dropped > 0:
+        if not is_packed and is_main and collator._dropped > 0:
             print(f"  Collator dropped {collator._dropped:,} samples this epoch")
             collator._dropped = 0
 

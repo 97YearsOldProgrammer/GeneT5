@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from flash_attn import flash_attn_func
+from flash_attn import flash_attn_func, flash_attn_varlen_func
 
 
 #####################
@@ -83,8 +83,8 @@ class FlashAttention(nn.Module):
                 get_slopes(2 * closest_power)[0::2][:num_heads - closest_power]
             ])
 
-    def forward(self, hidden_states):
-        """Bidirectional flash attention"""
+    def forward(self, hidden_states, cu_seqlens=None, max_seqlen=None):
+        """Bidirectional flash attention with optional varlen packed mode"""
 
         B, L, D = hidden_states.shape
 
@@ -95,15 +95,34 @@ class FlashAttention(nn.Module):
         alibi  = self.alibi_slopes.float() if self.alibi_slopes is not None else None
         drop_p = self.dropout.p if self.training else 0.0
 
-        out = flash_attn_func(
-            q, k, v,
-            dropout_p     = drop_p,
-            softmax_scale = self.softmax_scale,
-            causal        = False,
-            alibi_slopes  = alibi,
-        )
+        if cu_seqlens is not None:
+            # Packed mode: flatten to (B*L, H, D) for varlen kernel
+            q   = q.reshape(-1, self.num_heads, self.head_dim)
+            k   = k.reshape(-1, self.num_kv_heads, self.head_dim)
+            v   = v.reshape(-1, self.num_kv_heads, self.head_dim)
+            out = flash_attn_varlen_func(
+                q, k, v,
+                cu_seqlens_q  = cu_seqlens,
+                cu_seqlens_k  = cu_seqlens,
+                max_seqlen_q  = max_seqlen,
+                max_seqlen_k  = max_seqlen,
+                dropout_p     = drop_p,
+                softmax_scale = self.softmax_scale,
+                causal        = False,
+                alibi_slopes  = alibi,
+            )
+            out = out.reshape(B, L, self.embed_dim)
+        else:
+            # Standard mode (validation, inference)
+            out = flash_attn_func(
+                q, k, v,
+                dropout_p     = drop_p,
+                softmax_scale = self.softmax_scale,
+                causal        = False,
+                alibi_slopes  = alibi,
+            )
+            out = out.reshape(B, L, self.embed_dim)
 
-        out = out.reshape(B, L, self.embed_dim)
         out = self.o(out)
         out = self.dropout(out)
 

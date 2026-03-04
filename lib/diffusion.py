@@ -57,3 +57,43 @@ def apply_diffusion_mask(target_ids, prefix_len, mask_token_id, pad_token_id):
     weights = mdlm_loss_weight(t)
 
     return masked_ids, labels, weights
+
+
+def apply_diffusion_mask_packed(input_ids, cu_seqlens, prefix_lens, num_real,
+                                mask_token_id, pad_token_id):
+    """MDLM masking for packed sequences — samples t per sub-sequence"""
+
+    B, S     = input_ids.shape
+    device   = input_ids.device
+    N_real   = prefix_lens.shape[0]
+
+    t         = torch.rand(N_real, device=device)
+    mask_rate = cosine_mask_rate(t)
+    weights   = mdlm_loss_weight(t)
+
+    masked_ids = input_ids.clone().reshape(-1)
+    labels     = torch.full((B * S,), -100, dtype=torch.long, device=device)
+
+    real_idx = 0
+    seg_idx  = 0
+    for b in range(B):
+        n = num_real[b].item()
+        for j in range(n):
+            start = cu_seqlens[seg_idx].item()
+            end   = cu_seqlens[seg_idx + 1].item()
+            plen  = prefix_lens[real_idx].item()
+            seg_idx += 1
+
+            target_start = start + plen
+            target_ids   = masked_ids[target_start:end]
+            not_pad      = target_ids != pad_token_id
+            selected     = (torch.rand(end - target_start, device=device) < mask_rate[real_idx]) & not_pad
+
+            labels[target_start:end][selected]     = target_ids[selected]
+            masked_ids[target_start:end][selected]  = mask_token_id
+            real_idx += 1
+
+        # Skip padding segment at end of row
+        seg_idx += 1
+
+    return masked_ids.reshape(B, S), labels.reshape(B, S), weights

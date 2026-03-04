@@ -52,6 +52,8 @@ parser.add_argument("--finalize", action="store_true",
     help="Skip per-species baking, only generate eval (run after distributed bake)")
 parser.add_argument("--force", action="store_true",
     help="Re-bake all species even if output already exists")
+parser.add_argument("--packed", action="store_true",
+    help="Bake in packed tar format (tokenize + pack into fixed 8192-token sequences)")
 
 args = parser.parse_args()
 
@@ -223,7 +225,8 @@ def _make_jobs(species_list, output_format="binary"):
 
 
 if not args.finalize and args.train:
-    work_items = _make_jobs(species_to_process, output_format="tar")
+    fmt        = "packed_tar" if args.packed else "tar"
+    work_items = _make_jobs(species_to_process, output_format=fmt)
 
     print(f"\n{' Processing Training Species ':=^60}")
 
@@ -417,9 +420,12 @@ bake_config = {
     "train_species":        [name for name, _ in train_species],
     "heldout_species":      [name for name, _ in heldout_species],
     "eval_samples_generated": len(all_eval_samples),
-    "output_format":        "tar",
+    "output_format":        "packed_tar" if args.packed else "tar",
     "total_train_samples":  total_train_samples,
 }
+
+if args.packed:
+    bake_config["pack_seq_len"] = 8192
 
 if args.nnodes > 1 and not args.finalize:
     config_path = output_dir / f"bake_config_node{args.node_rank}.json"

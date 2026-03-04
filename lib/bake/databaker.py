@@ -304,6 +304,68 @@ def convert_binary_to_tar(binary_path, species_name, maxcount=50000):
     return total_written
 
 
+def convert_binary_to_packed_tar(binary_path, species_name, tokenizer,
+                                  max_seq_len=8192, maxcount=50000):
+    """Tokenize + pack binary chunks into fixed-length tar shards"""
+
+    import numpy as np
+    import webdataset as wds
+
+    binary_path = pathlib.Path(binary_path)
+    shard_dir   = binary_path.parent
+    pattern     = str(shard_dir / f"{species_name}-%06d.tar")
+
+    # Phase 1: tokenize all chunks
+    samples = []
+    for idx, chunk in ds.iter_binary(binary_path):
+        input_ids  = tokenizer.encode(chunk.get_input_text(), add_special_tokens=False)
+        target_ids = tokenizer.encode(chunk.get_target_text(), add_special_tokens=False)
+        full_ids   = input_ids + target_ids
+        if len(full_ids) > max_seq_len:
+            full_ids   = full_ids[:max_seq_len]
+            input_ids  = input_ids[:min(len(input_ids), max_seq_len)]
+        samples.append({"input_ids": full_ids, "prefix_len": len(input_ids)})
+
+    # Phase 2: greedy pack into max_seq_len sequences
+    packs        = []
+    buf_ids      = []
+    buf_seq_lens = []
+    buf_pfx_lens = []
+
+    for s in samples:
+        ids  = s["input_ids"]
+        plen = s["prefix_len"]
+
+        if len(buf_ids) + len(ids) > max_seq_len:
+            pad = max_seq_len - len(buf_ids)
+            buf_ids.extend([tokenizer.pad_token_id] * pad)
+            packs.append((buf_ids, buf_seq_lens, buf_pfx_lens))
+            buf_ids, buf_seq_lens, buf_pfx_lens = [], [], []
+
+        buf_ids.extend(ids)
+        buf_seq_lens.append(len(ids))
+        buf_pfx_lens.append(plen)
+
+    if buf_ids:
+        pad = max_seq_len - len(buf_ids)
+        buf_ids.extend([tokenizer.pad_token_id] * pad)
+        packs.append((buf_ids, buf_seq_lens, buf_pfx_lens))
+
+    # Phase 3: write packed tar shards
+    total_written = 0
+    with wds.ShardWriter(pattern, maxcount=maxcount) as sink:
+        for i, (ids, seq_lens, pfx_lens) in enumerate(packs):
+            sink.write({
+                "__key__":    f"pack_{i:06d}",
+                "packed.npy": np.array(ids, dtype=np.int32),
+                "meta.json":  json.dumps({"seq_lens": seq_lens, "prefix_lens": pfx_lens}),
+            })
+            total_written += 1
+
+    binary_path.unlink()
+    return total_written, len(samples)
+
+
 def process_species(job):
     """Worker function for parallel species processing
 
@@ -367,6 +429,23 @@ def process_species(job):
             except Exception as e:
                 result["success"] = False
                 result["error"]   = f"Tar conversion failed: {e}"
+
+    # Packed tar format: tokenize + pack at bake time
+    if result["success"] and job.output_format == "packed_tar":
+        binary_path = output_dir / "training.bin"
+        if binary_path.exists():
+            try:
+                import lib.tokenizer.hf as tk_mod
+                tokenizer    = tk_mod.GeneTokenizer(pathlib.Path(job.tokenizer))
+                packed, raw  = convert_binary_to_packed_tar(
+                    binary_path, job.species, tokenizer, max_seq_len=8192,
+                )
+                result["total_packed_samples"] = packed
+                result["total_raw_samples"]    = raw
+                result["total_samples"]        = packed
+            except Exception as e:
+                result["success"] = False
+                result["error"]   = f"Packed tar conversion failed: {e}"
 
     return result
 

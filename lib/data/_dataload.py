@@ -115,6 +115,7 @@ class BinaryTrainDataset:
 PAD_BUCKETS     = [2048, 4096, 5120, 6656, 8192]
 DEFAULT_MAX_SEQ = PAD_BUCKETS[-1]
 BUDGET_SEQ      = 8192
+PACK_SEQ_LEN    = 8192
 
 
 def _bucket_pad(length):
@@ -172,4 +173,40 @@ def token_budget_batcher(source, budget, max_batch, collator, sort_size=256):
             yield result
 
 
+###########################
+#####  Packed Collate #####
+###########################
+
+
+def packed_collate(batch):
+    """Collate packed WebDataset samples into a batch with cu_seqlens"""
+
+    B = len(batch)
+    S = len(batch[0]["input_ids"])
+
+    input_ids = torch.stack([b["input_ids"] for b in batch])
+
+    offsets       = []
+    prefix_all    = []
+    num_real_list = []
+    running       = 0
+
+    for b in batch:
+        offsets.append(running)
+        for sl in b["seq_lens"]:
+            running += sl
+            offsets.append(running)
+        pad_len = S - sum(b["seq_lens"])
+        if pad_len > 0:
+            running += pad_len
+            offsets.append(running)
+        prefix_all.extend(b["prefix_lens"])
+        num_real_list.append(len(b["seq_lens"]))
+
+    return {
+        "input_ids":   input_ids,
+        "cu_seqlens":  torch.tensor(offsets, dtype=torch.int32),
+        "prefix_lens": torch.tensor(prefix_all, dtype=torch.int32),
+        "num_real":    torch.tensor(num_real_list, dtype=torch.int32),
+    }
 

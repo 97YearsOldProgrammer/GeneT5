@@ -55,7 +55,9 @@ create_train_pipeline  = dataload.create_train_pipeline
 BinaryTrainDataset     = dataload.BinaryTrainDataset
 DEFAULT_MAX_SEQ        = dataload.DEFAULT_MAX_SEQ
 BUDGET_SEQ             = dataload.BUDGET_SEQ
+PACK_SEQ_LEN           = dataload.PACK_SEQ_LEN
 token_budget_batcher   = dataload.token_budget_batcher
+packed_collate         = dataload.packed_collate
 
 
 ###################
