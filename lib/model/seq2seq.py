@@ -20,7 +20,7 @@ class GeneT5(nn.Module):
         use_alibi   = True,
         use_moe     = True,
         num_experts = 16,
-        moe_top_k   = 4,
+        moe_top_k   = 2,
         num_kv_heads = None,
         vocab_size  = 4096,
         tie_weights = True,

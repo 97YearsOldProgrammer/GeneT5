@@ -27,7 +27,7 @@ parser.add_argument("--no_moe", action="store_false", dest="use_moe",
     help="Disable Mixture of Experts.")
 parser.add_argument("--num_experts", type=int, default=16,
     help="Number of experts for MoE.")
-parser.add_argument("--moe_top_k", type=int, default=4,
+parser.add_argument("--moe_top_k", type=int, default=2,
     help="Top-K routing for MoE.")
 parser.add_argument("--init_std", type=float, default=0.006,
     help="Standard deviation for all random init (DeepSeek).")

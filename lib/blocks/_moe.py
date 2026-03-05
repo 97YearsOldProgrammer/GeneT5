@@ -19,7 +19,7 @@ class MoEConfig:
     embed_dim:            int   = 768
     ff_dim:               int   = 384
     num_experts:          int   = 16
-    top_k:                int   = 4
+    top_k:                int   = 2
     dropout:              float = 0.0
     load_balance_weight:  float = 0.01
     router_z_loss_weight: float = 0.001

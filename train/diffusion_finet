@@ -618,7 +618,7 @@ def main():
                 last_logged_pct = (current_pct // args.log_every_pct) * args.log_every_pct
                 elapsed         = time.time() - epoch_start_time
                 batch_per_sec   = (step + 1) / elapsed if elapsed > 0 else 0
-                avg_loss        = total_train_loss / (step + 1)
+                avg_loss        = (total_train_loss / (step + 1)).item()
 
                 train_logger.log_step(
                     epoch         = epoch + 1,
@@ -630,7 +630,7 @@ def main():
                     batch_per_sec = batch_per_sec,
                 )
 
-        train_loss = total_train_loss / max(num_batches, 1)
+        train_loss = (total_train_loss / max(num_batches, 1)).item()
 
         if not is_packed and is_main and collator._dropped > 0:
             print(f"  Collator dropped {collator._dropped:,} samples this epoch")

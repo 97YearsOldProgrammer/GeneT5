@@ -9,10 +9,26 @@ import triton.language as tl
 from torch.library import triton_op, wrap_triton, custom_op
 
 
-BLOCK_M    = 64
-BLOCK_N    = 64
+# Tuned for GB10 sm_121 (99KB SMEM/block, 48 SMs, 273 GB/s BW)
+# Benchmarked 2026-03-04: 16 experts, 1536 tok/expert, K=768, FF_DIM=768
+# Forward GEMM: (128,128,32) warps=8 stages=3 -> 0.45ms (1.17x vs baseline)
+BLOCK_M    = 128
+BLOCK_N    = 128
 BLOCK_K    = 32
+FWD_WARPS  = 8
+FWD_STAGES = 3
+# Fused SwiGLU: (64,128,32) warps=8 stages=3 -> 0.95ms (1.22x vs baseline)
+FUSE_M     = 64
+FUSE_N     = 128
+FUSE_K     = 32
+FUSE_WARPS = 8
+FUSE_STAGES = 3
+# dW kernel: (64,128,128) warps=4 stages=2 -> 1.23ms (1.85x vs baseline)
 DW_BLOCK_M = 64
+DW_BLOCK_K = 128
+DW_BLOCK_N = 128
+DW_WARPS   = 4
+DW_STAGES  = 2
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -319,8 +335,8 @@ def _swiglu_bwd_kernel(
 def _swiglu_bwd_op(d_hidden: torch.Tensor, gate_save: torch.Tensor, up_save: torch.Tensor) -> torch.Tensor:
     total_M, FF_DIM = d_hidden.shape
     d_fused  = torch.empty(total_M, 2 * FF_DIM, device=d_hidden.device, dtype=d_hidden.dtype)
-    m_blocks = math.ceil(total_M / BLOCK_M)
-    n_blocks = math.ceil(FF_DIM / BLOCK_N)
+    m_blocks = math.ceil(total_M / FUSE_M)
+    n_blocks = math.ceil(FF_DIM / FUSE_N)
 
     wrap_triton(_swiglu_bwd_kernel)[(m_blocks, n_blocks)](
         d_hidden, gate_save, up_save, d_fused,
@@ -329,7 +345,8 @@ def _swiglu_bwd_op(d_hidden: torch.Tensor, gate_save: torch.Tensor, up_save: tor
         gate_save.stride(0), gate_save.stride(1),
         up_save.stride(0), up_save.stride(1),
         d_fused.stride(0), d_fused.stride(1),
-        TOTAL_M=total_M, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        TOTAL_M=total_M, BLOCK_M=FUSE_M, BLOCK_N=FUSE_N,
+        num_warps=FUSE_WARPS, num_stages=FUSE_STAGES,
     )
     return d_fused
 
@@ -348,8 +365,8 @@ def _grouped_gemm_dw_op(A: torch.Tensor, dC: torch.Tensor, offsets: torch.Tensor
     E = offsets.shape[0] - 1
     dB = torch.empty(E, K, N, device=A.device, dtype=A.dtype)
 
-    k_tile_count = math.ceil(K / BLOCK_K)
-    n_tile_count = math.ceil(N / BLOCK_N)
+    k_tile_count = math.ceil(K / DW_BLOCK_K)
+    n_tile_count = math.ceil(N / DW_BLOCK_N)
     grid         = (E * k_tile_count, n_tile_count)
 
     wrap_triton(_grouped_gemm_dw_kernel)[grid](
@@ -358,7 +375,8 @@ def _grouped_gemm_dw_op(A: torch.Tensor, dC: torch.Tensor, offsets: torch.Tensor
         A.stride(0), A.stride(1),
         dC.stride(0), dC.stride(1),
         dB.stride(0), dB.stride(1), dB.stride(2),
-        BLOCK_M=DW_BLOCK_M, BLOCK_K=BLOCK_K, BLOCK_N=BLOCK_N,
+        BLOCK_M=DW_BLOCK_M, BLOCK_K=DW_BLOCK_K, BLOCK_N=DW_BLOCK_N,
+        num_warps=DW_WARPS, num_stages=DW_STAGES,
     )
     return dB
 
@@ -387,6 +405,7 @@ def _grouped_gemm_fwd(A: torch.Tensor, B: torch.Tensor, offsets: torch.Tensor) -
         C.stride(0), C.stride(1),
         NUM_EXPERTS=E,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=FWD_WARPS, num_stages=FWD_STAGES,
     )
     return C
 
@@ -424,7 +443,7 @@ def _fused_swiglu_gemm_fwd(A: torch.Tensor, B: torch.Tensor,
     C          = torch.empty(total_M, FF_DIM, device=A.device, dtype=A.dtype)
     gate_save  = torch.empty(total_M, FF_DIM, device=A.device, dtype=A.dtype)
     up_save    = torch.empty(total_M, FF_DIM, device=A.device, dtype=A.dtype)
-    grid       = _compute_fwd_grid(offsets, E, BLOCK_M, BLOCK_N, FF_DIM)
+    grid       = _compute_fwd_grid(offsets, E, FUSE_M, FUSE_N, FF_DIM)
 
     wrap_triton(_fused_swiglu_gemm_kernel)[grid](
         A, B, C, gate_save, up_save, offsets,
@@ -435,7 +454,8 @@ def _fused_swiglu_gemm_fwd(A: torch.Tensor, B: torch.Tensor,
         gate_save.stride(0), gate_save.stride(1),
         up_save.stride(0), up_save.stride(1),
         NUM_EXPERTS=E,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        BLOCK_M=FUSE_M, BLOCK_N=FUSE_N, BLOCK_K=FUSE_K,
+        num_warps=FUSE_WARPS, num_stages=FUSE_STAGES,
     )
     return C, gate_save, up_save
 
@@ -485,6 +505,7 @@ def _grouped_gemm_scatter_fwd(A: torch.Tensor, B: torch.Tensor, offsets: torch.T
         gemm_out.stride(0), gemm_out.stride(1),
         NUM_EXPERTS=E,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        num_warps=FWD_WARPS, num_stages=FWD_STAGES,
     )
 
     idx_e    = sorted_tokens.unsqueeze(-1).expand(-1, N)
