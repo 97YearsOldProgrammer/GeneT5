@@ -5,8 +5,6 @@ import json
 from pathlib    import Path
 from lib.blocks import Encoder
 
-from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
-
 
 class GeneT5(nn.Module):
 
