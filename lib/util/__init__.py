@@ -10,7 +10,7 @@ from lib.bake.databaker import (
     report_augmentation_status,
 )
 
-from lib.inference.engine import (
+from lib.inference import (
     auto_detect_device,
     get_device_info,
     select_dtype,

@@ -7,10 +7,10 @@ from lib.blocks._flash_att      import FlashAttention, FlashAttentionConfig
 from lib.blocks._moe            import MoE, MoEConfig
 
 
-####  DECODER  ####
+####  ENCODER  ####
 
 
-class DecoderBlock(nn.Module):
+class EncoderBlock(nn.Module):
 
     def __init__(
         self,
@@ -79,7 +79,7 @@ class DecoderBlock(nn.Module):
             return hidden_states, None
 
 
-class Decoder(nn.Module):
+class Encoder(nn.Module):
 
     def __init__(
         self,
@@ -103,7 +103,7 @@ class Decoder(nn.Module):
         self.use_alibi = use_alibi
 
         self.layers = nn.ModuleList([
-            DecoderBlock(
+            EncoderBlock(
                 embed_dim        = embed_dim,
                 num_heads        = num_heads,
                 ff_dim           = ff_dim,

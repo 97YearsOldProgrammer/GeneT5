@@ -45,7 +45,7 @@ PYTHONPATH=. python bin/finet \
     ../baked/w5k_c4.5k_5pct/validation.packed \
     ../model/test_run ../model/base \
     --epochs 1 --lr 1e-4 --token_budget 36400 --max_batch_size 8 \
-    --grad_accum 64 --compile --log_every_pct 5
+    --grad_accum 64 --compile --log_every_steps 50
 
 # Full training (2x DGX Spark)
 bin/distributed.sh ../baked/w5k_c4.5k/training.packed \

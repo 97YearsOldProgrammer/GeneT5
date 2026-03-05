@@ -6,7 +6,7 @@ import gc
 from transformers import AutoConfig
 from pathlib      import Path
 
-from lib.blocks         import Decoder
+from lib.blocks         import Encoder
 from lib.tokenizer.hf   import GeneTokenizer
 
 
@@ -148,9 +148,9 @@ def build_gt5(
         nn.init.normal_(embed.weight.data[orig_embed.shape[0]:], mean=0.0, std=init_std)
     print(f"    copied {copy_size}, random init {max(0, vocab_size - copy_size)} new")
 
-    # Build decoder stack
-    print(f"\n[4] Building Decoder Stack")
-    decoder = Decoder(
+    # Build encoder stack
+    print(f"\n[4] Building Encoder Stack")
+    encoder = Encoder(
         num_layers   = num_layers,
         embed_dim    = embed_dim,
         num_heads    = num_heads,
@@ -164,10 +164,10 @@ def build_gt5(
     )
 
     # Transfer weights from DNABERT-2
-    print(f"\n[5] Transferring DNABERT-2 weights to decoder")
+    print(f"\n[5] Transferring DNABERT-2 weights to encoder")
     num_copy = min(num_layers, dna_num_layers)
     for idx in range(num_copy):
-        layer  = decoder.layers[idx]
+        layer  = encoder.layers[idx]
         prefix = f"bert.encoder.layer.{idx}"
 
         # Self-attention: Q/K/V from fused Wqkv
@@ -197,7 +197,7 @@ def build_gt5(
         # FFN norm
         layer.norm2.weight.data.copy_(sd[f"{prefix}.mlp.layernorm.weight"])
 
-    nn.init.ones_(decoder.final_norm.weight)
+    nn.init.ones_(encoder.final_norm.weight)
     if use_moe:
         print(f"    transferred {num_copy} layers (self-attn + norms from DNABERT-2)")
         print(f"    MoE upcycled: {NUM_BASE_EXPERTS} base experts from dense FFN, "
@@ -244,7 +244,7 @@ def build_gt5(
 
     checkpoint = {
         "embed":   embed.state_dict(),
-        "decoder": decoder.state_dict(),
+        "encoder": encoder.state_dict(),
         "lm_head": lm_head.state_dict(),
     }
     torch.save(checkpoint, save_path / "pytorch_model.bin")
@@ -253,7 +253,7 @@ def build_gt5(
         torch.cuda.empty_cache()
 
     total_params  = sum(p.numel() for p in embed.parameters())
-    total_params += sum(p.numel() for p in decoder.parameters())
+    total_params += sum(p.numel() for p in encoder.parameters())
     total_params += sum(p.numel() for p in lm_head.parameters())
 
     print("\n" + "=" * 60)

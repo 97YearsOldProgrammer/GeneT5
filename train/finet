@@ -72,8 +72,8 @@ def build_parser():
         metavar='<float>', help='label smoothing factor [%(default).2f]')
     parser.add_argument('--gradient_checkpointing', action='store_true',
         help='enable gradient checkpointing to save memory')
-    parser.add_argument('--log_every_pct', required=False, type=int, default=10,
-        metavar='<int>', help='log progress every N percent of epoch [%(default)i]')
+    parser.add_argument('--log_every_steps', required=False, type=int, default=100,
+        metavar='<int>', help='log progress every N optimizer steps [%(default)i]')
     parser.add_argument('--save_steps', required=False, type=int, default=None,
         metavar='<int>', help='save checkpoint every N optimizer steps (default: end of epoch only)')
     parser.add_argument('--empty_cache_steps', required=False, type=int, default=None,
@@ -355,7 +355,7 @@ def main():
 
     optimizer_steps_per_epoch = batches_per_epoch // args.grad_accum
     if is_main:
-        print(f"  Progress logging: every {args.log_every_pct}% ({batches_per_epoch * args.log_every_pct // 100} batches)")
+        print(f"  Progress logging: every {args.log_every_steps} optimizer steps")
         if args.save_steps:
             print(f"  Step checkpoints: every {args.save_steps} optimizer steps")
         else:
@@ -375,7 +375,10 @@ def main():
     # Training metrics logger
     train_logger = None
     if is_main:
-        train_logger = util.create_train_logger(output_dir, resume=args.checkpoint is not None)
+        train_logger = util.create_train_logger(
+            output_dir, resume=args.checkpoint is not None,
+            total_epochs=args.epochs,
+        )
         print(f"  Training log: {train_logger.log_path}")
 
     # Eval hook (rank 0 only)
@@ -403,8 +406,6 @@ def main():
         optimizer.zero_grad(set_to_none=True)
 
         num_batches      = batches_per_epoch
-        log_interval     = max(1, num_batches * args.log_every_pct // 100)
-        last_logged_pct  = -1
         epoch_start_time = time.time()
 
         for step, batch in enumerate(train_loader):
@@ -452,12 +453,20 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
-                if global_step % 100 == 0 and global_step > 0 and is_main:
-                    elapsed     = time.time() - epoch_start_time
-                    batch_per_s = (step + 1) / elapsed if elapsed > 0 else 0
-                    print(f"  step {global_step} | loss {loss_val:.4f} | "
-                          f"batch {step+1}/{num_batches} | "
-                          f"{batch_per_s:.1f} batch/s")
+                if train_logger and global_step % args.log_every_steps == 0 and global_step > 0:
+                    elapsed       = time.time() - epoch_start_time
+                    batch_per_sec = (step + 1) / elapsed if elapsed > 0 else 0
+                    avg_loss      = total_train_loss / (step + 1)
+
+                    train_logger.log_step(
+                        epoch         = epoch + 1,
+                        global_step   = global_step,
+                        batch         = step + 1,
+                        num_batches   = num_batches,
+                        loss          = avg_loss,
+                        lr            = optimizer.get_last_lr()[0],
+                        batch_per_sec = batch_per_sec,
+                    )
 
                 if args.save_steps and global_step % args.save_steps == 0:
                     train_util.save_checkpoint(model, optimizer, None, epoch,
@@ -471,23 +480,6 @@ def main():
                     torch.cuda.empty_cache()
 
             total_train_loss += loss_val
-
-            current_pct = (step + 1) * 100 // num_batches
-            if train_logger and current_pct >= last_logged_pct + args.log_every_pct:
-                last_logged_pct = (current_pct // args.log_every_pct) * args.log_every_pct
-                elapsed         = time.time() - epoch_start_time
-                batch_per_sec   = (step + 1) / elapsed if elapsed > 0 else 0
-                avg_loss        = total_train_loss / (step + 1)
-
-                train_logger.log_step(
-                    epoch         = epoch + 1,
-                    global_step   = global_step,
-                    batch         = step + 1,
-                    num_batches   = num_batches,
-                    loss          = avg_loss,
-                    lr            = optimizer.get_last_lr()[0],
-                    batch_per_sec = batch_per_sec,
-                )
 
         train_loss = total_train_loss / max(num_batches, 1)
 
@@ -550,22 +542,20 @@ def main():
     # Stop memory watcher and close loggers
     if mem_watcher:
         mem_watcher.stop()
-    if train_logger:
-        train_logger.close()
     if eval_logger:
         eval_logger.close()
 
-    # save final (rank 0 only)
     if is_main:
-        print(f"\n{'=' * 60}")
-        print('Saving final model...')
-        train_util.save_final_model(model, tokenizer, args.model_path, output_dir)
+        if train_logger:
+            train_logger.log_summary(best_val_loss=best_val_loss)
 
-        print(f"\n{'=' * 60}")
-        print(f"Complete!")
+        print(f"\nSaving final model...")
+        train_util.save_final_model(model, tokenizer, args.model_path, output_dir)
         print(f"  Output: {output_dir}")
-        print(f"  Best Val Loss: {best_val_loss:.4f}")
-        print(f"{'=' * 60}")
+        print(f"  Best val loss: {best_val_loss:.4f}")
+
+    if train_logger:
+        train_logger.close()
 
     if is_dist:
         train_util.cleanup_distributed()

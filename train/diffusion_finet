@@ -21,6 +21,7 @@ import lib.util         as util
 import lib.train        as train_util
 import lib.diffusion    as diffusion
 from lib.train.optimizer import create_optimizer
+from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
 
 
 DEFAULTS = {
@@ -109,17 +110,15 @@ def load_packed_sample(sample):
     }
 
 
-def compute_packed_loss(logits, labels, cu_seqlens, num_real, weights, label_smoothing=0.0):
+def compute_packed_loss(logits, labels, cu_seqlens, num_real, weights, loss_fct):
     """Per-sub-sequence weighted MDLM loss for packed batches
 
     Vectorized: builds real-segment starts/ends without Python loop .item() syncs
     """
 
     B, S, V    = logits.shape
-    per_token  = torch.nn.functional.cross_entropy(
+    per_token  = loss_fct(
         logits.reshape(-1, V), labels.reshape(-1),
-        ignore_index=-100, reduction='none',
-        label_smoothing=label_smoothing,
     )
     labels_flat = labels.reshape(-1)
     N_real      = weights.shape[0]
@@ -191,8 +190,8 @@ def build_parser():
         metavar='<float>', help='label smoothing factor [%(default).2f]')
     parser.add_argument('--gradient_checkpointing', action='store_true',
         help='enable gradient checkpointing')
-    parser.add_argument('--log_every_pct', required=False, type=int, default=10,
-        metavar='<int>', help='log progress every N percent [%(default)i]')
+    parser.add_argument('--log_every_steps', required=False, type=int, default=100,
+        metavar='<int>', help='log progress every N optimizer steps [%(default)i]')
     parser.add_argument('--save_steps', required=False, type=int, default=None,
         metavar='<int>', help='save checkpoint every N optimizer steps')
     parser.add_argument('--empty_cache_steps', required=False, type=int, default=None,
@@ -202,7 +201,7 @@ def build_parser():
     parser.add_argument('--memwatch', action='store_true',
         help='enable background memory monitoring')
     parser.add_argument('--compile', action='store_true',
-        help='enable torch.compile on decoder')
+        help='enable torch.compile on encoder')
     parser.add_argument('--no_eval', action='store_true',
         help='skip generative F1 evaluation')
     parser.add_argument('--eval_samples', required=False, type=int, default=20,
@@ -296,14 +295,30 @@ def main():
         pathlib.Path(args.model_path), device='cpu', dtype=torch.bfloat16
     )
 
-    # torch.compile decoder BEFORE DDP (compiling DDP wrapper deadlocks on NCCL)
+    # torch.compile encoder BEFORE DDP (compiling DDP wrapper deadlocks on NCCL)
     if args.compile:
         if is_main:
-            print("\nCompiling decoder...")
+            print("\nCompiling encoder (first forward will trigger)...")
         compile_opts = {"mode": "default", "dynamic": None}
-        model.decoder = torch.compile(model.decoder, **compile_opts)
+        model.encoder = torch.compile(model.encoder, **compile_opts)
+
+        # Warmup compile with minimal batch to avoid OOM on first real step
+        # Compilation allocates ~1GB transient memory (tracing + autotuning);
+        # doing it here before optimizer creation keeps peak memory lower
         if is_main:
-            print("  Compiled: decoder")
+            print("  Warmup forward+backward...", end=" ", flush=True)
+        _t0 = time.time()
+        model.to(device)
+        _x = torch.randn(1, 128, model.embed_dim, device=device, dtype=torch.bfloat16)
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            _y, _moe = model.encoder(_x, None, None)
+        _y.sum().backward()
+        del _x, _y, _moe
+        model.zero_grad(set_to_none=True)
+        torch.cuda.empty_cache()
+        model.to('cpu')
+        if is_main:
+            print(f"done ({time.time() - _t0:.0f}s)")
 
     model = train_util.wrap_model_distributed(
         model, device, find_unused_params=False, static_graph=False
@@ -453,11 +468,15 @@ def main():
         print('Training (MDLM Diffusion)...')
         print(f"{'=' * 60}")
 
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    dtype    = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    loss_fct = LigerCrossEntropyLoss(
+        ignore_index=-100, reduction='none',
+        label_smoothing=args.label_smoothing,
+    )
 
     if args.gradient_checkpointing:
-        if hasattr(raw_model.decoder, 'gradient_checkpointing_enable'):
-            raw_model.decoder.gradient_checkpointing_enable()
+        if hasattr(raw_model.encoder, 'gradient_checkpointing_enable'):
+            raw_model.encoder.gradient_checkpointing_enable()
         if is_main:
             print("  Gradient checkpointing: enabled")
 
@@ -472,7 +491,10 @@ def main():
     # Training logger
     train_logger = None
     if is_main:
-        train_logger = util.create_train_logger(output_dir, resume=args.checkpoint is not None)
+        train_logger = util.create_train_logger(
+            output_dir, resume=args.checkpoint is not None,
+            total_epochs=args.epochs,
+        )
         print(f"  Training log: {train_logger.log_path}")
 
     for epoch in range(start_epoch, args.epochs):
@@ -491,7 +513,6 @@ def main():
         optimizer.zero_grad(set_to_none=True)
 
         num_batches      = batches_per_epoch
-        last_logged_pct  = -1
         epoch_start_time = time.time()
 
         for step, batch in enumerate(train_loader):
@@ -551,15 +572,13 @@ def main():
                         loss = compute_packed_loss(
                             logits, labels,
                             batch['cu_seqlens'], batch['num_real'],
-                            weights, label_smoothing=args.label_smoothing,
+                            weights, loss_fct,
                         )
                     else:
                         # Vectorized per-sample weighted loss (MDLM)
                         B, S, V = logits.shape
-                        per_token = torch.nn.functional.cross_entropy(
+                        per_token = loss_fct(
                             logits.reshape(-1, V), labels.reshape(-1),
-                            ignore_index=-100, reduction='none',
-                            label_smoothing=args.label_smoothing,
                         ).reshape(B, S)
 
                         counts          = (labels != -100).sum(dim=-1).clamp(min=1).float()
@@ -584,12 +603,20 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
-                if global_step % 100 == 0 and global_step > 0 and is_main:
-                    elapsed     = time.time() - epoch_start_time
-                    batch_per_s = (step + 1) / elapsed if elapsed > 0 else 0
-                    print(f"  step {global_step} | loss {loss_val.item() * args.grad_accum:.4f} | "
-                          f"batch {step+1}/{num_batches} | "
-                          f"{batch_per_s:.1f} batch/s")
+                if train_logger and global_step % args.log_every_steps == 0 and global_step > 0:
+                    elapsed       = time.time() - epoch_start_time
+                    batch_per_sec = (step + 1) / elapsed if elapsed > 0 else 0
+                    avg_loss      = (total_train_loss / (step + 1)).item()
+
+                    train_logger.log_step(
+                        epoch         = epoch + 1,
+                        global_step   = global_step,
+                        batch         = step + 1,
+                        num_batches   = num_batches,
+                        loss          = avg_loss,
+                        lr            = optimizer.get_last_lr()[0],
+                        batch_per_sec = batch_per_sec,
+                    )
 
                 if args.save_steps and global_step % args.save_steps == 0:
                     train_util.save_checkpoint(
@@ -605,23 +632,6 @@ def main():
                     torch.cuda.empty_cache()
 
             total_train_loss += loss_val
-
-            current_pct = (step + 1) * 100 // num_batches
-            if train_logger and current_pct >= last_logged_pct + args.log_every_pct:
-                last_logged_pct = (current_pct // args.log_every_pct) * args.log_every_pct
-                elapsed         = time.time() - epoch_start_time
-                batch_per_sec   = (step + 1) / elapsed if elapsed > 0 else 0
-                avg_loss        = (total_train_loss / (step + 1)).item()
-
-                train_logger.log_step(
-                    epoch         = epoch + 1,
-                    global_step   = global_step,
-                    batch         = step + 1,
-                    num_batches   = num_batches,
-                    loss          = avg_loss,
-                    lr            = optimizer.get_last_lr()[0],
-                    batch_per_sec = batch_per_sec,
-                )
 
         train_loss = (total_train_loss / max(num_batches, 1)).item()
 
@@ -686,19 +696,18 @@ def main():
     # Cleanup
     if mem_watcher:
         mem_watcher.stop()
-    if train_logger:
-        train_logger.close()
 
     if is_main:
-        print(f"\n{'=' * 60}")
-        print('Saving final model...')
-        train_util.save_final_model(model, tokenizer, args.model_path, output_dir)
+        if train_logger:
+            train_logger.log_summary(best_val_loss=best_val_loss)
 
-        print(f"\n{'=' * 60}")
-        print(f"Complete!")
+        print(f"\nSaving final model...")
+        train_util.save_final_model(model, tokenizer, args.model_path, output_dir)
         print(f"  Output: {output_dir}")
-        print(f"  Best Val Loss: {best_val_loss:.4f}")
-        print(f"{'=' * 60}")
+        print(f"  Best val loss: {best_val_loss:.4f}")
+
+    if train_logger:
+        train_logger.close()
 
     if is_dist:
         train_util.cleanup_distributed()
@@ -711,6 +720,8 @@ def validate_diffusion(model, val_loader, device, dtype, is_dist,
 
     model_was_training = model.training
     model.train(False)
+
+    val_loss_fct = LigerCrossEntropyLoss(ignore_index=-100, reduction='none')
 
     total_loss  = 0
     num_batches = 0
@@ -731,9 +742,8 @@ def validate_diffusion(model, val_loader, device, dtype, is_dist,
             logits  = outputs['logits']
 
             B, S, V = logits.shape
-            per_token = torch.nn.functional.cross_entropy(
+            per_token = val_loss_fct(
                 logits.reshape(-1, V), labels.reshape(-1),
-                ignore_index=-100, reduction='none',
             ).reshape(B, S)
 
             counts          = (labels != -100).sum(dim=-1).clamp(min=1).float()

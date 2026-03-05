@@ -10,7 +10,7 @@ parser.add_argument("--save_dir", type=str, default="/workspace/model/GeneT5/ini
 parser.add_argument("--dnabert_path", type=str, default="zhihan1996/DNABERT-2-117M",
     help="HuggingFace model ID or local path to DNABERT-2.")
 parser.add_argument("--layers", type=int, default=None,
-    help="Number of decoder layers. Defaults to matching DNABERT-2.")
+    help="Number of encoder layers. Defaults to matching DNABERT-2.")
 parser.add_argument("--heads", type=int, default=None,
     help="Number of attention heads. Defaults to matching DNABERT-2.")
 parser.add_argument("--ff_dim", type=int, default=None,
