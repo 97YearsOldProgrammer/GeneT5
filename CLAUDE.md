@@ -46,12 +46,12 @@ init/          - Model initialization
   setup-nfs.sh   - NFS setup
 lib/           - Core library code
   model/         - Model architectures and builders
-    seq2seq.py     - GeneT5 decoder-only architecture
+    genet5.py      - GeneT5 model architecture
     build.py       - Model builder (GeneT5 from DNABERT-2)
   tokenizer/     - Tokenization
     hf.py          - GeneTokenizer (DNABERT-2 extended)
   data/          - Data loading, packing, dynamic padding
-  blocks/        - Model components (encoder, decoder, MoE, sparse attention)
+  blocks/        - Model components (transformer layers, MoE, attention)
   train/         - Training loop, logging, memory monitoring, eval hooks
     loop.py        - Distributed training, optimizers, checkpoints
     logger.py      - CSV + stdout training logger

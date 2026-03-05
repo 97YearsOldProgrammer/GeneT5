@@ -34,7 +34,7 @@ class GeneT5(nn.Module):
         self.embed         = nn.Embedding(vocab_size, embed_dim)
         self.embed_dropout = nn.Dropout(dropout)
 
-        # Bidirectional encoder stack
+        # Transformer stack (named 'decoder' for checkpoint compatibility)
         self.decoder = Decoder(
             num_layers   = num_layers,
             embed_dim    = embed_dim,

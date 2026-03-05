@@ -1,27 +1,25 @@
 ## GeneT5
 
-End-to-end gene prediction using an encoder-decoder transformer, replacing traditional HMM-based tools like Augustus
+End-to-end gene prediction using masked diffusion (MDLM), replacing traditional HMM-based tools like Augustus
 
 ### Architecture
 
 ```
-DNA Sequence --> DNABERT-2 Encoder (12L) --> Perceiver Compressor (1024 latents)
-                                                    |
-                                                    v
-Gene Annotation <-- Decoder (12L, MoE x16, GQA) <--+
+DNA + [MASK] tokens --> Transformer (12L, MoE x16, ALiBi) --> Iterative unmasking --> Gene Annotation
 ```
 
-- **Encoder**: DNABERT-2 117M with sparse windowed attention
-- **Compressor**: Perceiver with 1024 learned latents (variable-length input -> fixed representation)
-- **Decoder**: 12 layers, grouped-query attention (12H/3KV), Mixture-of-Experts (16 experts, top-2)
-- **Total**: 1.55B parameters
+- **Model**: Bidirectional transformer, 12 layers, ALiBi positional encoding
+- **MoE**: 16 experts top-2, upcycled from DNABERT-2 dense FFN
+- **Training**: MDLM masked diffusion (cosine schedule)
+- **Inference**: Iterative parallel unmasking (not autoregressive)
+- **Total**: ~374M parameters
 
 ### Why Deep Learning for Gene Prediction
 
-1. Attention mechanism captures long-range dependencies that Markov models miss
-2. Pre-trained encoder (DNABERT-2) provides cross-species transfer learning
+1. Bidirectional attention captures long-range dependencies that Markov models miss
+2. Weights initialized from DNABERT-2 provide cross-species transfer learning
 3. MoE enables capacity scaling without proportional compute cost
-4. Single model handles prokaryotes through vertebrates
+4. Diffusion decoding generates all annotations in parallel (vs sequential HMM)
 
 ### Setup
 
@@ -63,16 +61,18 @@ See [bin/README.md](bin/README.md) for full command recipes
 ### Project Structure
 
 ```
-bin/            CLI entry points (init, bake, train, eval)
+train/          Training scripts (SFT, diffusion, GRPO)
+init/           Model initialization
 lib/
-  blocks/       Encoder, decoder, perceiver, MoE, sparse attention
-  dataset/      Data loading, packing, token budget batching
-  util/         Training loop, memory monitoring, logging
+  model/        GeneT5 architecture and builder
+  blocks/       Transformer layers, MoE, attention
+  data/         Data loading, packing, token budget batching
+  train/        Training loop, memory monitoring, logging
+  inference/    Inference engine and output parsing
   nosing/       Post-processing (exon/intron/protein extraction)
-  model.py      Main GeneT5 architecture
-  tokenizer.py  Tokenizer wrapper
-test/           Evaluation (BUSCO, F1 metrics)
-tests/          Development benchmarks and tests
+  tokenizer/    Tokenizer wrapper
+eval/           Evaluation (BUSCO, F1 metrics)
+cli/            CLI interface
 ```
 
 ### Data Layout

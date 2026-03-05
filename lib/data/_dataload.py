@@ -112,10 +112,10 @@ class BinaryTrainDataset:
 #####################
 
 
-PAD_BUCKETS     = [2048, 4096, 6144, 8192, 10240, 12288]
+PAD_BUCKETS     = [2048, 4096, 6144, 8192]
 DEFAULT_MAX_SEQ = PAD_BUCKETS[-1]
-BUDGET_SEQ      = 12288
-PACK_SEQ_LEN    = 12288
+BUDGET_SEQ      = 8192
+PACK_SEQ_LEN    = 8192
 
 
 def _bucket_pad(length):

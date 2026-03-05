@@ -1,5 +1,6 @@
 import lib.data._parser     as parser
 import lib.data._binary     as binary
+import lib.data._merge      as merge
 import lib.data._chunking   as chunking
 import lib.data._dataload   as dataload
 import lib.data._util       as util
@@ -32,8 +33,9 @@ read_binary         = binary.read_binary
 get_binary_info     = binary.get_binary_info
 get_chunk_count     = binary.get_chunk_count
 read_chunk_at_index = binary.read_chunk_at_index
-iter_binary         = binary.iter_binary
-merge_binary_files  = binary.merge_binary_files
+iter_binary           = binary.iter_binary
+iter_binary_token_ids = binary.iter_binary_token_ids
+merge_binary_files    = merge.merge_binary_files
 
 
 #####################

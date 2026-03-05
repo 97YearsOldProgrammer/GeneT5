@@ -23,6 +23,7 @@ from lib.data.wrapper import (
     get_chunk_count,
     read_chunk_at_index,
     iter_binary,
+    iter_binary_token_ids,
     merge_binary_files,
     BinaryChunk,
 

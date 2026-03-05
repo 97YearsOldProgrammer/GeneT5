@@ -100,10 +100,10 @@ def build_gt5(
     # Init
     init_std            = DEFAULTS["init_std"],
 ):
-    """Build decoder-only GeneT5 from DNABERT-2 and save clean checkpoint"""
+    """Build GeneT5 from DNABERT-2 and save clean checkpoint"""
 
     print("=" * 60)
-    print("Building GeneT5 (decoder-only) from DNABERT-2")
+    print("Building GeneT5 from DNABERT-2")
     print("=" * 60)
     print(f"\nInit std: {init_std}")
 
@@ -129,7 +129,7 @@ def build_gt5(
     dna_num_layers  = dna_config.num_hidden_layers
 
     print(f"\n    DNABERT-2: hidden={embed_dim}, layers={dna_num_layers}, heads={dna_config.num_attention_heads}")
-    print(f"    Decoder:   layers={num_layers}, heads={num_heads}, moe={use_moe}, experts={num_experts}, ff_dim={ff_dim}")
+    print(f"    GeneT5:    layers={num_layers}, heads={num_heads}, moe={use_moe}, experts={num_experts}, ff_dim={ff_dim}")
 
     # Load raw state dict
     print(f"\n[2] Loading DNABERT-2 weights")

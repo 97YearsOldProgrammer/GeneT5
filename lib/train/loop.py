@@ -3,7 +3,7 @@ import random
 
 import torch
 
-from lib.train.distributed import is_main_process, all_reduce_mean
+from lib.train.distributed import is_main_process
 
 
 ###################################

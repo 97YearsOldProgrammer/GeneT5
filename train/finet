@@ -17,7 +17,7 @@ from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
 
 import lib.data         as ds
 import lib.tokenizer.hf as tk
-import lib.model.seq2seq as mdl
+import lib.model.genet5  as mdl
 import lib.util         as util
 import lib.train        as train_util
 
@@ -182,7 +182,7 @@ def main():
             print("  First ~3 batches will be slow (compilation warmup)")
 
     model = train_util.wrap_model_distributed(model, device,
-        find_unused_params=False, static_graph=False)
+        find_unused_params=True, static_graph=False)
 
     # Halve allreduce volume by compressing gradients to BF16
     if is_dist:
@@ -417,8 +417,9 @@ def main():
 
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
 
-            is_sync_step = (step + 1) % args.grad_accum == 0
-            sync_context = nullcontext() if (not is_dist or is_sync_step) else model.no_sync()
+            is_last_batch = (step + 1) == num_batches
+            is_sync_step  = ((step + 1) % args.grad_accum == 0) or is_last_batch
+            sync_context  = nullcontext() if (not is_dist or is_sync_step) else model.no_sync()
 
             with sync_context:
                 with torch.amp.autocast('cuda', dtype=dtype):

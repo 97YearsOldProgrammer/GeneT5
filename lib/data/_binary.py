@@ -206,8 +206,7 @@ class BinaryChunk:
 
         sorted_features = sorted(self.features, key=lambda x: x.get("start", 0))
 
-        parts  = []
-        first  = True
+        segments = ["<bos>"]
 
         for f in sorted_features:
             if f.get("type", "").lower() != "exon":
@@ -219,47 +218,30 @@ class BinaryChunk:
             cds_end    = f.get("cds_end")
 
             if cds_start is not None and cds_end is not None:
-                # Exon has CDS boundaries — split into UTR + CDS regions
                 if cds_start > exon_start:
                     utr5 = self.sequence[exon_start:cds_start]
                     if utr5:
-                        parts.append(("<UTR>", utr5))
+                        segments.append("<UTR>")
+                        segments.append(utr5)
 
                 cds_dna = self.sequence[cds_start:cds_end]
                 if cds_dna:
-                    parts.append(("<exon>", cds_dna))
+                    segments.append("<exon>")
+                    segments.append(cds_dna)
 
                 if cds_end < exon_end:
                     utr3 = self.sequence[cds_end:exon_end]
                     if utr3:
-                        parts.append(("<UTR>", utr3))
+                        segments.append("<UTR>")
+                        segments.append(utr3)
             else:
-                # No CDS info — entire exon is coding
                 exon_dna = self.sequence[exon_start:exon_end]
                 if exon_dna:
-                    parts.append(("<exon>", exon_dna))
+                    segments.append("<exon>")
+                    segments.append(exon_dna)
 
-        target = "<bos>"
-        for tag, dna in parts:
-            target += tag + dna
-        target += "<eos>"
-
-        return target
-
-    def estimate_input_tokens(self, tokenizer=None):
-        """Estimate input token count for this chunk"""
-
-        input_text = self.get_input_text()
-
-        if tokenizer is not None:
-            return len(tokenizer.encode(input_text, add_special_tokens=False))
-
-        # Fallback: rough estimate
-        seq_tokens  = len(self.sequence) / 4.5
-        hint_tokens = len(self.hints) * 5 if self.has_hints else 0
-        overhead    = 5
-
-        return int(seq_tokens + hint_tokens + overhead)
+        segments.append("<eos>")
+        return "".join(segments)
 
 
 ################################
@@ -522,179 +504,70 @@ def iter_binary(input_path):
             yield chunk_idx, BinaryChunk.from_bytes(data)
 
 
-def merge_binary_files(input_paths, output_path, compress=None, show_progress=True, max_chunks=None, seed=42):
+def iter_binary_token_ids(input_path):
+    """Fast iterator that extracts only pre-tokenized IDs from binary file
+
+    Skips JSON/text deserialization — only unpacks the v2 header lengths
+    and the trailing token ID arrays. Yields (input_ids, target_ids) tuples.
+    Returns None for files without pre-tokenized IDs.
     """
-    Stream-merge multiple .bin files into one unified file
 
-    Memory: O(1) per chunk — reads raw bytes from each source file
-    and writes directly to output without deserializing BinaryChunk
+    header_size_v2 = struct.calcsize('<6I')
 
-    Handles mixed compression: decompresses if needed, optionally recompresses
-    When max_chunks is set, randomly subsamples to cap total output
-    """
-    output_path = pathlib.Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(input_path, 'rb') as f:
+        magic = f.read(4)
+        if magic != MAGIC_HEADER:
+            raise ValueError(f"Invalid magic header: {magic}")
 
-    input_paths = [pathlib.Path(p) for p in input_paths]
-    input_paths = [p for p in input_paths if p.exists()]
+        version       = struct.unpack('<B', f.read(1))[0]
+        compress_type = struct.unpack('<B', f.read(1))[0]
+        num_chunks    = struct.unpack('<I', f.read(4))[0]
 
-    if not input_paths:
-        return output_path
+        decompressor = _get_decompressor(compress_type)
 
-    # First pass: count total chunks from all files (header-only reads)
-    file_metas   = []
-    total_chunks = 0
-
-    for path in input_paths:
-        with open(path, 'rb') as f:
-            magic = f.read(4)
-            if magic != MAGIC_HEADER:
-                continue
-
-            version       = struct.unpack('<B', f.read(1))[0]
-            compress_type = struct.unpack('<B', f.read(1))[0]
-            num_chunks    = struct.unpack('<I', f.read(4))[0]
-
-            if num_chunks == 0:
-                continue
-
-            # Read offset table
-            offsets = []
-            if version >= 2:
-                for _ in range(num_chunks):
-                    offset, length = struct.unpack('<QI', f.read(12))
-                    offsets.append((offset, length))
-            else:
-                for _ in range(num_chunks):
-                    offset, length = struct.unpack('<II', f.read(8))
-                    offsets.append((offset, length))
-
-            file_metas.append({
-                'path':         path,
-                'version':      version,
-                'compress':     compress_type,
-                'num_chunks':   num_chunks,
-                'offsets':      offsets,
-            })
-            total_chunks += num_chunks
-
-    if total_chunks == 0:
-        return output_path
-
-    # Subsample if total exceeds max_chunks
-    selected = None
-    if max_chunks is not None and max_chunks > 0 and total_chunks > max_chunks:
-        import random
-        random.seed(seed)
-
-        # Build flat list of (file_idx, chunk_idx) then sample
-        all_indices = []
-        for fi, meta in enumerate(file_metas):
-            for ci in range(meta['num_chunks']):
-                all_indices.append((fi, ci))
-
-        chosen       = set(random.sample(all_indices, max_chunks))
-        selected     = {}
-        for fi, ci in chosen:
-            selected.setdefault(fi, set()).add(ci)
-
-        if show_progress:
-            print(f"  Subsampling {total_chunks:,} -> {max_chunks:,} chunks")
-        total_chunks = max_chunks
-
-    # Determine output compression
-    if compress == 'zstd':
-        try:
-            import zstd
-            out_compress   = COMPRESS_ZSTD
-            compressor     = lambda data: zstd.compress(data, 3)
-        except ImportError:
-            import zlib
-            out_compress   = COMPRESS_ZLIB
-            compressor     = lambda data: zlib.compress(data, 6)
-    elif compress == 'zlib':
-        import zlib
-        out_compress = COMPRESS_ZLIB
-        compressor   = lambda data: zlib.compress(data, 6)
-    else:
-        out_compress = COMPRESS_NONE
-        compressor   = None
-
-    if show_progress:
-        print(f"  Merging {len(file_metas)} files -> {output_path.name} ({total_chunks:,} chunks)")
-
-    # Second pass: stream-write merged file
-    with open(output_path, 'wb') as out:
-        out.write(MAGIC_HEADER)
-        out.write(struct.pack('<B', FORMAT_VERSION))
-        out.write(struct.pack('<B', out_compress))
-        out.write(struct.pack('<I', total_chunks))
-
-        # Placeholder offset table
-        offset_table_pos = out.tell()
-        out.write(b'\x00' * (total_chunks * OFFSET_ENTRY_SIZE_V2))
-
-        out_offsets   = []
-        chunks_done   = 0
-
-        for fi, meta in enumerate(file_metas):
-            src_decomp = _get_decompressor(meta['compress'])
-
-            # Can we skip decompression+recompression?
-            passthrough = (meta['compress'] == out_compress)
-            file_selected = selected.get(fi) if selected else None
-
-            with open(meta['path'], 'rb') as src:
-                for ci, (src_offset, src_length) in enumerate(meta['offsets']):
-                    if file_selected is not None and ci not in file_selected:
-                        continue
-
-                    src.seek(src_offset)
-                    raw_bytes = src.read(src_length)
-
-                    if passthrough:
-                        write_bytes = raw_bytes
-                    else:
-                        # Decompress from source format
-                        if src_decomp:
-                            plain = src_decomp(raw_bytes)
-                        else:
-                            plain = raw_bytes
-
-                        # Recompress to output format
-                        if compressor:
-                            write_bytes = compressor(plain)
-                        else:
-                            write_bytes = plain
-
-                    current_offset = out.tell()
-                    out.write(write_bytes)
-                    out_offsets.append((current_offset, len(write_bytes)))
-
-                    chunks_done += 1
-                    if show_progress and chunks_done % 50000 == 0:
-                        pct = 100 * chunks_done / total_chunks
-                        print(f"    {chunks_done:,}/{total_chunks:,} ({pct:.1f}%)", end='\r')
-
-        if show_progress and total_chunks > 50000:
-            print(f"    {total_chunks:,}/{total_chunks:,} (100.0%)")
-
-        # Write real offset table
-        out.seek(offset_table_pos)
-        for offset, length in out_offsets:
-            out.write(struct.pack('<QI', offset, length))
-
-    file_size = output_path.stat().st_size
-    if show_progress:
-        if file_size < 1024 * 1024:
-            size_str = f"{file_size / 1024:.1f} KB"
-        elif file_size < 1024 ** 3:
-            size_str = f"{file_size / 1024 / 1024:.1f} MB"
+        offsets = []
+        if version >= 2:
+            for _ in range(num_chunks):
+                offset, length = struct.unpack('<QI', f.read(12))
+                offsets.append((offset, length))
         else:
-            size_str = f"{file_size / 1024 ** 3:.2f} GB"
-        print(f"  Done: {size_str}")
+            for _ in range(num_chunks):
+                offset, length = struct.unpack('<II', f.read(8))
+                offsets.append((offset, length))
 
-    return output_path
+        for chunk_idx, (offset, length) in enumerate(offsets):
+            f.seek(offset)
+            raw = f.read(length)
+
+            if decompressor:
+                raw = decompressor(raw)
+
+            if len(raw) < header_size_v2:
+                yield chunk_idx, None, None
+                continue
+
+            meta_len, seq_len, feat_len, hints_len, in_len, tgt_len = struct.unpack(
+                '<6I', raw[:header_size_v2]
+            )
+
+            if in_len > 1000000 or tgt_len > 1000000 or in_len == 0:
+                yield chunk_idx, None, None
+                continue
+
+            # Jump straight to token ID bytes — skip meta+seq+feat+hints
+            ids_offset = header_size_v2 + meta_len + seq_len + feat_len + hints_len
+
+            in_bytes  = raw[ids_offset:ids_offset + in_len * 4]
+            input_ids = list(struct.unpack(f'<{in_len}i', in_bytes))
+
+            if tgt_len > 0:
+                tgt_start  = ids_offset + in_len * 4
+                tgt_bytes  = raw[tgt_start:tgt_start + tgt_len * 4]
+                target_ids = list(struct.unpack(f'<{tgt_len}i', tgt_bytes))
+            else:
+                target_ids = []
+
+            yield chunk_idx, input_ids, target_ids
 
 
 def get_chunk_count(input_path):

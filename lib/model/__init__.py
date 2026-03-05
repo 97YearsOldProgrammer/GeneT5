@@ -1,1 +1,1 @@
-from lib.model.seq2seq import GeneT5
+from lib.model.genet5 import GeneT5

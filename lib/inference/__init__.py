@@ -5,6 +5,9 @@ from lib.inference.engine import (
     GenerationConfig,
     InferenceResult,
     GeneT5Inference,
+)
+
+from lib.inference._tokenizer import (
     SimpleTokenizer,
     read_input,
 )
