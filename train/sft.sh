@@ -174,6 +174,10 @@ for env in "${NCCL_ENVS[@]}"; do
     export "$env"
 done
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,garbage_collection_threshold:0.8"
+export TRITON_PTXAS_PATH="/usr/local/cuda/bin/ptxas"
+export TRITON_CACHE_DIR="/workspace/.cache/triton"
+export TORCHINDUCTOR_CACHE_DIR="/workspace/.cache/torchinductor"
+export TORCHINDUCTOR_FX_GRAPH_CACHE=1
 # Auto-detect master code dir (same logic as worker detection)
 MASTER_CODE_DIR=""
 for d in /workspace/Code/GeneT5 /workspace/GeneT5; do
@@ -316,6 +320,10 @@ if [[ -n "$WORKER_IP" ]]; then
         esac
     done
     ENV_STR+="export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8; "
+    ENV_STR+="export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas; "
+    ENV_STR+="export TRITON_CACHE_DIR=/workspace/.cache/triton; "
+    ENV_STR+="export TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor; "
+    ENV_STR+="export TORCHINDUCTOR_FX_GRAPH_CACHE=1; "
     ENV_STR+="export PYTHONPATH=${WORKER_CODE_DIR}; "
     # Worker detects its own CX7 interface + HCA (may differ from master)
     ENV_STR+="for iface in enP2p1s0f1np1 enP2p1s0f0np0 enp1s0f1np1 enp1s0f0np0; do "

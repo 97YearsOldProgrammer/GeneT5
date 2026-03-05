@@ -296,15 +296,14 @@ def main():
         pathlib.Path(args.model_path), device='cpu', dtype=torch.bfloat16
     )
 
-    # torch.compile
+    # torch.compile decoder BEFORE DDP (compiling DDP wrapper deadlocks on NCCL)
     if args.compile:
         if is_main:
-            print("\nCompiling model regions...")
-        torch._dynamo.config.recompile_limit = 32
+            print("\nCompiling decoder...")
         compile_opts = {"mode": "default", "dynamic": None}
         model.decoder = torch.compile(model.decoder, **compile_opts)
         if is_main:
-            print("  Compiled: decoder (recompile_limit=32)")
+            print("  Compiled: decoder")
 
     model = train_util.wrap_model_distributed(
         model, device, find_unused_params=False, static_graph=False
@@ -463,7 +462,6 @@ def main():
             print("  Gradient checkpointing: enabled")
 
     patience_counter  = 0
-    _mark_dynamic_done = False
 
     # Memory watcher
     mem_watcher = None
@@ -520,12 +518,6 @@ def main():
                 )
                 cu_seqlens = None
                 max_seqlen = None
-
-            if not _mark_dynamic_done:
-                if not is_packed:
-                    torch._dynamo.mark_dynamic(masked_ids, 0)
-                    torch._dynamo.mark_dynamic(masked_ids, 1)
-                _mark_dynamic_done = True
 
             if step == 0 and is_main:
                 n_masked = (labels != -100).sum().item()

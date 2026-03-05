@@ -171,10 +171,10 @@ def main():
         print(f"\nLoading model...")
     model = mdl.GeneT5.from_pretrained(pathlib.Path(args.model_path), device='cpu', dtype=torch.bfloat16)
 
-    # Regional torch.compile (before DDP so DDPOptimizer sees compiled submodules)
+    # torch.compile decoder BEFORE DDP (compiling DDP wrapper deadlocks on NCCL)
     if args.compile:
         if is_main:
-            print("\nCompiling model regions...")
+            print("\nCompiling decoder...")
         compile_opts = {"mode": "default", "dynamic": None}
         model.decoder = torch.compile(model.decoder, **compile_opts)
         if is_main:
