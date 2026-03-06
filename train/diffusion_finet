@@ -321,12 +321,9 @@ def main():
             print(f"done ({time.time() - _t0:.0f}s)")
 
     model = train_util.wrap_model_distributed(
-        model, device, find_unused_params=False, static_graph=False
+        model, device, find_unused_params=False, static_graph=True,
+        bucket_cap_mb=100,
     )
-
-    if is_dist:
-        from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
-        model.register_comm_hook(state=None, hook=default_hooks.bf16_compress_hook)
 
     raw_model = train_util.unwrap_model(model)
     stats     = raw_model.get_param_stats()

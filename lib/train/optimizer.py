@@ -48,40 +48,45 @@ class MuonE2E:
         self._momentum = momentum
         self._wd       = weight_decay
 
-        self._lr_proxy  = torch.optim.SGD([torch.zeros(1)], lr=lr)
+        self._lr_proxy   = torch.optim.SGD([torch.zeros(1)], lr=lr)
         self._schedulers = []
 
     def step(self):
 
         lr = self._lr_proxy.param_groups[0]['lr']
 
-        for p, buf in zip(self._params_2d, self._bufs_2d):
-            if p.grad is None:
-                continue
-            g = p.grad
+        active    = [i for i, p in enumerate(self._params_2d) if p.grad is not None]
+        grads_2d  = [self._params_2d[i].grad for i in active]
+        params_2d = [self._params_2d[i].data for i in active]
+        bufs_2d   = [self._bufs_2d[i] for i in active]
 
-            buf.lerp_(g, 1 - self._momentum)
-            update = g.lerp_(buf, self._momentum)
+        torch._foreach_lerp_(bufs_2d, grads_2d, 1 - self._momentum)
+        torch._foreach_lerp_(grads_2d, bufs_2d, self._momentum)
 
-            update = _newton_schulz(update)
-            update *= max(1, p.size(-2) / p.size(-1)) ** 0.5
+        for j, i in enumerate(active):
+            p         = self._params_2d[i]
+            update    = _newton_schulz(grads_2d[j])
+            update   *= max(1, p.size(-2) / p.size(-1)) ** 0.5
+            grads_2d[j] = update
 
-            p.data.mul_(1 - lr * self._wd)
-            p.data.add_(update, alpha=-lr)
+        torch._foreach_mul_(params_2d, 1 - lr * self._wd)
+        torch._foreach_add_(params_2d, grads_2d, alpha=-lr)
 
-        for p, buf in zip(self._params_1d, self._bufs_1d):
-            if p.grad is None:
-                continue
-            g = p.grad
+        active_1d = [i for i, p in enumerate(self._params_1d) if p.grad is not None]
+        if active_1d:
+            grads_1d  = [self._params_1d[i].grad for i in active_1d]
+            params_1d = [self._params_1d[i].data for i in active_1d]
+            bufs_1d   = [self._bufs_1d[i] for i in active_1d]
 
-            buf.lerp_(g, 1 - self._momentum)
-            update = g.lerp_(buf, self._momentum)
+            torch._foreach_lerp_(bufs_1d, grads_1d, 1 - self._momentum)
+            torch._foreach_lerp_(grads_1d, bufs_1d, self._momentum)
 
-            nrm = update.norm() + 1e-7
-            update = update / nrm
+            norms = torch._foreach_norm(grads_1d)
+            torch._foreach_add_(norms, 1e-7)
+            torch._foreach_div_(grads_1d, norms)
 
-            p.data.mul_(1 - lr * self._wd)
-            p.data.add_(update, alpha=-lr)
+            torch._foreach_mul_(params_1d, 1 - lr * self._wd)
+            torch._foreach_add_(params_1d, grads_1d, alpha=-lr)
 
     def zero_grad(self, set_to_none=False):
 

@@ -97,7 +97,8 @@ def broadcast_object(obj, src=0):
 
 
 def wrap_model_distributed(model, device, find_unused_params=False,
-                           gradient_as_bucket_view=True, static_graph=False):
+                           gradient_as_bucket_view=True, static_graph=False,
+                           bucket_cap_mb=25):
     """Wrap model with DistributedDataParallel for multi-GPU training"""
 
     if not dist.is_initialized():
@@ -113,6 +114,7 @@ def wrap_model_distributed(model, device, find_unused_params=False,
         find_unused_parameters  = find_unused_params,
         gradient_as_bucket_view = gradient_as_bucket_view,
         static_graph            = static_graph,
+        bucket_cap_mb           = bucket_cap_mb,
     )
 
     return model
