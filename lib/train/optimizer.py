@@ -3,7 +3,7 @@ import torch
 from lib.train.distributed import is_main_process
 
 
-def _newton_schulz(G, steps=5):
+def _newton_schulz_impl(G, steps=5):
     """Batched Newton-Schulz orthogonalization (supports ndim >= 2)"""
 
     a, b, c = (3.4445, -4.7750, 2.0315)
@@ -18,6 +18,9 @@ def _newton_schulz(G, steps=5):
     if G.size(-2) > G.size(-1):
         X = X.mT
     return X
+
+
+_newton_schulz = torch.compile(_newton_schulz_impl, dynamic=None)
 
 
 class MuonE2E:

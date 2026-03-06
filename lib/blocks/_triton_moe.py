@@ -327,6 +327,68 @@ def _swiglu_bwd_kernel(
 
 
 # ──────────────────────────────────────────────────────────────────────
+#  Gather-reduce kernel — replaces scatter_add with atomic-free gather
+# ──────────────────────────────────────────────────────────────────────
+
+# Memory-bound kernel: maximize N-coalescing, small M for more blocks
+# Benchmarked 2026-03-06: GB10 sm_121, 98304 tokens, N=768, top_k=2
+# M=32 N=256 warps=8 stages=2 -> 2.14ms (8.9x vs PyTorch scatter_add)
+GATHER_BLOCK_M = 32
+GATHER_BLOCK_N = 256
+GATHER_WARPS   = 8
+GATHER_STAGES  = 2
+
+
+@triton.jit
+def _gather_reduce_kernel(
+    gemm_ptr, weights_ptr, gather_idx_ptr, output_ptr,
+    N: tl.constexpr, TOP_K: tl.constexpr,
+    stride_gm, stride_gn,
+    stride_om, stride_on,
+    stride_gim, stride_gik,
+    NUM_TOKENS: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    """Gather top_k contributions per output token and reduce in SRAM
+
+    For each output token, loads its top_k GEMM results (via gather_idx),
+    multiplies by routing weights, and sums — all in registers.
+    No atomics, no intermediate tensors, perfect output coalescing.
+    """
+
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    m_offs = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    n_offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    m_mask = m_offs < NUM_TOKENS
+    n_mask = n_offs < N
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in tl.static_range(TOP_K):
+        idx = tl.load(
+            gather_idx_ptr + m_offs * stride_gim + k * stride_gik,
+            mask=m_mask, other=0,
+        )
+
+        gemm = tl.load(
+            gemm_ptr + idx[:, None] * stride_gm + n_offs[None, :] * stride_gn,
+            mask=m_mask[:, None] & n_mask[None, :], other=0.0,
+        ).to(tl.float32)
+
+        w = tl.load(weights_ptr + idx, mask=m_mask, other=0.0).to(tl.float32)
+
+        acc += gemm * w[:, None]
+
+    tl.store(
+        output_ptr + m_offs[:, None] * stride_om + n_offs[None, :] * stride_on,
+        acc.to(output_ptr.dtype.element_ty),
+        mask=m_mask[:, None] & n_mask[None, :],
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
 #  Op wrappers: custom_op (opaque to inductor) for fwd, triton_op for bwd
 # ──────────────────────────────────────────────────────────────────────
 
@@ -508,11 +570,23 @@ def _grouped_gemm_scatter_fwd(A: torch.Tensor, B: torch.Tensor, offsets: torch.T
         num_warps=FWD_WARPS, num_stages=FWD_STAGES,
     )
 
-    idx_e    = sorted_tokens.unsqueeze(-1).expand(-1, N)
-    weighted = gemm_out.float() * sorted_weights.float().unsqueeze(-1)
-    output   = torch.zeros(num_tokens, N, device=A.device, dtype=torch.float32)
-    output.scatter_add_(0, idx_e, weighted)
-    output   = output.to(A.dtype)
+    top_k      = total_M // num_tokens
+    gather_idx = sorted_tokens.argsort(stable=True).reshape(num_tokens, top_k)
+    output     = torch.empty(num_tokens, N, device=A.device, dtype=A.dtype)
+
+    m_blocks = math.ceil(num_tokens / GATHER_BLOCK_M)
+    n_blocks = math.ceil(N / GATHER_BLOCK_N)
+
+    wrap_triton(_gather_reduce_kernel)[(m_blocks, n_blocks)](
+        gemm_out, sorted_weights, gather_idx, output,
+        N, top_k,
+        gemm_out.stride(0), gemm_out.stride(1),
+        output.stride(0), output.stride(1),
+        gather_idx.stride(0), gather_idx.stride(1),
+        NUM_TOKENS=num_tokens,
+        BLOCK_M=GATHER_BLOCK_M, BLOCK_N=GATHER_BLOCK_N,
+        num_warps=GATHER_WARPS, num_stages=GATHER_STAGES,
+    )
 
     return output, gemm_out
 
