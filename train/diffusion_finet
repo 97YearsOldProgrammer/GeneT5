@@ -3,6 +3,9 @@
 import argparse
 import glob
 import json
+import os
+import signal
+import sys
 import time
 import pathlib
 import torch
@@ -113,38 +116,46 @@ def load_packed_sample(sample):
 def compute_packed_loss(logits, labels, cu_seqlens, num_real, weights, loss_fct):
     """Per-sub-sequence weighted MDLM loss for packed batches
 
-    Vectorized: builds real-segment starts/ends without Python loop .item() syncs
+    Fully vectorized: no .item() calls, no Python loops
     """
 
-    B, S, V    = logits.shape
-    per_token  = loss_fct(
-        logits.reshape(-1, V), labels.reshape(-1),
-    )
+    B, S, V   = logits.shape
+    device    = logits.device
+    N_real    = weights.shape[0]
+
+    per_token   = loss_fct(logits.reshape(-1, V), labels.reshape(-1))
     labels_flat = labels.reshape(-1)
-    N_real      = weights.shape[0]
+    total_len   = labels_flat.shape[0]
 
-    # Build real-segment index pairs (skip padding segments)
-    cu  = cu_seqlens.cpu()
-    nr  = num_real.cpu()
-    seg = 0
-    starts = []
-    ends   = []
-    for b in range(B):
-        n = nr[b].item()
-        for j in range(n):
-            starts.append(cu[seg].item())
-            ends.append(cu[seg + 1].item())
-            seg += 1
-        seg += 1
+    # Map real segments to cu_seqlens indices (skip padding segs)
+    cum_nr     = torch.zeros(B + 1, dtype=torch.long, device=device)
+    cum_nr[1:] = num_real.cumsum(0)
+    row_id       = torch.repeat_interleave(torch.arange(B, device=device), num_real.long())
+    local_offset = torch.arange(N_real, device=device) - cum_nr[row_id]
+    real_seg_idx = (cum_nr[row_id] + row_id + local_offset).long()
 
-    loss_sum = torch.zeros(1, device=logits.device, dtype=logits.dtype)
-    for i in range(N_real):
-        s, e      = starts[i], ends[i]
-        seg_loss  = per_token[s:e]
-        seg_count = (labels_flat[s:e] != -100).sum().clamp(min=1).float()
-        loss_sum += (seg_loss.sum() / seg_count) * weights[i]
+    starts   = cu_seqlens[real_seg_idx].long()
+    ends     = cu_seqlens[real_seg_idx + 1].long()
+    seg_lens = ends - starts
+    max_slen = seg_lens.max().item()
 
-    return loss_sum / max(N_real, 1)
+    # Build [N_real, max_slen] position grid
+    offsets         = torch.arange(max_slen, device=device).unsqueeze(0)
+    abs_pos         = starts.unsqueeze(1) + offsets
+    valid           = offsets < seg_lens.unsqueeze(1)
+    abs_pos_clamped = abs_pos.clamp(max=total_len - 1)
+
+    # Gather per-token loss and labels for each segment
+    seg_losses  = per_token[abs_pos_clamped] * valid.float()
+    seg_labels  = labels_flat[abs_pos_clamped]
+    seg_labeled = ((seg_labels != -100) & valid).float()
+
+    # Per-segment mean loss, weighted by MDLM weights
+    seg_loss_sum = seg_losses.sum(dim=1)
+    seg_count    = seg_labeled.sum(dim=1).clamp(min=1)
+    per_seg_loss = seg_loss_sum / seg_count
+
+    return (per_seg_loss * weights).sum() / max(N_real, 1)
 
 
 ############################
@@ -302,18 +313,24 @@ def main():
         compile_opts = {"mode": "default", "dynamic": None}
         model.encoder = torch.compile(model.encoder, **compile_opts)
 
-        # Warmup compile with minimal batch to avoid OOM on first real step
-        # Compilation allocates ~1GB transient memory (tracing + autotuning);
-        # doing it here before optimizer creation keeps peak memory lower
+        # Warmup compile with real training shape so first batch doesn't recompile
+        pack_seq = cfg.get("pack_seq_len", ds.PACK_SEQ_LEN)
         if is_main:
-            print("  Warmup forward+backward...", end=" ", flush=True)
+            print(f"  Warmup forward+backward (B={args.batch_size}, S={pack_seq})...",
+                  end=" ", flush=True)
         _t0 = time.time()
         model.to(device)
-        _x = torch.randn(1, 128, model.embed_dim, device=device, dtype=torch.bfloat16)
+        _x = torch.randn(args.batch_size, pack_seq, model.embed_dim,
+                          device=device, dtype=torch.bfloat16)
+        # One full-row segment per batch row + zero-length pad seg
+        _cu = torch.zeros(2 * args.batch_size + 1, dtype=torch.int32, device=device)
+        for _b in range(args.batch_size):
+            _cu[2*_b + 1] = (_b + 1) * pack_seq
+            _cu[2*_b + 2] = (_b + 1) * pack_seq
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            _y, _moe = model.encoder(_x, None, None)
+            _y, _moe = model.encoder(_x, _cu, pack_seq)
         _y.sum().backward()
-        del _x, _y, _moe
+        del _x, _y, _moe, _cu
         model.zero_grad(set_to_none=True)
         torch.cuda.empty_cache()
         model.to('cpu')
@@ -321,7 +338,7 @@ def main():
             print(f"done ({time.time() - _t0:.0f}s)")
 
     model = train_util.wrap_model_distributed(
-        model, device, find_unused_params=False, static_graph=True,
+        model, device, find_unused_params=False, static_graph=False,
         bucket_cap_mb=100,
     )
 
@@ -348,7 +365,7 @@ def main():
             print(f"  Val:   {len(val_dataset):,}")
 
     if is_packed:
-        # Packed pipeline: fixed 8192-token sequences, no token budget batcher
+        # Packed pipeline: fixed-length sequences, no token budget batcher
         train_dataset = (
             wds.WebDataset(shard_urls, resampled=True, nodesplitter=wds.split_by_node)
             .shuffle(10000)
@@ -364,7 +381,15 @@ def main():
         ).batched(args.batch_size, collation_fn=ds.packed_collate)
 
         batches_per_epoch = total_train // (args.batch_size * world_size)
-        train_loader      = train_loader.with_epoch(batches_per_epoch)
+        if batches_per_epoch == 0:
+            if is_main:
+                print(f"\nERROR: batches_per_epoch=0 (total_train={total_train}, "
+                      f"batch_size={args.batch_size}, world_size={world_size})")
+                print(f"  Check bake_config.json total_train_samples")
+            if is_dist:
+                train_util.cleanup_distributed()
+            return
+        train_loader = train_loader.with_epoch(batches_per_epoch)
     else:
         # Legacy unpacked pipeline
         train_dataset = ds.create_train_pipeline(shard_urls, tokenizer)
@@ -459,6 +484,17 @@ def main():
         with open(output_dir / 'finetune_config.json', 'w') as f:
             json.dump(config, f, indent=2)
 
+    # Signal handler for clean diagnostics on kill
+    _exit_reason = [None]
+    def _signal_handler(signum, frame):
+        name = signal.Signals(signum).name
+        _exit_reason[0] = name
+        rank = dist_info['rank'] if is_dist else 0
+        print(f"\n[rank {rank}] Caught {name} — exiting", flush=True)
+        sys.exit(128 + signum)
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT,  _signal_handler)
+
     # Training loop
     if is_main:
         print(f"\n{'=' * 60}")
@@ -494,6 +530,18 @@ def main():
         )
         print(f"  Training log: {train_logger.log_path}")
 
+    # Flight recorder — lightweight batch-level log for crash forensics
+    flight_file = None
+    if is_main:
+        flight_path = output_dir / '_flight.jsonl'
+        flight_file = open(flight_path, 'w')
+        print(f"  Flight recorder: {flight_path}")
+
+    # Worker heartbeat interval (keeps SSH tunnel alive on non-main ranks)
+    heartbeat_interval = 300
+    last_heartbeat     = time.time()
+    rank_id            = dist_info['rank'] if is_dist else 0
+
     for epoch in range(start_epoch, args.epochs):
         if is_main:
             print(f"\nEpoch {epoch + 1}/{args.epochs}")
@@ -516,6 +564,14 @@ def main():
             if batch is None:
                 continue
 
+            # Heartbeat on non-main ranks to keep SSH alive
+            if not is_main and time.time() - last_heartbeat > heartbeat_interval:
+                elapsed = time.time() - epoch_start_time
+                print(f"[rank {rank_id}] heartbeat: epoch {epoch+1}, "
+                      f"step {step}/{num_batches}, "
+                      f"elapsed {elapsed/3600:.1f}h", flush=True)
+                last_heartbeat = time.time()
+
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
             if batch['input_ids'].dtype != torch.long:
                 batch['input_ids'] = batch['input_ids'].long()
@@ -528,7 +584,7 @@ def main():
                     mask_token_id, tokenizer.pad_token_id,
                 )
                 cu_seqlens = batch['cu_seqlens']
-                max_seqlen = cfg.get("pack_seq_len", ds.PACK_SEQ_LEN)
+                max_seqlen = batch['max_seqlen']
             else:
                 masked_ids, labels, weights = diffusion.apply_diffusion_mask(
                     batch['input_ids'], batch['prefix_len'],
@@ -550,6 +606,18 @@ def main():
                     print(f"  First batch: shape={masked_ids.shape}, "
                           f"prefix_len={batch['prefix_len']}, "
                           f"masked={n_masked}/{n_target}")
+
+            # Flight recorder: log batch properties (no GPU sync, just shapes)
+            if flight_file:
+                cu_len    = cu_seqlens.shape[0] if cu_seqlens is not None else 0
+                nr_list   = batch['num_real'].tolist() if is_packed else []
+                seg_lens  = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist() if cu_seqlens is not None else []
+                min_seg   = min(seg_lens) if seg_lens else 0
+                max_seg   = max(seg_lens) if seg_lens else 0
+                flight_file.write(f'{{"s":{step},"t":{int(time.time())},'
+                                  f'"cu":{cu_len},"ms":{max_seqlen},'
+                                  f'"nr":{nr_list},"min_seg":{min_seg},"max_seg":{max_seg}}}\n')
+                flight_file.flush()
 
             is_last_batch = (step + 1) == num_batches
             is_sync_step  = ((step + 1) % args.grad_accum == 0) or is_last_batch
@@ -691,6 +759,8 @@ def main():
         train_util.barrier()
 
     # Cleanup
+    if flight_file:
+        flight_file.close()
     if mem_watcher:
         mem_watcher.stop()
 
@@ -764,4 +834,13 @@ def validate_diffusion(model, val_loader, device, dtype, is_dist,
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        rank = int(os.environ.get('RANK', 0))
+        print(f"\n[rank {rank}] FATAL: {type(e).__name__}: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)

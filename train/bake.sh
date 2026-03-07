@@ -6,7 +6,7 @@
 #   train/bake.sh --worker <IP> --tokenizer ../model/base [bake_data args...]
 #
 # What it does:
-#   1. SSHes to worker, launches bake_data --node_rank 1 inside the gt5 container
+#   1. SSHes to worker, launches bake_data --node_rank 1 inside the container
 #   2. Runs bake_data --node_rank 0 locally
 #   3. Waits for both nodes to finish per-species baking
 #   4. Runs --finalize locally to merge all bins + generate eval
@@ -15,7 +15,7 @@
 # get roughly equal work (largest genome -> node 0, second -> node 1, etc.)
 #
 # Prerequisites:
-#   - Both machines running the gt5 Docker container (start-gt5-multi.sh)
+#   - Both machines running the Docker container
 #   - SSH key access from host -> worker (passwordless)
 #   - Same mount layout on both (/workspace/raw, /workspace/baked, etc.)
 #
@@ -62,11 +62,11 @@ if [[ -z "$WORKER_IP" ]]; then
     echo "Example:"
     echo "  train/bake.sh --worker 192.168.100.11 \\"
     echo "      ../raw \\"
-    echo "      --tokenizer ../model/GeneT5/init \\"
-    echo "      --output_dir ../baked/GeneT5/w20k \\"
+    echo "      --tokenizer ../model/GeneT5/init/init_diffusion_moe16 \\"
+    echo "      --output_dir ../baked/GeneT5/mar06_s51_w20k_p18k \\"
     echo "      --window_size 20000 \\"
-    echo "      --packed \\"
-    echo "      --val_species B.taurus,S.lycopersicum"
+    echo "      --packed --pack_seq_len 18432 \\"
+    echo "      --val_species B.taurus"
     exit 1
 fi
 
@@ -81,21 +81,37 @@ echo "  Bake args:        ${BAKE_ARGS[*]}"
 echo "============================================================"
 echo ""
 
-# ── Ensure worker container is running ──
-SSH_CMD="ssh -F /dev/null -o StrictHostKeyChecking=no -o IdentityFile=~/.ssh/id_ed25519_spark -o IdentitiesOnly=yes ${WORKER_USER}@${WORKER_IP}"
+# ── SSH setup (matches sft.sh) ──
+SSH_BASE="ssh -F /dev/null -o StrictHostKeyChecking=no -o IdentityFile=~/.ssh/id_ed25519_spark -o IdentitiesOnly=yes"
+SSH_CMD="${SSH_BASE} ${WORKER_USER}@${WORKER_IP}"
 
-WORKER_RUNNING=$(${SSH_CMD} "docker inspect -f '{{.State.Running}}' ${CONTAINER} 2>/dev/null" || echo "false")
-if [[ "$WORKER_RUNNING" != "true" ]]; then
-    echo "[node 1] Container not running, starting in daemon mode..."
-    ${SSH_CMD} "cd /home/cg666/Code && bash start-worker.sh --daemon"
-    echo "[node 1] Waiting for container setup (pip install)..."
-    for i in $(seq 1 30); do
-        if ${SSH_CMD} "docker exec ${CONTAINER} python -c 'import liger_kernel' 2>/dev/null"; then
-            break
-        fi
-        sleep 2
-    done
-fi
+# ── Ensure worker container is running (matches sft.sh logic) ──
+WORKER_STATE=$(${SSH_CMD} "docker inspect -f '{{.State.Status}}' ${CONTAINER} 2>/dev/null" || echo "missing")
+
+case "$WORKER_STATE" in
+    running)
+        echo "[node 1] Container already running"
+        ;;
+    exited|created)
+        echo "[node 1] Container stopped, restarting (packages intact)..."
+        ${SSH_CMD} "docker start ${CONTAINER}"
+        ;;
+    *)
+        echo "[node 1] No container found, creating fresh (will pip install)..."
+        ${SSH_CMD} "cd /home/cg666/Code && bash start-worker.sh --daemon"
+        echo "[node 1] Waiting for pip install..."
+        for i in $(seq 1 30); do
+            if ${SSH_CMD} "docker exec ${CONTAINER} python -c 'import liger_kernel' 2>/dev/null"; then
+                break
+            fi
+            if [[ $i -eq 30 ]]; then
+                echo "[node 1] ERROR: pip install timed out after 60s"
+                exit 1
+            fi
+            sleep 2
+        done
+        ;;
+esac
 
 # Detect GeneT5 code path on worker (differs from master mount layout)
 WORKER_CODE_DIR=$(${SSH_CMD} "docker exec ${CONTAINER} bash -c 'for d in /workspace/Code/GeneT5 /workspace/GeneT5; do [ -f \$d/train/bake_data ] && echo \$d && break; done'" 2>/dev/null)
@@ -105,16 +121,25 @@ if [[ -z "$WORKER_CODE_DIR" ]]; then
 fi
 echo "[node 1] Code directory: ${WORKER_CODE_DIR}"
 
-# Sync requirements on worker (idempotent, picks up webdataset etc.)
+# Sync requirements on worker
 echo "[node 1] Syncing pip requirements..."
 ${SSH_CMD} "docker exec ${CONTAINER} pip install -q -r ${WORKER_CODE_DIR}/requirements.txt" 2>/dev/null || true
 
-# Build the bake_data command (per-species baking only, no merge/eval)
+# Auto-detect master code dir
+MASTER_CODE_DIR=""
+for d in /workspace/Code/GeneT5 /workspace/GeneT5; do
+    [ -f "$d/train/bake_data" ] && MASTER_CODE_DIR="$d" && break
+done
+if [[ -z "$MASTER_CODE_DIR" ]]; then
+    MASTER_CODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+fi
+
+# Build the bake_data command
 BAKE_CMD="cd ${WORKER_CODE_DIR} && PYTHONPATH=${WORKER_CODE_DIR} python train/bake_data ${BAKE_ARGS[*]} --train"
 
 # ── Launch worker (node 1) via SSH ──
 echo "[node 1] Launching on ${WORKER_IP}..."
-ssh -F /dev/null -o StrictHostKeyChecking=no -o IdentityFile=~/.ssh/id_ed25519_spark -o IdentitiesOnly=yes "${WORKER_USER}@${WORKER_IP}" \
+${SSH_BASE} "${WORKER_USER}@${WORKER_IP}" \
     "docker exec ${CONTAINER} bash -c '${BAKE_CMD} --nnodes 2 --node_rank 1'" \
     > >(while IFS= read -r line; do echo "[node 1] $line"; done) \
     2>&1 &
@@ -125,15 +150,6 @@ sleep 2
 
 # ── Launch host (node 0) locally ──
 echo "[node 0] Launching locally..."
-# Auto-detect master code dir
-MASTER_CODE_DIR=""
-for d in /workspace/Code/GeneT5 /workspace/GeneT5; do
-    [ -f "$d/train/bake_data" ] && MASTER_CODE_DIR="$d" && break
-done
-if [[ -z "$MASTER_CODE_DIR" ]]; then
-    MASTER_CODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-fi
-
 cd "$MASTER_CODE_DIR"
 PYTHONPATH="$MASTER_CODE_DIR" python train/bake_data ${BAKE_ARGS[*]} --train \
     --nnodes 2 --node_rank 0 \

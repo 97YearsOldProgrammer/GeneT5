@@ -56,8 +56,9 @@ class GeneT5(nn.Module):
 
     def forward(self, input_ids, cu_seqlens=None, max_seqlen=None):
 
-        x      = self.embed(input_ids)
-        x      = self.embed_dropout(x)
+        x = self.embed(input_ids)
+        x = self.embed_dropout(x)
+
         x, moe = self.encoder(x, cu_seqlens, max_seqlen)
         logits = self.lm_head(x)
 

@@ -163,8 +163,8 @@ NCCL_ENVS=(
     "NCCL_BUFFSIZE=8388608"
     "NCCL_NET_GDR_LEVEL=0"
     "NCCL_NET_GDR_READ=0"
-    "NCCL_TIMEOUT=1800"
-    "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=1800"
+    "NCCL_TIMEOUT=300"
+    "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=300"
 )
 
 if [ -n "$CX7_IF" ]; then
@@ -176,6 +176,7 @@ for env in "${NCCL_ENVS[@]}"; do
     export "$env"
 done
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,garbage_collection_threshold:0.8"
+export PYTHONUNBUFFERED=1
 export TRITON_PTXAS_PATH="/usr/local/cuda/bin/ptxas"
 export TRITON_CACHE_DIR="/workspace/.cache/triton"
 export TORCHINDUCTOR_CACHE_DIR="/workspace/.cache/torchinductor"
@@ -260,7 +261,7 @@ build_torchrun_cmd() {
 
 if [[ -n "$WORKER_IP" ]]; then
     # Ensure worker container is running
-    SSH_CMD="ssh -F /dev/null -o StrictHostKeyChecking=no -o IdentityFile=~/.ssh/id_ed25519_spark -o IdentitiesOnly=yes ${WORKER_USER}@${WORKER_IP}"
+    SSH_CMD="ssh -F /dev/null -o StrictHostKeyChecking=no -o IdentityFile=~/.ssh/id_ed25519_spark -o IdentitiesOnly=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=6 ${WORKER_USER}@${WORKER_IP}"
     WORKER_STATE=$(${SSH_CMD} "docker inspect -f '{{.State.Status}}' ${CONTAINER} 2>/dev/null" || echo "missing")
 
     case "$WORKER_STATE" in
@@ -326,6 +327,7 @@ if [[ -n "$WORKER_IP" ]]; then
     ENV_STR+="export TRITON_CACHE_DIR=/workspace/.cache/triton; "
     ENV_STR+="export TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor; "
     ENV_STR+="export TORCHINDUCTOR_FX_GRAPH_CACHE=1; "
+    ENV_STR+="export PYTHONUNBUFFERED=1; "
     ENV_STR+="export PYTHONPATH=${WORKER_CODE_DIR}; "
     # Worker detects its own CX7 interface + HCA (may differ from master)
     ENV_STR+="for iface in enP2p1s0f1np1 enP2p1s0f0np0 enp1s0f1np1 enp1s0f0np0; do "
@@ -345,7 +347,7 @@ if [[ -n "$WORKER_IP" ]]; then
     WORKER_PID=""
     CLEANED_UP=0
 
-    SSH_BASE="ssh -F /dev/null -o StrictHostKeyChecking=no -o IdentityFile=~/.ssh/id_ed25519_spark -o IdentitiesOnly=yes"
+    SSH_BASE="ssh -F /dev/null -o StrictHostKeyChecking=no -o IdentityFile=~/.ssh/id_ed25519_spark -o IdentitiesOnly=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=6"
 
     # Kill a process and all its descendants with SIGKILL
     kill_tree() {
@@ -442,11 +444,15 @@ if [[ -n "$WORKER_IP" ]]; then
     # Give worker a head start to open the rendezvous port listener
     sleep 3
 
-    # Launch master locally (background, in own process group for clean kill)
+    # Tee all output to timestamped log (PYTHONUNBUFFERED=1 prevents buffer loss on crash)
+    LOG_DIR="/workspace/logs/GeneT5/sft"
+    mkdir -p "$LOG_DIR"
+    MASTER_LOG="${LOG_DIR}/$(date +%Y%m%d_%H%M%S).log"
     echo "[master] Launching locally..."
+    echo "[master] Log: ${MASTER_LOG}"
     echo ""
     set -m
-    eval "$(build_torchrun_cmd 0)" &
+    eval "$(build_torchrun_cmd 0)" 2>&1 | tee -a "$MASTER_LOG" &
     MASTER_PID=$!
     set +m
 

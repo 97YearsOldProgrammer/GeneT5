@@ -61,7 +61,10 @@ def apply_diffusion_mask(target_ids, prefix_len, mask_token_id, pad_token_id):
 
 def apply_diffusion_mask_packed(input_ids, cu_seqlens, prefix_lens, num_real,
                                 mask_token_id, pad_token_id):
-    """MDLM masking for packed sequences — samples t per sub-sequence"""
+    """MDLM masking for packed sequences — samples t per sub-sequence
+
+    Fully vectorized: no .item() calls, no Python loops over segments
+    """
 
     B, S     = input_ids.shape
     device   = input_ids.device
@@ -71,29 +74,45 @@ def apply_diffusion_mask_packed(input_ids, cu_seqlens, prefix_lens, num_real,
     mask_rate = cosine_mask_rate(t)
     weights   = mdlm_loss_weight(t)
 
-    masked_ids = input_ids.clone().reshape(-1)
-    labels     = torch.full((B * S,), -100, dtype=torch.long, device=device)
+    flat      = input_ids.reshape(-1)
+    total_len = flat.shape[0]
 
-    real_idx = 0
-    seg_idx  = 0
-    for b in range(B):
-        n = num_real[b].item()
-        for j in range(n):
-            start = cu_seqlens[seg_idx].item()
-            end   = cu_seqlens[seg_idx + 1].item()
-            plen  = prefix_lens[real_idx].item()
-            seg_idx += 1
+    # Build real-segment start/end pairs from cu_seqlens and num_real
+    # Each row has num_real[b] real segs + 1 padding seg in cu_seqlens
+    # Real seg i in row b maps to cu_seqlens index = (cumsum of num_real before b) + b + local_j
+    cum_nr     = torch.zeros(B + 1, dtype=torch.long, device=device)
+    cum_nr[1:] = num_real.cumsum(0)
+    # row_id[i] = which row does real segment i belong to
+    row_id       = torch.repeat_interleave(torch.arange(B, device=device), num_real.long())
+    local_offset = torch.arange(N_real, device=device) - cum_nr[row_id]
+    real_seg_idx = (cum_nr[row_id] + row_id + local_offset).long()
 
-            target_start = start + plen
-            target_ids   = masked_ids[target_start:end]
-            not_pad      = target_ids != pad_token_id
-            selected     = (torch.rand(end - target_start, device=device) < mask_rate[real_idx]) & not_pad
+    starts     = cu_seqlens[real_seg_idx]
+    ends       = cu_seqlens[real_seg_idx + 1]
+    seg_lens   = ends - starts
+    target_starts = starts + prefix_lens
+    target_lens   = ends - target_starts
 
-            labels[target_start:end][selected]     = target_ids[selected]
-            masked_ids[target_start:end][selected]  = mask_token_id
-            real_idx += 1
+    # Build flat position index for all target positions across all segments
+    max_tlen   = target_lens.max().item()
+    offsets    = torch.arange(max_tlen, device=device).unsqueeze(0)
+    abs_pos    = target_starts.unsqueeze(1) + offsets
+    valid_mask = offsets < target_lens.unsqueeze(1)
 
-        # Skip padding segment at end of row
-        seg_idx += 1
+    # Clamp for safe indexing, then mask
+    abs_pos_clamped = abs_pos.clamp(max=total_len - 1)
+    tokens_at_pos   = flat[abs_pos_clamped]
+    not_pad         = (tokens_at_pos != pad_token_id) & valid_mask
+
+    # Per-segment random mask thresholded by mask_rate
+    rand_vals = torch.rand(N_real, max_tlen, device=device)
+    selected  = (rand_vals < mask_rate.unsqueeze(1)) & not_pad
+
+    # Apply masking
+    masked_ids = flat.clone()
+    sel_pos    = abs_pos_clamped[selected]
+    labels     = torch.full((total_len,), -100, dtype=torch.long, device=device)
+    labels[sel_pos]     = flat[sel_pos]
+    masked_ids[sel_pos] = mask_token_id
 
     return masked_ids.reshape(B, S), labels.reshape(B, S), weights

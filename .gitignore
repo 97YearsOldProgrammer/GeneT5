@@ -40,3 +40,4 @@ checkpoints/
 
 # Archive
 .archive/
+.claude/settings.local.json

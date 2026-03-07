@@ -332,7 +332,9 @@ if args.train and (args.finalize or args.nnodes == 1):
             with open(cfg_path) as f:
                 node_cfg = json.load(f)
             total_train_samples += node_cfg.get("total_train_samples", 0)
-    else:
+
+    # Fallback: sum per-species stats.json (handles packed finalize with missing counts)
+    if total_train_samples == 0:
         for sp_name in all_train_names:
             stats_path = output_dir / sp_name / "stats.json"
             if stats_path.exists():

@@ -206,10 +206,13 @@ def packed_collate(batch):
         prefix_all.extend(b["prefix_lens"])
         num_real_list.append(len(b["seq_lens"]))
 
+    cu = torch.tensor(offsets, dtype=torch.int32)
+
     return {
-        "input_ids":   input_ids,
-        "cu_seqlens":  torch.tensor(offsets, dtype=torch.int32),
-        "prefix_lens": torch.tensor(prefix_all, dtype=torch.int32),
-        "num_real":    torch.tensor(num_real_list, dtype=torch.int32),
+        "input_ids":    input_ids,
+        "cu_seqlens":   cu,
+        "prefix_lens":  torch.tensor(prefix_all, dtype=torch.int32),
+        "num_real":     torch.tensor(num_real_list, dtype=torch.int32),
+        "max_seqlen":   int((cu[1:] - cu[:-1]).max().item()),
     }
 
