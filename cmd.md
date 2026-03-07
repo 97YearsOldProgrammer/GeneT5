@@ -1,1 +1,0 @@
-bin/bake.sh --worker 192.168.100.11 --tokenizer ../model/GeneT5/init --output_dir ../baked/GeneT5/w20k_s51_v2 --window_size 20000 --species_parallel 3 --val_species B.taurus,S.lycopersicum --eval_samples 50 --seed 42 ../raw
