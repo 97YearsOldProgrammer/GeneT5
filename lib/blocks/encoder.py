@@ -19,7 +19,6 @@ class EncoderBlock(nn.Module):
         ff_dim,
         dropout          = 0.0,
         attn_dropout     = 0.0,
-        use_alibi        = True,
         use_moe          = False,
         num_experts      = 16,
         moe_top_k        = 4,
@@ -36,7 +35,6 @@ class EncoderBlock(nn.Module):
             num_heads    = num_heads,
             num_kv_heads = num_kv_heads,
             dropout      = attn_dropout,
-            use_alibi    = use_alibi,
         )
         self.self_attn = FlashAttention(config=flash_config)
         self.norm1     = LayerNorm(embed_dim)
@@ -89,7 +87,6 @@ class Encoder(nn.Module):
         ff_dim,
         dropout          = 0.0,
         attn_dropout     = 0.0,
-        use_alibi        = True,
         use_moe          = True,
         num_experts      = 16,
         moe_top_k        = 4,
@@ -99,8 +96,7 @@ class Encoder(nn.Module):
     ):
         super().__init__()
 
-        self.use_moe   = use_moe
-        self.use_alibi = use_alibi
+        self.use_moe = use_moe
 
         self.layers = nn.ModuleList([
             EncoderBlock(
@@ -109,7 +105,6 @@ class Encoder(nn.Module):
                 ff_dim           = ff_dim,
                 dropout          = dropout,
                 attn_dropout     = attn_dropout,
-                use_alibi        = use_alibi,
                 use_moe          = use_moe,
                 num_experts      = num_experts,
                 moe_top_k        = moe_top_k,

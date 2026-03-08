@@ -75,7 +75,6 @@ def _upcycle_moe_layer(layer, sd, prefix, ff_dim, num_experts, init_std):
 
 DEFAULTS = {
     "dropout":      0.1,
-    "use_alibi":    True,
     "use_moe":      True,
     "num_experts":  16,
     "moe_top_k":    2,
@@ -90,7 +89,6 @@ def build_gt5(
     num_heads           = None,
     ff_dim              = None,
     dropout             = DEFAULTS["dropout"],
-    use_alibi           = DEFAULTS["use_alibi"],
     use_moe             = DEFAULTS["use_moe"],
     num_experts         = DEFAULTS["num_experts"],
     moe_top_k           = DEFAULTS["moe_top_k"],
@@ -157,7 +155,6 @@ def build_gt5(
         ff_dim       = ff_dim,
         dropout      = dropout,
         attn_dropout = dropout,
-        use_alibi    = use_alibi,
         use_moe      = use_moe,
         num_experts  = num_experts,
         moe_top_k    = moe_top_k,
@@ -231,7 +228,6 @@ def build_gt5(
         "num_heads":    num_heads,
         "ff_dim":       ff_dim,
         "dropout":      dropout,
-        "use_alibi":    use_alibi,
         "use_moe":      use_moe,
         "num_experts":  num_experts,
         "moe_top_k":    moe_top_k,

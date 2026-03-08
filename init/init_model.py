@@ -43,7 +43,6 @@ saved_path = build_gt5(
     num_heads           = args.heads,
     ff_dim              = args.ff_dim,
     dropout             = args.dropout,
-    use_alibi           = True,
     use_moe             = args.use_moe,
     num_experts         = args.num_experts,
     moe_top_k           = args.moe_top_k,

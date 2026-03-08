@@ -19,7 +19,6 @@ class FlashAttentionConfig:
     num_kv_heads: int   = None
     head_dim:     int   = None
     dropout:      float = 0.0
-    use_alibi:    bool  = True
     window_size:  tuple = (-1, -1)
 
     def __post_init__(self):
@@ -36,7 +35,7 @@ class FlashAttentionConfig:
 
 
 class FlashAttention(nn.Module):
-    """Full bidirectional attention using flash_attn with GQA and ALiBi"""
+    """Full bidirectional attention using flash_attn with GQA"""
 
     def __init__(self, config):
 
@@ -58,31 +57,6 @@ class FlashAttention(nn.Module):
         self.o       = nn.Linear(config.num_heads * self.head_dim, config.embed_dim, bias=False)
         self.dropout = nn.Dropout(config.dropout)
 
-        if config.use_alibi:
-            slopes = self._compute_alibi_slopes(config.num_heads).float()
-            self.register_buffer('alibi_slopes', slopes, persistent=False)
-        else:
-            self.alibi_slopes = None
-
-    @staticmethod
-    def _compute_alibi_slopes(num_heads):
-        """Compute ALiBi slopes for positional bias"""
-
-        def get_slopes(n):
-            if n == 1:
-                return torch.tensor([1.0])
-            base = 2 ** (-2 ** -(math.log2(n) - 3))
-            return torch.tensor([base ** i for i in range(1, n + 1)])
-
-        if math.log2(num_heads).is_integer():
-            return get_slopes(num_heads)
-        else:
-            closest_power = 2 ** math.floor(math.log2(num_heads))
-            return torch.cat([
-                get_slopes(closest_power),
-                get_slopes(2 * closest_power)[0::2][:num_heads - closest_power]
-            ])
-
     def forward(self, hidden_states, cu_seqlens=None, max_seqlen=None):
         """Bidirectional flash attention with optional varlen packed mode"""
 
@@ -92,11 +66,9 @@ class FlashAttention(nn.Module):
         k = self.k(hidden_states).view(B, L, self.num_kv_heads, self.head_dim)
         v = self.v(hidden_states).view(B, L, self.num_kv_heads, self.head_dim)
 
-        alibi  = self.alibi_slopes.float() if self.alibi_slopes is not None else None
         drop_p = self.dropout.p if self.training else 0.0
 
         if cu_seqlens is not None:
-            # Packed mode: flatten to (B*L, H, D) for varlen kernel
             q   = q.reshape(-1, self.num_heads, self.head_dim)
             k   = k.reshape(-1, self.num_kv_heads, self.head_dim)
             v   = v.reshape(-1, self.num_kv_heads, self.head_dim)
@@ -109,17 +81,14 @@ class FlashAttention(nn.Module):
                 dropout_p     = drop_p,
                 softmax_scale = self.softmax_scale,
                 causal        = False,
-                alibi_slopes  = alibi,
             )
             out = out.reshape(B, L, self.embed_dim)
         else:
-            # Standard mode (validation, inference)
             out = flash_attn_func(
                 q, k, v,
                 dropout_p     = drop_p,
                 softmax_scale = self.softmax_scale,
                 causal        = False,
-                alibi_slopes  = alibi,
             )
             out = out.reshape(B, L, self.embed_dim)
 

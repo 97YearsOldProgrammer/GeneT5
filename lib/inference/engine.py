@@ -152,7 +152,6 @@ class GeneT5Inference:
             num_heads    = config["num_heads"],
             ff_dim       = config["ff_dim"],
             dropout      = config.get("dropout", 0.1),
-            use_alibi    = config.get("use_alibi", True),
             use_moe      = config.get("use_moe", True),
             num_experts  = config.get("num_experts", 8),
             moe_top_k    = config.get("moe_top_k", 2),
