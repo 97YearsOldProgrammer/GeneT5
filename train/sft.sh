@@ -25,9 +25,10 @@ WORKER_USER="cg666"
 CONTAINER="gt5"
 
 # Detect ConnectX-7 P2P interface (must be up AND have an IP)
+# Try lowercase first — these have IPv4 GIDs in the IB GID table
 CX7_IF=""
 CX7_HCA=""
-for iface in enP2p1s0f1np1 enP2p1s0f0np0 enp1s0f1np1 enp1s0f0np0; do
+for iface in enp1s0f1np1 enp1s0f0np0 enP2p1s0f1np1 enP2p1s0f0np0; do
     if [ -d "/sys/class/net/$iface" ] && [ "$(cat /sys/class/net/$iface/operstate 2>/dev/null)" = "up" ]; then
         HAS_IP=$(python3 -c "
 import socket,struct,fcntl; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
@@ -153,7 +154,7 @@ fi
 
 NCCL_ENVS=(
     "NCCL_DEBUG=INFO"
-    "NCCL_IB_HCA=${CX7_HCA:-roceP2p1s0f1}"
+    "NCCL_IB_HCA=${CX7_HCA:-rocep1s0f1}"
     "NCCL_IB_TIMEOUT=23"
     "NCCL_IB_RETRY_CNT=13"
     "NCCL_IB_MERGE_NICS=0"
@@ -330,7 +331,7 @@ if [[ -n "$WORKER_IP" ]]; then
     ENV_STR+="export PYTHONUNBUFFERED=1; "
     ENV_STR+="export PYTHONPATH=${WORKER_CODE_DIR}; "
     # Worker detects its own CX7 interface + HCA (may differ from master)
-    ENV_STR+="for iface in enP2p1s0f1np1 enP2p1s0f0np0 enp1s0f1np1 enp1s0f0np0; do "
+    ENV_STR+="for iface in enp1s0f1np1 enp1s0f0np0 enP2p1s0f1np1 enP2p1s0f0np0; do "
     ENV_STR+="  if [ -d /sys/class/net/\$iface ] && python3 -c \"import socket,struct,fcntl;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);socket.inet_ntoa(fcntl.ioctl(s.fileno(),0x8915,struct.pack('256s',b'\$iface'))[20:24])\" 2>/dev/null; then "
     ENV_STR+="    export NCCL_SOCKET_IFNAME=\$iface; export GLOO_SOCKET_IFNAME=\$iface; "
     ENV_STR+="    tmp=\${iface#en}; export NCCL_IB_HCA=roce\${tmp%np*}; break; "
