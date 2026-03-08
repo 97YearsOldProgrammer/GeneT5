@@ -41,3 +41,4 @@ checkpoints/
 # Archive
 .archive/
 .claude/settings.local.json
+.claude/agents
