@@ -3,6 +3,7 @@ import torch.nn as nn
 from liger_kernel.transformers.rms_norm import LigerRMSNorm
 from liger_kernel.ops.geglu             import LigerGELUMulFunction
 from liger_kernel.ops.swiglu            import LigerSiLUMulFunction
+from liger_kernel.ops.fused_add_rms_norm import LigerFusedAddRMSNormFunction
 
 
 ######################
@@ -11,6 +12,12 @@ from liger_kernel.ops.swiglu            import LigerSiLUMulFunction
 
 
 LayerNorm = LigerRMSNorm
+
+
+def fused_add_rmsnorm(x, residual, weight, eps=1e-6):
+    """Fused residual add + RMSNorm: S = X + R, Y = rmsnorm(S)"""
+
+    return LigerFusedAddRMSNormFunction.apply(x, residual, weight, eps)
 
 
 ########################

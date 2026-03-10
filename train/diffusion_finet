@@ -25,6 +25,7 @@ import lib.train        as train_util
 import lib.diffusion    as diffusion
 from lib.train.optimizer import create_optimizer
 from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
+from liger_kernel.transformers.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
 
 
 DEFAULTS = {
@@ -113,17 +114,15 @@ def load_packed_sample(sample):
     }
 
 
-def compute_packed_loss(logits, labels, cu_seqlens, num_real, weights, loss_fct):
+def compute_packed_loss(per_token, labels, cu_seqlens, num_real, weights, B):
     """Per-sub-sequence weighted MDLM loss for packed batches
 
     Fully vectorized: no .item() calls, no Python loops
     """
 
-    B, S, V   = logits.shape
-    device    = logits.device
+    device    = per_token.device
     N_real    = weights.shape[0]
 
-    per_token   = loss_fct(logits.reshape(-1, V), labels.reshape(-1))
     labels_flat = labels.reshape(-1)
     total_len   = labels_flat.shape[0]
 
@@ -220,6 +219,12 @@ def build_parser():
     parser.add_argument('--diffusion_steps', required=False, type=int,
         default=DEFAULTS['diffusion_steps'],
         metavar='<int>', help='inference diffusion steps for F1 evaluation [%(default)i]')
+    parser.add_argument('--fused_ce', action='store_true',
+        help='use LigerFusedLinearCrossEntropyLoss (avoids materializing logits)')
+    parser.add_argument('--fused_norm', action='store_true',
+        help='use fused residual-add + RMSNorm in encoder')
+    parser.add_argument('--freeze_base', action='store_true',
+        help='freeze pretrained base, only train MoE + embed/head')
     return parser
 
 
@@ -303,8 +308,17 @@ def main():
     if is_main:
         print(f"\nLoading model...")
     model = mdl.GeneT5.from_pretrained(
-        pathlib.Path(args.model_path), device='cpu', dtype=torch.bfloat16
+        pathlib.Path(args.model_path), device='cpu', dtype=torch.bfloat16,
+        fused_add_norm=args.fused_norm,
     )
+
+    # Freeze pretrained base if requested
+    if args.freeze_base:
+        model.freeze_base()
+        if is_main:
+            stats = model.get_param_stats()
+            print(f"  Frozen base: {stats['total_frozen']:,} params frozen, "
+                  f"{stats['total_trainable']:,} trainable")
 
     # torch.compile encoder BEFORE DDP (compiling DDP wrapper deadlocks on NCCL)
     if args.compile:
@@ -502,10 +516,21 @@ def main():
         print(f"{'=' * 60}")
 
     dtype    = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    loss_fct = LigerCrossEntropyLoss(
-        ignore_index=-100, reduction='none',
-        label_smoothing=args.label_smoothing,
-    )
+    use_fused_ce = args.fused_ce
+    if use_fused_ce:
+        loss_fct = LigerFusedLinearCrossEntropyLoss(
+            ignore_index=-100, reduction='none',
+            label_smoothing=args.label_smoothing,
+        )
+        if is_main:
+            print("  Fused linear cross-entropy: enabled")
+    else:
+        loss_fct = LigerCrossEntropyLoss(
+            ignore_index=-100, reduction='none',
+            label_smoothing=args.label_smoothing,
+        )
+    if args.fused_norm and is_main:
+        print("  Fused add+RMSNorm: enabled")
 
     if args.gradient_checkpointing:
         if hasattr(raw_model.encoder, 'gradient_checkpointing_enable'):
@@ -629,32 +654,40 @@ def main():
                         input_ids=masked_ids,
                         cu_seqlens=cu_seqlens,
                         max_seqlen=max_seqlen,
+                        return_hidden=use_fused_ce,
                     )
 
-                    logits = outputs['logits']
+                    if use_fused_ce:
+                        hidden   = outputs['hidden']
+                        B, S, D  = hidden.shape
+                        lm_w     = raw_model.lm_head.weight
+                        per_token = loss_fct(
+                            lm_w, hidden.reshape(-1, D), labels.reshape(-1),
+                        )
+                    else:
+                        logits    = outputs['logits']
+                        B, S, V   = logits.shape
+                        per_token = loss_fct(
+                            logits.reshape(-1, V), labels.reshape(-1),
+                        )
 
                     if is_packed:
                         loss = compute_packed_loss(
-                            logits, labels,
+                            per_token, labels,
                             batch['cu_seqlens'], batch['num_real'],
-                            weights, loss_fct,
+                            weights, B,
                         )
                     else:
-                        # Vectorized per-sample weighted loss (MDLM)
-                        B, S, V = logits.shape
-                        per_token = loss_fct(
-                            logits.reshape(-1, V), labels.reshape(-1),
-                        ).reshape(B, S)
-
+                        per_token_2d    = per_token.reshape(B, S)
                         counts          = (labels != -100).sum(dim=-1).clamp(min=1).float()
-                        per_sample_loss = per_token.sum(dim=-1) / counts
+                        per_sample_loss = per_token_2d.sum(dim=-1) / counts
                         loss            = (per_sample_loss * weights).mean()
 
                     if outputs.get('moe_loss') is not None:
                         loss = loss + outputs['moe_loss']
 
                     loss = loss / args.grad_accum
-                    del logits
+                    del per_token
 
                 loss.backward()
                 loss_val = loss.detach()
@@ -673,6 +706,12 @@ def main():
                     batch_per_sec = (step + 1) / elapsed if elapsed > 0 else 0
                     avg_loss      = (total_train_loss / (step + 1)).item()
 
+                    # Collect per-expert token distribution
+                    raw_model   = model.module if hasattr(model, 'module') else model
+                    expert_frac = raw_model.get_expert_frac()
+                    if expert_frac is not None:
+                        expert_frac = expert_frac.tolist()
+
                     train_logger.log_step(
                         epoch         = epoch + 1,
                         global_step   = global_step,
@@ -681,6 +720,7 @@ def main():
                         loss          = avg_loss,
                         lr            = optimizer.get_last_lr()[0],
                         batch_per_sec = batch_per_sec,
+                        expert_frac   = expert_frac,
                     )
 
                 if args.save_steps and global_step % args.save_steps == 0:
@@ -715,6 +755,8 @@ def main():
             val_loss = validate_diffusion(
                 model, val_loader, device, dtype, is_dist,
                 mask_token_id, tokenizer.pad_token_id, raw_model.vocab_size,
+                use_fused_ce=use_fused_ce,
+                lm_weight=raw_model.lm_head.weight if use_fused_ce else None,
             )
 
         if train_logger:
@@ -782,13 +824,18 @@ def main():
 
 @torch.no_grad()
 def validate_diffusion(model, val_loader, device, dtype, is_dist,
-                       mask_token_id, pad_token_id, vocab_size):
+                       mask_token_id, pad_token_id, vocab_size,
+                       use_fused_ce=False, lm_weight=None):
     """Validate with MDLM-weighted loss (same computation as training)"""
 
     model_was_training = model.training
     model.train(False)
 
-    val_loss_fct = LigerCrossEntropyLoss(ignore_index=-100, reduction='none')
+    if use_fused_ce:
+        val_loss_fct = LigerFusedLinearCrossEntropyLoss(
+            ignore_index=-100, reduction='none')
+    else:
+        val_loss_fct = LigerCrossEntropyLoss(ignore_index=-100, reduction='none')
 
     total_loss  = 0
     num_batches = 0
@@ -805,13 +852,20 @@ def validate_diffusion(model, val_loader, device, dtype, is_dist,
         )
 
         with torch.amp.autocast('cuda', dtype=dtype):
-            outputs = model(input_ids=masked_ids)
-            logits  = outputs['logits']
+            outputs = model(input_ids=masked_ids, return_hidden=use_fused_ce)
 
-            B, S, V = logits.shape
-            per_token = val_loss_fct(
-                logits.reshape(-1, V), labels.reshape(-1),
-            ).reshape(B, S)
+            if use_fused_ce:
+                hidden  = outputs['hidden']
+                B, S, D = hidden.shape
+                per_token = val_loss_fct(
+                    lm_weight, hidden.reshape(-1, D), labels.reshape(-1),
+                ).reshape(B, S)
+            else:
+                logits  = outputs['logits']
+                B, S, V = logits.shape
+                per_token = val_loss_fct(
+                    logits.reshape(-1, V), labels.reshape(-1),
+                ).reshape(B, S)
 
             counts          = (labels != -100).sum(dim=-1).clamp(min=1).float()
             per_sample_loss = per_token.sum(dim=-1) / counts
@@ -820,7 +874,7 @@ def validate_diffusion(model, val_loader, device, dtype, is_dist,
         total_loss  += loss.item()
         num_batches += 1
 
-        del outputs, logits, loss, batch, masked_ids, labels, weights
+        del outputs, loss, batch, masked_ids, labels, weights
 
     avg_loss = total_loss / max(num_batches, 1)
 

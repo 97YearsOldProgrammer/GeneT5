@@ -88,7 +88,7 @@ docs/          - Design documents
 
   baked/                  - Packed training datasets
     GeneT5/                 - GeneT5 SFT pipeline baked data
-      {run_name}/           - Convention: feb{DD}_s{N}_v{V}_e{V}
+      {run_name}/           - Convention: {mon}{DD}_s{N}_w{W}_p{P}
         {species}/            - Per-species directory
           shard_000.tar       - WebDataset training shards
           stats.json          - Species baking stats
@@ -100,8 +100,8 @@ docs/          - Design documents
   model/                  - Model checkpoints
     GeneT5/
       init/                 - Initialized (untrained) models
-        init_moe4/            - MoE-4 expert init from DNABERT-2
-      feb{DD}_*_t{N}/       - Experiment runs (date + trial number)
+        init_upcycle_moe16_topk2/ - MoE-16 expert (top-2) init from DNABERT-2
+      {mon}{DD}_*_t{N}/     - Experiment runs (date + trial number)
         finetune_config.json  - Full training config
         training_log.csv      - Step-level training metrics
         eval_log.csv          - Per-epoch evaluation metrics
@@ -117,7 +117,7 @@ docs/          - Design documents
 ## Output Directory Management
 
 All model outputs MUST go under `/workspace/model/GeneT5/` with descriptive names:
-- SFT experiments: `feb{DD}_*_t{N}/` (date + trial)
+- SFT experiments: `{mon}{DD}_*_t{N}/` (month + date + trial)
 - NEVER save to random ad-hoc directories outside `model/GeneT5/`
 
 ## Training Pipeline
@@ -126,8 +126,8 @@ Full pipeline from raw genomes to trained models:
 
 ```
 Step 1: INIT MODEL
-  init/init_model.py → /workspace/model/GeneT5/init/init_moe4/
-  Builds GeneT5 from DNABERT-2 encoder weights
+  init/init_model.py → /workspace/model/GeneT5/init/init_upcycle_moe16_topk2/
+  Builds GeneT5 from DNABERT-2 encoder weights (16 experts, top-2)
 
 Step 2: BAKE SFT DATA
   train/bake_data → /workspace/baked/GeneT5/{run}/
@@ -173,9 +173,9 @@ Step 5: GRPO (reinforcement learning)
 ## Training Logs & Experiments
 
 - Experiment doc: `docs/sft_experiments.md` (all trials, configs, results, comparisons)
-- Previous trial notes: `/workspace/logs/GeneT5/notes/trial1_feb10_run1.md`
-- Current run outputs: `/workspace/model/GeneT5/feb12_trail1/` (training_log.csv, eval_log.csv, memory_*.csv)
-- Key finding: aggressive LR (3e-4) + small effective batch (256) = fast train convergence but severe overfitting (val 20x train); conservative LR (1e-4) + large batch (1024) + label smoothing = better generalization
+- Current init: `/workspace/model/GeneT5/init/init_upcycle_moe16_topk2/` (MoE-16, top-2, 1.53B params)
+- Current baked data: `/workspace/baked/GeneT5/mar06_s51_w20k_p18k/` (51 species, 96GB)
+- Key findings from Feb trials: aggressive LR (3e-4) + small effective batch (256) = fast convergence but severe overfitting; conservative LR (1e-4) + large batch (1024) + label smoothing = better generalization
 
 ## Lessons Learned
 

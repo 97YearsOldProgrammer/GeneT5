@@ -121,7 +121,7 @@ class TrainLogger:
         return self._speed_ema
 
     def log_step(self, epoch, global_step, batch, num_batches,
-                 loss, lr, batch_per_sec):
+                 loss, lr, batch_per_sec, expert_frac=None, moe_loss=None):
         """Log training step: CSV row + formatted progress line"""
 
         elapsed   = self._elapsed()
@@ -153,15 +153,24 @@ class TrainLogger:
         self._writer.writerow(row)
         self._file.flush()
 
-        bar   = _bar(pct)
-        spark = _sparkline(self._loss_hist)
-        gpu   = f"GPU {mem['gpu_alloc_gb']}/{mem['gpu_max_gb']}GB" if 'gpu_alloc_gb' in mem else ""
-
-        print(f"  Ep {epoch}/{self.total_epochs} {bar} {pct:5.1f}% "
-              f"\u2502 loss {loss:.4f} {spark} "
+        # Line 1: step, loss, speed, ETA
+        print(f"  step {global_step:<6d} Ep {epoch}/{self.total_epochs} {pct:5.1f}% "
+              f"\u2502 loss {loss:.4f} "
               f"\u2502 {speed:.1f} b/s "
-              f"\u2502 ETA {_fmt_eta(remaining)} "
-              f"\u2502 {gpu}")
+              f"\u2502 ETA {_fmt_eta(remaining)}", end="")
+
+        if moe_loss is not None:
+            print(f" \u2502 moe {moe_loss:.4f}", end="")
+        print()
+
+        # Line 2: expert distribution (only when available)
+        if expert_frac is not None:
+            pcts = [f'{v * 100:.1f}' for v in expert_frac]
+            lo   = min(expert_frac) * 100
+            hi   = max(expert_frac) * 100
+            ratio = hi / lo if lo > 0 else float('inf')
+            print(f"         experts [{' '.join(pcts)}]% "
+                  f"imbal {ratio:.1f}x")
 
     def log_epoch(self, epoch, train_loss, val_loss, lr):
         """Log epoch summary row"""

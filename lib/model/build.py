@@ -10,18 +10,18 @@ from lib.blocks         import Encoder
 from lib.tokenizer.hf   import GeneTokenizer
 
 
-UPCYCLE_NOISE_STD  = 0.001   # symmetry-breaking for tiled copies
+UPCYCLE_NOISE_STD  = 0.001   # symmetry-breaking noise on tiled copies
 UPCYCLE_FRESH_STD  = 0.06    # random init for fresh experts
 UPCYCLE_ROUTER_STD = 0.001   # near-zero router init
-NUM_BASE_EXPERTS   = 4       # experts sliced from dense FFN (3072 / 768 = 4)
-NUM_FRESH_EXPERTS  = 4       # randomly initialized experts for new patterns
+NUM_TILES          = 3       # each base chunk tiled 3x (2 chunks × 3 = 6 base experts)
+NUM_FRESH          = 2       # randomly initialized experts
 
 
 def _upcycle_moe_layer(layer, sd, prefix, ff_dim, num_experts, init_std):
     """Upcycle dense DNABERT-2 FFN into MoE experts
 
-    Slices the dense [3072] FFN into 4 base experts of [768] each,
-    tiles to fill 12 slots, leaves 4 fresh random experts for new patterns
+    Splits dense [3072] FFN into 2 chunks of [1536], tiles each 3x = 6 base experts
+    with symmetry-breaking noise on copies, plus 2 fresh random experts
     """
 
     gated        = sd[f"{prefix}.mlp.gated_layers.weight"]   # [6144, 768]
@@ -29,42 +29,40 @@ def _upcycle_moe_layer(layer, sd, prefix, ff_dim, num_experts, init_std):
     down_w       = sd[f"{prefix}.mlp.wo.weight"]             # [768, 3072]
 
     dense_ff  = gate_w.shape[0]                              # 3072
-    embed_dim = gate_w.shape[1]                              # 768
-    chunk_dim = dense_ff // NUM_BASE_EXPERTS                 # 768
+    num_base  = dense_ff // ff_dim                           # 3072 // 1536 = 2
 
     # Transpose to match MoE layout: MoE does x @ W, so W is [embed_dim, ff_dim]
     gate_wT = gate_w.T     # [768, 3072]
     up_wT   = up_w.T       # [768, 3072]
     down_wT = down_w.T     # [3072, 768]
 
-    # Slice into 4 base experts
+    # Slice into 2 base chunks
     base_gate_up = []
     base_down    = []
-    for i in range(NUM_BASE_EXPERTS):
-        s = i * chunk_dim
-        e = s + chunk_dim
-        gu = torch.cat([gate_wT[:, s:e], up_wT[:, s:e]], dim=1)   # [768, 1536]
+    for i in range(num_base):
+        s  = i * ff_dim
+        e  = s + ff_dim
+        gu = torch.cat([gate_wT[:, s:e], up_wT[:, s:e]], dim=1)   # [768, 2*ff_dim]
         base_gate_up.append(gu)
-        base_down.append(down_wT[s:e, :].clone())                 # [768, 768]
+        base_down.append(down_wT[s:e, :].clone())                 # [ff_dim, 768]
 
-    # Fill all experts
-    gate_up_all = layer.ff.expert_weights.gate_up_weights.data   # [E, 768, 2*ff_dim]
-    down_all    = layer.ff.expert_weights.down_weights.data      # [E, ff_dim, 768]
+    gate_up_all = layer.ff.expert_weights.gate_up_weights.data     # [E, 768, 2*ff_dim]
+    down_all    = layer.ff.expert_weights.down_weights.data        # [E, ff_dim, 768]
 
-    num_tiled = num_experts - NUM_FRESH_EXPERTS
+    # Tile each base chunk 3x = 6 base experts, noise on copies 2 and 3
+    num_tiled = num_base * NUM_TILES
     for slot in range(num_tiled):
-        base_idx = slot % NUM_BASE_EXPERTS
-        tile_num = slot // NUM_BASE_EXPERTS
+        base_idx = slot % num_base
+        tile_num = slot // num_base
 
         gate_up_all[slot].copy_(base_gate_up[base_idx])
         down_all[slot].copy_(base_down[base_idx])
 
-        # Symmetry-breaking noise on copies (keep first tile exact)
         if tile_num > 0:
             gate_up_all[slot].add_(torch.randn_like(gate_up_all[slot]) * UPCYCLE_NOISE_STD)
             down_all[slot].add_(torch.randn_like(down_all[slot]) * UPCYCLE_NOISE_STD)
 
-    # Fresh random experts for learning new structure
+    # Fresh random experts
     for slot in range(num_tiled, num_experts):
         nn.init.normal_(gate_up_all[slot], std=UPCYCLE_FRESH_STD)
         nn.init.normal_(down_all[slot], std=UPCYCLE_FRESH_STD)
@@ -76,7 +74,7 @@ def _upcycle_moe_layer(layer, sd, prefix, ff_dim, num_experts, init_std):
 DEFAULTS = {
     "dropout":      0.1,
     "use_moe":      True,
-    "num_experts":  16,
+    "num_experts":  8,
     "moe_top_k":    2,
     "init_std":     0.006,
 }
@@ -90,6 +88,7 @@ def build_gt5(
     ff_dim              = None,
     dropout             = DEFAULTS["dropout"],
     use_moe             = DEFAULTS["use_moe"],
+    moe_layers          = None,
     num_experts         = DEFAULTS["num_experts"],
     moe_top_k           = DEFAULTS["moe_top_k"],
     # Vocab
@@ -126,8 +125,19 @@ def build_gt5(
     embed_dim       = dna_config.hidden_size
     dna_num_layers  = dna_config.num_hidden_layers
 
+    # Determine MoE layer set for display
+    if moe_layers is not None:
+        moe_set = set(moe_layers)
+    elif use_moe:
+        moe_set = set(range(num_layers))
+    else:
+        moe_set = set()
+
     print(f"\n    DNABERT-2: hidden={embed_dim}, layers={dna_num_layers}, heads={dna_config.num_attention_heads}")
-    print(f"    GeneT5:    layers={num_layers}, heads={num_heads}, moe={use_moe}, experts={num_experts}, ff_dim={ff_dim}")
+    if moe_layers is not None:
+        print(f"    GeneT5:    layers={num_layers}, heads={num_heads}, moe_layers={sorted(moe_set)}, experts={num_experts}, ff_dim={ff_dim}")
+    else:
+        print(f"    GeneT5:    layers={num_layers}, heads={num_heads}, moe={use_moe}, experts={num_experts}, ff_dim={ff_dim}")
 
     # Load raw state dict
     print(f"\n[2] Loading DNABERT-2 weights")
@@ -148,14 +158,19 @@ def build_gt5(
 
     # Build encoder stack
     print(f"\n[4] Building Encoder Stack")
+    # Dense layers keep DNABERT-2's full FFN dim when using selective MoE
+    dense_ff_dim = dna_config.intermediate_size if moe_layers is not None else None
+
     encoder = Encoder(
         num_layers   = num_layers,
         embed_dim    = embed_dim,
         num_heads    = num_heads,
         ff_dim       = ff_dim,
+        dense_ff_dim = dense_ff_dim,
         dropout      = dropout,
         attn_dropout = dropout,
         use_moe      = use_moe,
+        moe_layers   = moe_layers,
         num_experts  = num_experts,
         moe_top_k    = moe_top_k,
     )
@@ -180,8 +195,8 @@ def build_gt5(
         # Post-attention LayerNorm
         layer.norm1.weight.data.copy_(sd[f"{prefix}.attention.output.LayerNorm.weight"])
 
-        # FFN weights
-        if use_moe:
+        # FFN weights: MoE upcycle or dense copy per layer
+        if layer.use_moe:
             _upcycle_moe_layer(layer, sd, prefix, ff_dim, num_experts, init_std)
         else:
             gated        = sd[f"{prefix}.mlp.gated_layers.weight"]
@@ -195,11 +210,15 @@ def build_gt5(
         layer.norm2.weight.data.copy_(sd[f"{prefix}.mlp.layernorm.weight"])
 
     nn.init.ones_(encoder.final_norm.weight)
-    if use_moe:
+    num_moe   = sum(1 for l in encoder.layers if l.use_moe)
+    num_dense = num_layers - num_moe
+    if num_moe > 0:
+        num_base = 3072 // ff_dim
         print(f"    transferred {num_copy} layers (self-attn + norms from DNABERT-2)")
-        print(f"    MoE upcycled: {NUM_BASE_EXPERTS} base experts from dense FFN, "
-              f"tiled to {num_experts - NUM_FRESH_EXPERTS}, "
-              f"{NUM_FRESH_EXPERTS} fresh (std={UPCYCLE_FRESH_STD})")
+        print(f"    {num_moe} MoE layers, {num_dense} dense layers")
+        print(f"    MoE upcycled: {num_base} chunks × {NUM_TILES} tiles = "
+              f"{num_base * NUM_TILES} base experts (noise std={UPCYCLE_NOISE_STD}), "
+              f"{NUM_FRESH} fresh (std={UPCYCLE_FRESH_STD})")
     else:
         print(f"    transferred {num_copy} layers (self-attn + FFN + norms from DNABERT-2)")
 
@@ -227,8 +246,10 @@ def build_gt5(
         "num_layers":   num_layers,
         "num_heads":    num_heads,
         "ff_dim":       ff_dim,
+        "dense_ff_dim": dense_ff_dim,
         "dropout":      dropout,
         "use_moe":      use_moe,
+        "moe_layers":   moe_layers,
         "num_experts":  num_experts,
         "moe_top_k":    moe_top_k,
         "vocab_size":   vocab_size,

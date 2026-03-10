@@ -155,6 +155,7 @@ fi
 NCCL_ENVS=(
     "NCCL_DEBUG=INFO"
     "NCCL_IB_HCA=${CX7_HCA:-rocep1s0f1}"
+    "NCCL_IB_GID_INDEX=3"
     "NCCL_IB_TIMEOUT=23"
     "NCCL_IB_RETRY_CNT=13"
     "NCCL_IB_MERGE_NICS=0"
@@ -330,13 +331,9 @@ if [[ -n "$WORKER_IP" ]]; then
     ENV_STR+="export TORCHINDUCTOR_FX_GRAPH_CACHE=1; "
     ENV_STR+="export PYTHONUNBUFFERED=1; "
     ENV_STR+="export PYTHONPATH=${WORKER_CODE_DIR}; "
-    # Worker detects its own CX7 interface + HCA (may differ from master)
-    ENV_STR+="for iface in enp1s0f1np1 enp1s0f0np0 enP2p1s0f1np1 enP2p1s0f0np0; do "
-    ENV_STR+="  if [ -d /sys/class/net/\$iface ] && python3 -c \"import socket,struct,fcntl;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);socket.inet_ntoa(fcntl.ioctl(s.fileno(),0x8915,struct.pack('256s',b'\$iface'))[20:24])\" 2>/dev/null; then "
-    ENV_STR+="    export NCCL_SOCKET_IFNAME=\$iface; export GLOO_SOCKET_IFNAME=\$iface; "
-    ENV_STR+="    tmp=\${iface#en}; export NCCL_IB_HCA=roce\${tmp%np*}; break; "
-    ENV_STR+="  fi; "
-    ENV_STR+="done; "
+    # Worker CX7 — hardcoded (detection loop breaks in SSH+docker bash -c quoting)
+    ENV_STR+="export NCCL_SOCKET_IFNAME=enp1s0f1np1; export GLOO_SOCKET_IFNAME=enp1s0f1np1; "
+    ENV_STR+="export NCCL_IB_HCA=rocep1s0f1; "
     ENV_STR+="cd ${WORKER_CODE_DIR}; "
     # Pre-flight cleanup on worker (pycache, inductor, page cache)
     ENV_STR+="find ${WORKER_CODE_DIR} -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true; "

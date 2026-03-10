@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -7,6 +8,9 @@ import torch.nn            as nn
 import torch.nn.functional as F
 
 from liger_kernel.ops.swiglu import LigerSiLUMulFunction
+
+# GENET5_MOE_BACKEND: auto (default), sonicmoe, triton, grouped_mm, bmm, pytorch
+_MOE_BACKEND = os.environ.get("GENET5_MOE_BACKEND", "auto")
 
 
 ####################
@@ -17,8 +21,8 @@ from liger_kernel.ops.swiglu import LigerSiLUMulFunction
 @dataclass
 class MoEConfig:
     embed_dim:            int   = 768
-    ff_dim:               int   = 384
-    num_experts:          int   = 16
+    ff_dim:               int   = 1536
+    num_experts:          int   = 8
     top_k:                int   = 2
     dropout:              float = 0.0
     load_balance_weight:  float = 0.01
@@ -61,7 +65,7 @@ class FusedExpertWeights(nn.Module):
 class MoE(nn.Module):
     """Mixture of Experts with bmm, grouped GEMM, or loop fallback
 
-    Dispatch priority: triton > grouped_mm (Hopper/Blackwell) > bmm > loop
+    Dispatch priority: sonicmoe > triton > grouped_mm (Hopper/Blackwell) > bmm > loop
     """
 
     def __init__(self, config):
@@ -79,6 +83,20 @@ class MoE(nn.Module):
         self.gate           = nn.Linear(config.embed_dim, config.num_experts, bias=False)
         self.expert_weights = FusedExpertWeights(config.num_experts, config.embed_dim, config.ff_dim)
         self.dropout        = nn.Dropout(config.dropout)
+
+        # SonicMoE (ICLR 2026 — fastest on Hopper, 1.86x over ScatterMoE)
+        self._sonicmoe_available = False
+        self._sonicmoe_layer     = None
+        try:
+            from sonicmoe import MoE as SonicMoELayer
+            from sonicmoe import KernelBackendMoE
+            from sonicmoe.enums import ActivationType
+            self._sonicmoe_cls     = SonicMoELayer
+            self._sonicmoe_backend = KernelBackendMoE
+            self._sonicmoe_act     = ActivationType
+            self._sonicmoe_available = True
+        except ImportError:
+            pass
 
         self._grouped_mm_available = (
             hasattr(torch, '_grouped_mm')
@@ -255,7 +273,47 @@ class MoE(nn.Module):
 
         return output
 
+    def _forward_sonicmoe(self, x):
+        """SonicMoE dispatch — full layer replacement with Hopper-optimized kernels"""
+
+        if self._sonicmoe_layer is None:
+            self._sonicmoe_layer = self._sonicmoe_cls(
+                num_experts        = self.num_experts,
+                num_experts_per_tok = self.top_k,
+                hidden_size        = self.embed_dim,
+                intermediate_size  = self.ff_dim,
+                activation_function = self._sonicmoe_act.SWIGLU,
+                add_bias           = False,
+                std                = 0.006,
+            ).to(device=x.device, dtype=x.dtype)
+
+            # Copy our trained weights into SonicMoE layer
+            with torch.no_grad():
+                self._sonicmoe_layer.gate.weight.copy_(self.gate.weight)
+                # SonicMoE stores expert weights differently — adapt format
+                ew = self.expert_weights
+                if hasattr(self._sonicmoe_layer, 'w1'):
+                    self._sonicmoe_layer.w1.weight.copy_(ew.gate_weights.transpose(-1, -2))
+                if hasattr(self._sonicmoe_layer, 'w3'):
+                    self._sonicmoe_layer.w3.weight.copy_(ew.up_weights.transpose(-1, -2))
+                if hasattr(self._sonicmoe_layer, 'w2'):
+                    self._sonicmoe_layer.w2.weight.copy_(ew.down_weights.transpose(-1, -2))
+
+        B, L, D = x.shape
+        x_flat  = x.view(-1, D)
+
+        out, sonic_aux = self._sonicmoe_layer(
+            x_flat, kernel_backend_moe=self._sonicmoe_backend.sonicmoe)
+
+        return out.view(B, L, D), sonic_aux
+
     def forward(self, x):
+
+        # SonicMoE: handles routing + dispatch + aux loss internally
+        if _MOE_BACKEND == "sonicmoe" and self._sonicmoe_available:
+            output, aux_loss = self._forward_sonicmoe(x)
+            output = self.dropout(output)
+            return output, aux_loss
 
         batch_size, seq_len, embed_dim = x.shape
         num_tokens                     = batch_size * seq_len
@@ -266,7 +324,15 @@ class MoE(nn.Module):
         top_k_probs, top_k_indices = torch.topk(router_probs, self.top_k, dim=-1)
         top_k_probs                = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
 
-        if self._triton_available and x_flat.is_cuda:
+        if _MOE_BACKEND == "triton" and self._triton_available:
+            output = self._forward_triton(x_flat, top_k_indices, top_k_probs)
+        elif _MOE_BACKEND == "grouped_mm" and self._grouped_mm_available:
+            output = self._forward_grouped(x_flat, top_k_indices, top_k_probs)
+        elif _MOE_BACKEND == "bmm":
+            output = self._forward_bmm(x_flat, top_k_indices, top_k_probs)
+        elif _MOE_BACKEND == "pytorch":
+            output = self._forward_pytorch(x_flat, top_k_indices, top_k_probs)
+        elif self._triton_available and x_flat.is_cuda:
             output = self._forward_triton(x_flat, top_k_indices, top_k_probs)
         elif self._grouped_mm_available and x_flat.is_cuda:
             output = self._forward_grouped(x_flat, top_k_indices, top_k_probs)
@@ -288,6 +354,9 @@ class MoE(nn.Module):
         expert_mask = F.one_hot(top_k_indices, self.num_experts).float().sum(dim=1)
         f           = expert_mask.sum(dim=0) / (num_tokens * self.top_k)
         P           = router_probs.mean(dim=0)
+
+        # Store per-expert load fraction for logging (no grad, no graph)
+        self._last_expert_frac = f.detach()
 
         load_balance_loss = self.num_experts * (f * P).sum()
         z_loss            = torch.logsumexp(router_logits, dim=-1).square().mean()
