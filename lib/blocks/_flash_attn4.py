@@ -57,6 +57,32 @@ class FlashAttention(nn.Module):
         self.o       = nn.Linear(config.num_heads * self.head_dim, config.embed_dim, bias=False)
         self.dropout = nn.Dropout(config.dropout)
 
+    @staticmethod
+    @torch.compiler.disable
+    def _fa4_kernel(q, k, v, cu_seqlens, max_seqlen, softmax_scale):
+        """CuTeDSL kernel — opaque to torch.compile (uses DLPack internally)"""
+
+        if cu_seqlens is not None:
+            out = flash_attn_varlen_func(
+                q, k, v,
+                cu_seqlens_q  = cu_seqlens,
+                cu_seqlens_k  = cu_seqlens,
+                max_seqlen_q  = max_seqlen,
+                max_seqlen_k  = max_seqlen,
+                softmax_scale = softmax_scale,
+                causal        = False,
+            )
+        else:
+            out = flash_attn_func(
+                q, k, v,
+                softmax_scale = softmax_scale,
+                causal        = False,
+            )
+
+        if isinstance(out, tuple):
+            out = out[0]
+        return out
+
     def forward(self, hidden_states, cu_seqlens=None, max_seqlen=None):
         """Bidirectional FA4 attention with optional varlen packed mode"""
 
@@ -67,31 +93,12 @@ class FlashAttention(nn.Module):
         v = self.v(hidden_states).view(B, L, self.num_kv_heads, self.head_dim)
 
         if cu_seqlens is not None:
-            q   = q.reshape(-1, self.num_heads, self.head_dim)
-            k   = k.reshape(-1, self.num_kv_heads, self.head_dim)
-            v   = v.reshape(-1, self.num_kv_heads, self.head_dim)
-            out = flash_attn_varlen_func(
-                q, k, v,
-                cu_seqlens_q  = cu_seqlens,
-                cu_seqlens_k  = cu_seqlens,
-                max_seqlen_q  = max_seqlen,
-                max_seqlen_k  = max_seqlen,
-                softmax_scale = self.softmax_scale,
-                causal        = False,
-            )
-            if isinstance(out, tuple):
-                out = out[0]
-            out = out.reshape(B, L, self.embed_dim)
-        else:
-            out = flash_attn_func(
-                q, k, v,
-                softmax_scale = self.softmax_scale,
-                causal        = False,
-            )
-            if isinstance(out, tuple):
-                out = out[0]
-            out = out.reshape(B, L, self.embed_dim)
+            q = q.reshape(-1, self.num_heads, self.head_dim)
+            k = k.reshape(-1, self.num_kv_heads, self.head_dim)
+            v = v.reshape(-1, self.num_kv_heads, self.head_dim)
 
+        out = self._fa4_kernel(q, k, v, cu_seqlens, max_seqlen, self.softmax_scale)
+        out = out.reshape(B, L, self.embed_dim)
         out = self.o(out)
         out = self.dropout(out)
 

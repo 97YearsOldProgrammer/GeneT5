@@ -131,6 +131,14 @@ class MuonE2E:
             for sched, saved in zip(self._schedulers, s['schedulers']):
                 sched.load_state_dict(saved)
 
+    def reset_momentum(self):
+        """Zero momentum buffers — prevents stale momentum from destabilizing MoE routers on resume"""
+
+        for buf in self._bufs_2d:
+            buf.zero_()
+        for buf in self._bufs_1d:
+            buf.zero_()
+
     def fast_forward_schedulers(self, target_step):
         """Advance schedulers to target_step (for old checkpoints without scheduler state)"""
 

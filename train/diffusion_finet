@@ -200,7 +200,7 @@ def build_parser():
         metavar='<float>', help='label smoothing factor [%(default).2f]')
     parser.add_argument('--gradient_checkpointing', action='store_true',
         help='enable gradient checkpointing')
-    parser.add_argument('--log_every_steps', required=False, type=int, default=100,
+    parser.add_argument('--log_every_steps', required=False, type=int, default=50,
         metavar='<int>', help='log progress every N optimizer steps [%(default)i]')
     parser.add_argument('--save_steps', required=False, type=int, default=None,
         metavar='<int>', help='save checkpoint every N optimizer steps')
@@ -380,18 +380,22 @@ def main():
 
     if is_packed:
         # Packed pipeline: fixed-length sequences, no token budget batcher
+        # warn_and_continue: skip transient I/O errors from FUSE network storage
         train_dataset = (
-            wds.WebDataset(shard_urls, resampled=True, nodesplitter=wds.split_by_node)
+            wds.WebDataset(shard_urls, resampled=True, nodesplitter=wds.split_by_node,
+                           handler=wds.warn_and_continue)
             .shuffle(10000)
             .decode()
             .map(load_packed_sample)
         )
+        mp_ctx = "forkserver" if args.compile and args.num_workers > 0 else None
         train_loader = wds.WebLoader(
             train_dataset,
-            batch_size         = None,
-            num_workers        = args.num_workers,
-            pin_memory         = not args.no_pin_memory,
-            persistent_workers = persistent,
+            batch_size             = None,
+            num_workers            = args.num_workers,
+            pin_memory             = not args.no_pin_memory,
+            persistent_workers     = persistent,
+            multiprocessing_context = mp_ctx,
         ).batched(args.batch_size, collation_fn=ds.packed_collate)
 
         batches_per_epoch = total_train // (args.batch_size * world_size)
@@ -410,12 +414,14 @@ def main():
         collator      = DiffusionCollator(tokenizer.pad_token_id, max_seq_len=ds.DEFAULT_MAX_SEQ)
         budget        = args.batch_size * ds.BUDGET_SEQ
 
+        mp_ctx = "forkserver" if args.compile and args.num_workers > 0 else None
         train_loader = wds.WebLoader(
             train_dataset,
-            batch_size         = None,
-            num_workers        = args.num_workers,
-            pin_memory         = not args.no_pin_memory,
-            persistent_workers = persistent,
+            batch_size             = None,
+            num_workers            = args.num_workers,
+            pin_memory             = not args.no_pin_memory,
+            persistent_workers     = persistent,
+            multiprocessing_context = mp_ctx,
         ).compose(
             lambda src: ds.token_budget_batcher(src, budget, args.batch_size, collator)
         )
@@ -479,9 +485,11 @@ def main():
         global_step     = saved_step if saved_step is not None else start_epoch * steps_per_epoch
 
         optimizer.fast_forward_schedulers(global_step)
+        optimizer.reset_momentum()
 
         if is_main:
             print(f"  Resumed: epoch={start_epoch}, global_step={global_step}")
+            print(f"  Momentum buffers reset (prevents MoE router destabilization)")
 
     # Save config
     if is_main:
@@ -597,7 +605,7 @@ def main():
                       f"elapsed {elapsed/3600:.1f}h", flush=True)
                 last_heartbeat = time.time()
 
-            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+            batch = {k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v for k, v in batch.items()}
             if batch['input_ids'].dtype != torch.long:
                 batch['input_ids'] = batch['input_ids'].long()
 
