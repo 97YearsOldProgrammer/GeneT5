@@ -1,9 +1,10 @@
+import math
+
 import torch
 import torch.nn                 as nn
 import torch.utils.checkpoint   as ckpt
 
 from lib.blocks._component      import LayerNorm, FeedForward, fused_add_rmsnorm
-from lib.blocks._moe            import MoE, MoEConfig
 
 import os as _os
 _ATTN_BACKEND = _os.environ.get("GENET5_ATTN_BACKEND", "auto")
@@ -46,20 +47,16 @@ class EncoderBlock(nn.Module):
         embed_dim,
         num_heads,
         ff_dim,
-        dropout          = 0.0,
-        attn_dropout     = 0.0,
-        use_moe          = False,
-        num_experts      = 16,
-        moe_top_k        = 4,
-        moe_load_balance = 0.01,
-        moe_router_z     = 0.001,
-        num_kv_heads     = None,
-        fused_add_norm   = False,
+        dropout        = 0.0,
+        attn_dropout   = 0.0,
+        num_kv_heads   = None,
+        fused_add_norm = False,
+        residual_scale = 1.0,
     ):
         super().__init__()
 
-        self.use_moe        = use_moe
         self.fused_add_norm = fused_add_norm
+        self.residual_scale = residual_scale
 
         flash_config = FlashAttentionConfig(
             embed_dim    = embed_dim,
@@ -69,49 +66,28 @@ class EncoderBlock(nn.Module):
         )
         self.self_attn = FlashAttention(config=flash_config)
         self.norm1     = LayerNorm(embed_dim)
-
-        # Feed-forward: MoE or standard
-        if use_moe:
-            moe_config = MoEConfig(
-                embed_dim            = embed_dim,
-                ff_dim               = ff_dim,
-                num_experts          = num_experts,
-                top_k                = moe_top_k,
-                dropout              = dropout,
-                load_balance_weight  = moe_load_balance,
-                router_z_loss_weight = moe_router_z,
-            )
-            self.ff = MoE(config=moe_config)
-        else:
-            self.ff = FeedForward(embed_dim, ff_dim, dropout)
-
-        self.norm2   = LayerNorm(embed_dim)
-        self.dropout = nn.Dropout(dropout)
+        self.ff        = FeedForward(embed_dim, ff_dim, dropout)
+        self.norm2     = LayerNorm(embed_dim)
+        self.dropout   = nn.Dropout(dropout)
 
     def forward(self, hidden_states, cu_seqlens=None, max_seqlen=None):
 
-        # Self-attention
+        alpha = self.residual_scale
+
         normed             = self.norm1(hidden_states)
         attn_output, _     = self.self_attn(normed, cu_seqlens, max_seqlen)
 
-        # Residual + norm2: fused or standard
         if self.fused_add_norm:
             normed, hidden_states = fused_add_rmsnorm(
-                self.dropout(attn_output), hidden_states,
+                self.dropout(attn_output) * alpha, hidden_states,
                 self.norm2.weight, self.norm2.variance_epsilon)
         else:
-            hidden_states = hidden_states + self.dropout(attn_output)
+            hidden_states = hidden_states + self.dropout(attn_output) * alpha
             normed        = self.norm2(hidden_states)
 
-        # Feed-forward
-        if self.use_moe:
-            ff_output, moe_aux_loss = self.ff(normed)
-            hidden_states           = hidden_states + self.dropout(ff_output)
-            return hidden_states, moe_aux_loss
-        else:
-            ff_output     = self.ff(normed)
-            hidden_states = hidden_states + self.dropout(ff_output)
-            return hidden_states, None
+        ff_output     = self.ff(normed)
+        hidden_states = hidden_states + self.dropout(ff_output) * alpha
+        return hidden_states
 
 
 class Encoder(nn.Module):
@@ -122,47 +98,24 @@ class Encoder(nn.Module):
         embed_dim,
         num_heads,
         ff_dim,
-        dense_ff_dim     = None,
-        dropout          = 0.0,
-        attn_dropout     = 0.0,
-        use_moe          = True,
-        moe_layers       = None,
-        num_experts      = 16,
-        moe_top_k        = 4,
-        moe_load_balance = 0.01,
-        moe_router_z     = 0.001,
-        num_kv_heads     = None,
-        fused_add_norm   = False,
+        dropout        = 0.0,
+        attn_dropout   = 0.0,
+        num_kv_heads   = None,
+        fused_add_norm = False,
+        depth_scaling  = False,
     ):
         super().__init__()
 
-        if dense_ff_dim is None:
-            dense_ff_dim = ff_dim
-
-        # Per-layer MoE assignment
-        if moe_layers is not None:
-            moe_set = set(moe_layers)
-        elif use_moe:
-            moe_set = set(range(num_layers))
-        else:
-            moe_set = set()
-
-        self.use_moe = len(moe_set) > 0
-
         self.layers = nn.ModuleList([
             EncoderBlock(
-                embed_dim        = embed_dim,
-                num_heads        = num_heads,
-                ff_dim           = ff_dim if i in moe_set else dense_ff_dim,
-                dropout          = dropout,
-                attn_dropout     = attn_dropout,
-                use_moe          = i in moe_set,
-                num_experts      = num_experts,
-                moe_top_k        = moe_top_k,
-                moe_load_balance = moe_load_balance,
-                moe_router_z     = moe_router_z,
-                num_kv_heads     = num_kv_heads,
-                fused_add_norm   = fused_add_norm,
+                embed_dim      = embed_dim,
+                num_heads      = num_heads,
+                ff_dim         = ff_dim,
+                dropout        = dropout,
+                attn_dropout   = attn_dropout,
+                num_kv_heads   = num_kv_heads,
+                fused_add_norm = fused_add_norm,
+                residual_scale = (1.0 / math.sqrt(i + 1)) if depth_scaling else 1.0,
             )
             for i in range(num_layers)
         ])
@@ -180,11 +133,9 @@ class Encoder(nn.Module):
 
     def forward(self, hidden_states, cu_seqlens=None, max_seqlen=None):
 
-        total_moe_loss = 0.0 if self.use_moe else None
-
         for layer in self.layers:
             if self._gradient_checkpointing and self.training:
-                hidden_states, moe_aux_loss = ckpt.checkpoint(
+                hidden_states = ckpt.checkpoint(
                     layer,
                     hidden_states,
                     cu_seqlens,
@@ -192,12 +143,9 @@ class Encoder(nn.Module):
                     use_reentrant=False,
                 )
             else:
-                hidden_states, moe_aux_loss = layer(hidden_states, cu_seqlens, max_seqlen)
-
-            if self.use_moe and moe_aux_loss is not None:
-                total_moe_loss = total_moe_loss + moe_aux_loss
+                hidden_states = layer(hidden_states, cu_seqlens, max_seqlen)
 
         hidden_states = self.final_norm(hidden_states)
         hidden_states = self.dropout(hidden_states)
 
-        return hidden_states, total_moe_loss
+        return hidden_states

@@ -69,7 +69,7 @@ def compute_log_probs(model, input_ids, labels, vocab_size):
     mask            = (labels != -100).float()
     token_log_probs = token_log_probs * mask
 
-    return token_log_probs, mask, outputs.get("moe_loss")
+    return token_log_probs, mask
 
 
 def compute_advantages(rewards, group_size):

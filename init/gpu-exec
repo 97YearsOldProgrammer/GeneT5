@@ -1,0 +1,26 @@
+#!/bin/bash
+#
+# Run a command inside the gt5 container from the host
+# This is how Claude Code (running on host) executes GPU work
+#
+# Usage:
+#   gpu python3 tests/bench_attention.py
+#   gpu bash                                    # interactive shell
+#   gpu torchrun --nproc_per_node=1 train/finet ...
+
+CONTAINER="gt5"
+
+if ! docker inspect "$CONTAINER" > /dev/null 2>&1; then
+    echo "Container $CONTAINER not found. Run: bash ~/Code/GeneT5/init/gpu/start-gt5.sh --fresh"
+    exit 1
+fi
+
+if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER")" != "true" ]]; then
+    docker start "$CONTAINER" > /dev/null
+fi
+
+if [ $# -eq 0 ]; then
+    docker exec -it "$CONTAINER" bash
+else
+    docker exec -it "$CONTAINER" bash -c "cd /workspace/code && $*"
+fi

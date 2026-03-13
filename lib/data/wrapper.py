@@ -3,6 +3,7 @@ import lib.data._binary     as binary
 import lib.data._merge      as merge
 import lib.data._chunking   as chunking
 import lib.data._dataload   as dataload
+import lib.data._ram        as ram
 import lib.data._util       as util
 
 
@@ -60,6 +61,18 @@ BUDGET_SEQ             = dataload.BUDGET_SEQ
 PACK_SEQ_LEN           = dataload.PACK_SEQ_LEN
 token_budget_batcher   = dataload.token_budget_batcher
 packed_collate         = dataload.packed_collate
+
+
+####################
+#####  RAM I/O #####
+####################
+
+
+consolidate          = ram.consolidate
+RamDataset           = ram.RamDataset
+TokenBudgetSampler   = ram.TokenBudgetSampler
+compress_dataset     = ram.compress_dataset
+decompress_dataset   = ram.decompress_dataset
 
 
 ###################

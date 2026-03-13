@@ -32,5 +32,5 @@ from lib.inference.output import (
 
 from lib.inference.diffusion_engine import (
     diffusion_generate,
-    cosine_unmask_schedule,
+    linear_unmask_schedule,
 )

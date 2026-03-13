@@ -41,9 +41,15 @@ train/         - SFT/GRPO training pipeline
   bake_data      - Data baking for SFT
   sft.sh         - Distributed SFT launcher
   bake.sh        - Distributed bake launcher
-init/          - Model initialization
+init/          - Model initialization and GPU setup
   init_model.py  - Model init
-  setup-nfs.sh   - NFS setup
+  gpu-exec       - Run commands inside gt5 container from host
+  gpu/           - Container launch and migration scripts
+    migrate_data.sh     - Host data layout migration
+    start-gt5.sh        - GeneT5 master container
+    start-gt5-worker.sh - GeneT5 worker container
+    start-fa.sh         - FlashAlignment container
+    start-pqc.sh        - ProteinQC container
 lib/           - Core library code
   model/         - Model architectures and builders
     genet5.py      - GeneT5 model architecture
@@ -77,48 +83,49 @@ docs/          - Design documents
 
 ## Data Layout
 
+Inside the `gt5` container, `/workspace/code` is the project source and `/workspace/data/`
+subdirectories are individually mounted from the host. Host data is root-owned (created by Docker).
+
 ```
 /workspace/
-  raw/                    - Raw GFF + FASTA by species
-    {Genus.species}/        - Binomial naming (e.g. H.sapiens, D.melanogaster)
-      fna.gz                - Compressed genome FASTA
-      gff.gz                - Compressed gene annotations
-      fna                   - Decompressed FASTA
-      fna.fai               - FASTA index (created by pyfaidx)
-
-  baked/                  - Packed training datasets
-    GeneT5/                 - GeneT5 SFT pipeline baked data
-      {run_name}/           - Convention: {mon}{DD}_s{N}_w{W}_p{P}
-        {species}/            - Per-species directory
-          shard_000.tar       - WebDataset training shards
-          stats.json          - Species baking stats
-          gene_index.json     - Gene index sidecar (avoids re-parsing GFF)
-        validation.bin        - Merged held-out species binary
-        eval.json             - Eval samples (diverse coding genes)
-        bake_config.json      - Full baking config (species, params, totals)
-
-  model/                  - Model checkpoints
-    GeneT5/
-      init/                 - Initialized (untrained) models
-        init_upcycle_moe16_topk2/ - MoE-16 expert (top-2) init from DNABERT-2
-      {mon}{DD}_*_t{N}/     - Experiment runs (date + trial number)
-        finetune_config.json  - Full training config
-        training_log.csv      - Step-level training metrics
-        eval_log.csv          - Per-epoch evaluation metrics
-        memory_*.csv          - Memory monitoring logs
-        best_model.pt         - Best checkpoint (by val loss)
-        checkpoint_latest.pt  - Latest epoch checkpoint
-        checkpoint_step_*.pt  - Step-level checkpoints
-
-  logs/                   - Baking and misc logs
-    baker/                  - Per-species baking logs
+  code/                   - Project source (mounted from host Code/GeneT5)
+  data/                   - Per-project data (mounted from host Data/GeneT5)
+    raw/                    - Raw GFF + FASTA by species (symlink to shared genome/raw)
+      {Genus.species}/        - Binomial naming (e.g. H.sapiens, D.melanogaster)
+        fna.gz                - Compressed genome FASTA
+        gff.gz                - Compressed gene annotations
+        fna                   - Decompressed FASTA
+        fna.fai               - FASTA index (created by pyfaidx)
+    baked/                  - Packed training datasets
+      {run_name}/             - Convention: {mon}{DD}_s{N}_w{W}_p{P}
+        {species}/              - Per-species directory
+          shard_000.tar         - WebDataset training shards
+          stats.json            - Species baking stats
+          gene_index.json       - Gene index sidecar (avoids re-parsing GFF)
+        validation.bin          - Merged held-out species binary
+        eval.json               - Eval samples (diverse coding genes)
+        bake_config.json        - Full baking config (species, params, totals)
+    model/                  - Model checkpoints
+      init/                   - Initialized (untrained) models
+        init_dense_24L/         - Dense 24L init from DNABERT-2
+      {mon}{DD}_*_t{N}/       - Experiment runs (date + trial number)
+        finetune_config.json    - Full training config
+        training_log.csv        - Step-level training metrics
+        eval_log.csv            - Per-epoch evaluation metrics
+        memory_*.csv            - Memory monitoring logs
+        best_model.pt           - Best checkpoint (by val loss)
+        checkpoint_latest.pt    - Latest epoch checkpoint
+        checkpoint_step_*.pt    - Step-level checkpoints
+    logs/                   - Baking and misc logs
+      baker/                  - Per-species baking logs
+      sft/                    - SFT training logs
 ```
 
 ## Output Directory Management
 
-All model outputs MUST go under `/workspace/model/GeneT5/` with descriptive names:
+All model outputs MUST go under `/workspace/data/model/` with descriptive names:
 - SFT experiments: `{mon}{DD}_*_t{N}/` (month + date + trial)
-- NEVER save to random ad-hoc directories outside `model/GeneT5/`
+- NEVER save to random ad-hoc directories outside `data/model/`
 
 ## Training Pipeline
 
@@ -126,16 +133,16 @@ Full pipeline from raw genomes to trained models:
 
 ```
 Step 1: INIT MODEL
-  init/init_model.py → /workspace/model/GeneT5/init/init_upcycle_moe16_topk2/
-  Builds GeneT5 from DNABERT-2 encoder weights (16 experts, top-2)
+  init/init_model.py → /workspace/data/model/init/init_dense_24L/
+  Builds GeneT5 from DNABERT-2 encoder weights (dense 24L)
 
 Step 2: BAKE SFT DATA
-  train/bake_data → /workspace/baked/GeneT5/{run}/
+  train/bake_data → /workspace/data/baked/{run}/
   Raw GFF+FASTA → tokenized WebDataset shards (.tar)
   Distributed: train/bake.sh --worker <IP>
 
 Step 3: SFT TRAINING
-  train/finet → /workspace/model/GeneT5/{exp}/
+  train/diffusion_finet → /workspace/data/model/{exp}/
   Trains GeneT5 on baked tar shards
   Distributed: train/sft.sh --worker <IP>
 
@@ -163,18 +170,19 @@ Step 5: GRPO (reinforcement learning)
 
 ## Hardware
 
-- 2x DGX Spark (GB10, 96GB unified memory each)
-- Master: 192.168.100.10, Worker: 192.168.100.11
+- 2x DGX Spark (GB10, 128GB unified memory each)
+- Master: spark-1089 (192.168.100.10), Worker: spark-0b7c (192.168.100.11)
 - NCCL over ConnectX-7 InfiniBand (RDMA)
-- NGC pytorch:25.12-py3 container on both nodes
-- Container name: `gt5`, launch scripts: `start-gt5.sh` (master), `start-worker.sh` (worker)
+- NGC pytorch:26.02-py3-igpu container on both nodes
+- Per-project containers: `gt5` (GeneT5), `fa` (FlashAlignment), `pqc` (ProteinQC)
+- Container launch: `init/gpu/start-gt5.sh` (master), `init/gpu/start-gt5-worker.sh` (worker)
 - Distributed training: `train/sft.sh` handles one-click launch, auto-patches, cleanup
 
 ## Training Logs & Experiments
 
 - Experiment doc: `docs/sft_experiments.md` (all trials, configs, results, comparisons)
-- Current init: `/workspace/model/GeneT5/init/init_upcycle_moe16_topk2/` (MoE-16, top-2, 1.53B params)
-- Current baked data: `/workspace/baked/GeneT5/mar06_s51_w20k_p18k/` (51 species, 96GB)
+- Current init: `/workspace/data/model/init/init_dense_24L/` (230M dense, 24 layers)
+- Current baked data: `/workspace/data/baked/mar12_s51_w20k_p18k/` (51 species, packed_tar)
 - Key findings from Feb trials: aggressive LR (3e-4) + small effective batch (256) = fast convergence but severe overfitting; conservative LR (1e-4) + large batch (1024) + label smoothing = better generalization
 
 ## Lessons Learned
@@ -183,13 +191,21 @@ Step 5: GRPO (reinforcement learning)
 
 ## Commands
 
-- Init model: `PYTHONPATH=. python init/init_model.py --help`
-- Bake data: `PYTHONPATH=. python train/bake_data <raw_dir> --tokenizer <path> [--train] [--eval] [--val_species X]`
-- Fine-tune: `PYTHONPATH=. python train/finet <data_dir> <output_dir> <model_path>`
-- GRPO: `PYTHONPATH=. python train/grpo --help`
-- Prep GRPO: `PYTHONPATH=. python train/prep_grpo --help`
-- Eval F1: `PYTHONPATH=. python eval/eval_f1 --help`
-- Eval BUSCO: `PYTHONPATH=. python eval/eval_busco --help`
+Inside the `gt5` container (paths relative to `/workspace/code`):
+
+- Init model: `python init/init_model.py --help`
+- Bake data: `python train/bake_data /workspace/data/raw --tokenizer <path> [--train] [--eval] [--val_species X]`
+- Fine-tune: `python train/diffusion_finet <data_dir> <output_dir> <model_path>`
+- GRPO: `python train/grpo --help`
+- Prep GRPO: `python train/prep_grpo --help`
+- Eval F1: `python eval/eval_f1 --help`
+- Eval BUSCO: `python eval/eval_busco --help`
 - Distributed SFT: `train/sft.sh <data_dir> <output_dir> <model_path> --worker <IP> [flags]`
-- Distributed bake: `train/bake.sh --worker <IP> --tokenizer <path> <raw_dir> [args...]`
+- Distributed bake: `train/bake.sh --worker <IP> --tokenizer <path> /workspace/data/raw [args...]`
 - Run tests: `PYTHONPATH=. python tests/<test_file>.py`
+
+Container management (from DGX host):
+
+- Launch GeneT5 master: `bash ~/Code/GeneT5/init/gpu/start-gt5.sh`
+- Launch GeneT5 worker: `bash ~/Code/GeneT5/init/gpu/start-gt5-worker.sh --daemon`
+- Migrate data layout: `bash ~/Code/GeneT5/init/gpu/migrate_data.sh`

@@ -36,6 +36,13 @@ from lib.data.wrapper import (
     token_budget_batcher,
     packed_collate,
 
+    # RAM I/O
+    consolidate,
+    RamDataset,
+    TokenBudgetSampler,
+    compress_dataset,
+    decompress_dataset,
+
     # Util
     format_size,
     print_run_stats,

@@ -8,6 +8,7 @@ import pathlib
 import concurrent.futures
 import json
 import random
+import subprocess
 
 import lib.util as util
 
@@ -16,9 +17,9 @@ parser = argparse.ArgumentParser(
     description="Bake species data: training bins, validation bins, and eval samples")
 parser.add_argument("raw_dir", type=str, metavar="<raw_dir>",
     help="Directory containing species subdirectories (fna.gz + gff.gz)")
-parser.add_argument("--output_dir", type=str, default="/workspace/baked",
+parser.add_argument("--output_dir", type=str, default="/workspace/data/baked",
     help="Output directory for baked files [%(default)s]")
-parser.add_argument("--log_dir",    type=str, default="/workspace/logs/baker",
+parser.add_argument("--log_dir",    type=str, default="/workspace/data/logs/baker",
     help="Directory for log files [%(default)s]")
 parser.add_argument("--window_size", type=int, default=20000,
     help="Window size in base pairs [%(default)s]")
@@ -56,6 +57,8 @@ parser.add_argument("--packed", action="store_true",
     help="Bake in packed tar format (tokenize + SPFHP-pack into fixed-length sequences)")
 parser.add_argument("--pack_seq_len", type=int, default=8192,
     help="Pack sequence length for packed tar format [%(default)s]")
+parser.add_argument("--ram", action="store_true",
+    help="Bake to lean RAM format (tokens.bin + offsets.npy, no WebDataset)")
 
 args = parser.parse_args()
 
@@ -65,14 +68,17 @@ if args.finalize:
     args.eval      = True
     args.nnodes    = 1
     args.node_rank = 0
-    # Inherit --packed from node configs if not explicitly set
-    if not args.packed:
+    # Inherit format from node configs if not explicitly set
+    if not args.packed and not args.ram:
         for cfg_path in pathlib.Path(args.output_dir).glob("bake_config_node*.json"):
             with open(cfg_path) as f:
                 node_cfg = json.load(f)
-            if node_cfg.get("output_format") == "packed_tar":
+            fmt = node_cfg.get("output_format", "")
+            if fmt == "packed_tar":
                 args.packed = True
-                break
+            elif fmt == "ram":
+                args.ram = True
+            break
 elif not args.train and not args.eval:
     args.train = True
     args.eval  = True
@@ -236,7 +242,12 @@ def _make_jobs(species_list, output_format="binary"):
 
 
 if not args.finalize and args.train:
-    fmt        = "packed_tar" if args.packed else "tar"
+    if args.ram:
+        fmt = "binary"
+    elif args.packed:
+        fmt = "packed_tar"
+    else:
+        fmt = "tar"
     work_items = _make_jobs(species_to_process, output_format=fmt)
 
     print(f"\n{' Processing Training Species ':=^60}")
@@ -317,50 +328,58 @@ if args.train and (args.finalize or args.nnodes == 1):
     all_train_names   = {name for name, _ in train_species}
     all_heldout_names = {name for name, _ in heldout_species}
 
-    # Discover tar shards for training species
-    all_tar_files  = sorted(output_dir.glob("*/*.tar"))
-    training_tars  = [f for f in all_tar_files if f.parent.name in all_train_names]
-
-    # Count total training samples
-    # For packed format: use train_totals from this run, or sum node configs (finalize)
-    # For unpacked: read raw counts from stats.json
+    # Count total training samples from stats
     total_train_samples = 0
-    if args.packed and train_totals:
-        total_train_samples = sum(train_totals.values())
-    elif args.packed and args.finalize:
-        for cfg_path in sorted(output_dir.glob("bake_config_node*.json")):
-            with open(cfg_path) as f:
-                node_cfg = json.load(f)
-            total_train_samples += node_cfg.get("total_train_samples", 0)
+    for sp_name in all_train_names:
+        stats_path = output_dir / sp_name / "stats.json"
+        if stats_path.exists():
+            with open(stats_path) as f:
+                sp_stats = json.load(f)
+            total_train_samples += sp_stats.get("run_stats", {}).get("total_samples", 0)
 
-    # Fallback: sum per-species stats.json (handles packed finalize with missing counts)
-    if total_train_samples == 0:
-        for sp_name in all_train_names:
-            stats_path = output_dir / sp_name / "stats.json"
-            if stats_path.exists():
-                with open(stats_path) as f:
-                    sp_stats = json.load(f)
-                total_train_samples += sp_stats.get("run_stats", {}).get("total_samples", 0)
+    # For tar/packed_tar: also check train_totals and node configs
+    if not args.ram:
+        if args.packed and train_totals:
+            total_train_samples = max(total_train_samples, sum(train_totals.values()))
+        elif args.packed and args.finalize:
+            node_total = 0
+            for cfg_path in sorted(output_dir.glob("bake_config_node*.json")):
+                with open(cfg_path) as f:
+                    node_cfg = json.load(f)
+                node_total += node_cfg.get("total_train_samples", 0)
+            total_train_samples = max(total_train_samples, node_total)
 
-    print(f"\n{' Per-Species Training Shards (tar) ':=^60}")
-    total_bytes = 0
-    species_tar_counts = {}
-    for f in training_tars:
-        fsize        = f.stat().st_size
-        total_bytes += fsize
-        sp           = f.parent.name
-        species_tar_counts[sp] = species_tar_counts.get(sp, 0) + 1
+        all_tar_files  = sorted(output_dir.glob("*/*.tar"))
+        training_tars  = [f for f in all_tar_files if f.parent.name in all_train_names]
 
-    for sp in sorted(species_tar_counts):
-        n_tars = species_tar_counts[sp]
-        sp_size = sum(f.stat().st_size for f in training_tars if f.parent.name == sp)
-        print(f"    {sp:30s} {n_tars:>3} tar(s)  ({sp_size / 1024 / 1024:.1f} MB)")
+        print(f"\n{' Per-Species Training Shards (tar) ':=^60}")
+        total_bytes = 0
+        species_tar_counts = {}
+        for f in training_tars:
+            fsize        = f.stat().st_size
+            total_bytes += fsize
+            sp           = f.parent.name
+            species_tar_counts[sp] = species_tar_counts.get(sp, 0) + 1
 
-    if total_bytes < 1024 ** 3:
-        total_str = f"{total_bytes / 1024 / 1024:.1f} MB"
+        for sp in sorted(species_tar_counts):
+            n_tars = species_tar_counts[sp]
+            sp_size = sum(f.stat().st_size for f in training_tars if f.parent.name == sp)
+            print(f"    {sp:30s} {n_tars:>3} tar(s)  ({sp_size / 1024 / 1024:.1f} MB)")
+
+        if total_bytes < 1024 ** 3:
+            total_str = f"{total_bytes / 1024 / 1024:.1f} MB"
+        else:
+            total_str = f"{total_bytes / 1024 ** 3:.2f} GB"
+        print(f"  Total: {len(training_tars)} tars, {total_train_samples:,} samples, {total_str}")
     else:
-        total_str = f"{total_bytes / 1024 ** 3:.2f} GB"
-    print(f"  Total: {len(training_tars)} tars, {total_train_samples:,} samples, {total_str}")
+        print(f"\n{' Per-Species Training Bins ':=^60}")
+        for sp_name in sorted(all_train_names):
+            bin_path = output_dir / sp_name / "training.bin"
+            if bin_path.exists():
+                n = ds.get_chunk_count(bin_path)
+                size = ds.format_size(bin_path.stat().st_size)
+                print(f"    {sp_name:30s} {n:>6,} samples  ({size})")
+        print(f"  Total: {total_train_samples:,} samples")
 
     # Validation merge from held-out species (still binary)
     validation_bins = sorted(
@@ -376,6 +395,33 @@ if args.train and (args.finalize or args.nnodes == 1):
             show_progress = True,
             max_chunks    = args.val_windows,
         )
+
+
+########################################
+#####  RAM Consolidation (--ram)   #####
+########################################
+
+
+if args.ram and args.train and (args.finalize or args.nnodes == 1):
+    import lib.data as ds
+
+    all_train_bins = sorted(
+        f for f in output_dir.glob("*/training.bin")
+        if f.parent.name not in (val_species_set or set())
+    )
+
+    if all_train_bins:
+        print(f"\n{' Consolidating to RAM Format ':=^60}")
+        ram_meta = ds.consolidate(all_train_bins, output_dir)
+
+        # Compress for easy upload
+        print(f"\n  Compressing for upload...")
+        try:
+            archive = ds.compress_dataset(output_dir)
+            print(f"  Archive: {archive}")
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            print(f"  Compression skipped (zstd not available): {e}")
+            print(f"  Upload with: rsync -Pz {output_dir}/ remote:/path/")
 
 
 #####################################
@@ -446,7 +492,7 @@ bake_config = {
     "train_species":        [name for name, _ in train_species],
     "heldout_species":      [name for name, _ in heldout_species],
     "eval_samples_generated": len(all_eval_samples),
-    "output_format":        "packed_tar" if args.packed else "tar",
+    "output_format":        "ram" if args.ram else ("packed_tar" if args.packed else "tar"),
     "total_train_samples":  total_train_samples,
 }
 
@@ -472,9 +518,18 @@ if args.train:
     import lib.data as ds
 
     merged_val = output_dir / "validation.bin"
+    tokens_bin = output_dir / "tokens.bin"
     tar_count  = len(list(output_dir.glob("*/*.tar")))
 
-    if tar_count > 0:
+    if args.ram and tokens_bin.exists():
+        meta_path = output_dir / "metadata.json"
+        if meta_path.exists():
+            with open(meta_path) as f:
+                ram_info = json.load(f)
+            size = ds.format_size(tokens_bin.stat().st_size)
+            print(f"  tokens.bin:      {ram_info['num_samples']:,} samples, "
+                  f"{ram_info['total_tokens']:,} tokens ({size})")
+    elif tar_count > 0:
         print(f"  training tars:   {tar_count} shards, {total_train_samples:,} samples")
 
     if merged_val.exists():

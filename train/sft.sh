@@ -153,16 +153,18 @@ fi
 
 
 NCCL_ENVS=(
-    "NCCL_DEBUG=INFO"
+    "NCCL_DEBUG=WARN"
     "NCCL_IB_HCA=${CX7_HCA:-rocep1s0f1}"
     "NCCL_IB_GID_INDEX=3"
     "NCCL_IB_TIMEOUT=23"
     "NCCL_IB_RETRY_CNT=13"
     "NCCL_IB_MERGE_NICS=0"
     "NCCL_CROSS_NIC=0"
-    "NCCL_MAX_NCHANNELS=4"
-    "NCCL_MIN_NCHANNELS=4"
-    "NCCL_BUFFSIZE=8388608"
+    "NCCL_ALGO=Ring"
+    "NCCL_PROTO=Simple"
+    "NCCL_MAX_NCHANNELS=8"
+    "NCCL_MIN_NCHANNELS=8"
+    "NCCL_BUFFSIZE=16777216"
     "NCCL_NET_GDR_LEVEL=0"
     "NCCL_NET_GDR_READ=0"
     "NCCL_TIMEOUT=300"
@@ -185,7 +187,7 @@ export TORCHINDUCTOR_CACHE_DIR="/workspace/.cache/torchinductor"
 export TORCHINDUCTOR_FX_GRAPH_CACHE=1
 # Auto-detect master code dir (same logic as worker detection)
 MASTER_CODE_DIR=""
-for d in /workspace/Code/GeneT5 /workspace/GeneT5; do
+for d in /workspace/code /workspace/Code/GeneT5 /workspace/GeneT5; do
     [ -f "$d/train/diffusion_finet" ] && MASTER_CODE_DIR="$d" && break
 done
 if [[ -z "$MASTER_CODE_DIR" ]]; then
@@ -276,7 +278,7 @@ if [[ -n "$WORKER_IP" ]]; then
             ;;
         *)
             echo "[worker] No container found, creating fresh (will pip install)..."
-            ${SSH_CMD} "cd /home/cg666/Code && bash start-worker.sh --daemon"
+            ${SSH_CMD} "bash /home/cg666/Code/GeneT5/init/gpu/start-gt5-worker.sh --daemon"
             echo "[worker] Waiting for pip install..."
             for i in $(seq 1 30); do
                 if ${SSH_CMD} "docker exec ${CONTAINER} python -c 'import liger_kernel' 2>/dev/null"; then
@@ -292,7 +294,7 @@ if [[ -n "$WORKER_IP" ]]; then
     esac
 
     # Detect GeneT5 code path on worker (differs from master mount layout)
-    WORKER_CODE_DIR=$(${SSH_CMD} "docker exec ${CONTAINER} bash -c 'for d in /workspace/Code/GeneT5 /workspace/GeneT5; do [ -f \$d/train/diffusion_finet ] && echo \$d && break; done'" 2>/dev/null)
+    WORKER_CODE_DIR=$(${SSH_CMD} "docker exec ${CONTAINER} bash -c 'for d in /workspace/code /workspace/Code/GeneT5 /workspace/GeneT5; do [ -f \$d/train/diffusion_finet ] && echo \$d && break; done'" 2>/dev/null)
     if [[ -z "$WORKER_CODE_DIR" ]]; then
         echo "ERROR: Cannot find GeneT5 code directory on worker"
         exit 1
@@ -443,7 +445,7 @@ if [[ -n "$WORKER_IP" ]]; then
     sleep 3
 
     # Tee all output to timestamped log (PYTHONUNBUFFERED=1 prevents buffer loss on crash)
-    LOG_DIR="/workspace/logs/GeneT5/sft"
+    LOG_DIR="/workspace/data/logs/sft"
     mkdir -p "$LOG_DIR"
     MASTER_LOG="${LOG_DIR}/$(date +%Y%m%d_%H%M%S).log"
     echo "[master] Launching locally..."

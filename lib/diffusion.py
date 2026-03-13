@@ -8,16 +8,52 @@ import torch
 ############################
 
 
-def cosine_mask_rate(t):
-    """Cosine schedule: mask_rate = 1 - cos(pi*t/2)"""
+def linear_mask_rate(t):
+    """Linear schedule: mask_rate = t (Dream 7B)"""
 
-    return 1.0 - torch.cos(t * math.pi / 2.0)
+    return t
 
 
-def mdlm_loss_weight(t):
-    """MDLM loss weight: (pi/2) * tan(pi*t/2), clamped"""
+def linear_loss_weight(t):
+    """ELBO weight for linear schedule: w(t) = 1/t, clamped"""
 
-    return (math.pi / 2.0) * torch.tan(t * math.pi / 2.0).clamp(max=10.0)
+    return (1.0 / t.clamp(min=1e-4)).clamp(max=20.0)
+
+
+############################
+#####  CART Reweight   #####
+############################
+
+
+def cart_weights(masked_ids, mask_token_id, cart_p=0.1):
+    """Context-Adaptive Reweighting at Token level (Dream 7B)
+
+    Masked tokens with more unmasked neighbors get higher weight
+    Geometric distance weighting: w_i = sum_j 1[j unmasked] * Geo(p, |i-j|-1)
+    """
+
+    is_clean = (masked_ids != mask_token_id).float()
+    L        = masked_ids.shape[-1]
+    device   = masked_ids.device
+
+    # Build geometric kernel: Geo(p, d-1) = p * (1-p)^(d-1) for d >= 1
+    dists  = torch.arange(L, device=device, dtype=torch.float32)
+    kernel = 0.5 * torch.exp(math.log(cart_p) + (dists.clamp(min=1) - 1) * math.log(1 - cart_p))
+    kernel[0] = 0.0
+
+    # Symmetric: context from left and right
+    # Convolve clean indicator with kernel
+    if is_clean.dim() == 2:
+        B = is_clean.shape[0]
+        k = torch.cat([kernel.flip(0), kernel[1:]])
+        k = k.unsqueeze(0).unsqueeze(0)
+        ctx = torch.nn.functional.conv1d(
+            is_clean.unsqueeze(1), k, padding=L - 1
+        ).squeeze(1)
+    else:
+        raise ValueError("Expected 2D input [B, L]")
+
+    return ctx.clamp(min=0.01)
 
 
 ############################
@@ -25,17 +61,22 @@ def mdlm_loss_weight(t):
 ############################
 
 
-def apply_diffusion_mask(target_ids, prefix_len, mask_token_id, pad_token_id):
-    """Apply MDLM-style random masking to target portion of input_ids"""
+def apply_diffusion_mask(target_ids, prefix_len, mask_token_id, pad_token_id,
+                         cart_p=0.0):
+    """Apply discrete diffusion masking to target portion of input_ids
+
+    Linear schedule with 1/t ELBO weight (Dream 7B style)
+    Optional CART per-token reweighting when cart_p > 0
+    """
 
     B, L   = target_ids.shape
     device = target_ids.device
 
-    # Sample timestep per sample
-    t         = torch.rand(B, device=device)
-    mask_rate = cosine_mask_rate(t)
+    # Sample timestep per sample, avoid t=0
+    t         = torch.rand(B, device=device).clamp(min=1e-4)
+    mask_rate = linear_mask_rate(t)
 
-    # Positions after prefix (broadcast-safe for int or tensor prefix_len)
+    # Positions after prefix
     pos          = torch.arange(L, device=device).unsqueeze(0)
     after_prefix = pos >= (prefix_len if isinstance(prefix_len, int)
                            else prefix_len.unsqueeze(1) if torch.is_tensor(prefix_len)
@@ -54,14 +95,20 @@ def apply_diffusion_mask(target_ids, prefix_len, mask_token_id, pad_token_id):
     masked_ids[selected] = mask_token_id
     labels[selected]     = target_ids[selected]
 
-    weights = mdlm_loss_weight(t)
+    # Sample-level ELBO weight
+    weights = linear_loss_weight(t)
+
+    # Per-token CART reweighting
+    if cart_p > 0:
+        token_w = cart_weights(masked_ids, mask_token_id, cart_p)
+        return masked_ids, labels, weights, token_w
 
     return masked_ids, labels, weights
 
 
 def apply_diffusion_mask_packed(input_ids, cu_seqlens, prefix_lens, num_real,
                                 mask_token_id, pad_token_id):
-    """MDLM masking for packed sequences — samples t per sub-sequence
+    """Diffusion masking for packed sequences — samples t per sub-sequence
 
     Fully vectorized: no .item() calls, no Python loops over segments
     """
@@ -70,26 +117,23 @@ def apply_diffusion_mask_packed(input_ids, cu_seqlens, prefix_lens, num_real,
     device   = input_ids.device
     N_real   = prefix_lens.shape[0]
 
-    t         = torch.rand(N_real, device=device)
-    mask_rate = cosine_mask_rate(t)
-    weights   = mdlm_loss_weight(t)
+    t         = torch.rand(N_real, device=device).clamp(min=1e-4)
+    mask_rate = linear_mask_rate(t)
+    weights   = linear_loss_weight(t)
 
     flat      = input_ids.reshape(-1)
     total_len = flat.shape[0]
 
     # Build real-segment start/end pairs from cu_seqlens and num_real
-    # Each row has num_real[b] real segs + 1 padding seg in cu_seqlens
-    # Real seg i in row b maps to cu_seqlens index = (cumsum of num_real before b) + b + local_j
     cum_nr     = torch.zeros(B + 1, dtype=torch.long, device=device)
     cum_nr[1:] = num_real.cumsum(0)
-    # row_id[i] = which row does real segment i belong to
     row_id       = torch.repeat_interleave(torch.arange(B, device=device), num_real.long())
     local_offset = torch.arange(N_real, device=device) - cum_nr[row_id]
     real_seg_idx = (cum_nr[row_id] + row_id + local_offset).long()
 
-    starts     = cu_seqlens[real_seg_idx]
-    ends       = cu_seqlens[real_seg_idx + 1]
-    seg_lens   = ends - starts
+    starts        = cu_seqlens[real_seg_idx]
+    ends          = cu_seqlens[real_seg_idx + 1]
+    seg_lens      = ends - starts
     target_starts = starts + prefix_lens
     target_lens   = ends - target_starts
 
@@ -99,7 +143,6 @@ def apply_diffusion_mask_packed(input_ids, cu_seqlens, prefix_lens, num_real,
     abs_pos    = target_starts.unsqueeze(1) + offsets
     valid_mask = offsets < target_lens.unsqueeze(1)
 
-    # Clamp for safe indexing, then mask
     abs_pos_clamped = abs_pos.clamp(max=total_len - 1)
     tokens_at_pos   = flat[abs_pos_clamped]
     not_pad         = (tokens_at_pos != pad_token_id) & valid_mask

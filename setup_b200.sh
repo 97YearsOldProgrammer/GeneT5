@@ -4,7 +4,6 @@
 # Container: nvcr.io/nvidia/pytorch:26.02-py3 (CUDA 13.1, PyTorch 2.11, Python 3.12)
 #
 # Attention cascade: FA4 > FA2 > SDPA  (FA3 is BLOCKED on Blackwell sm_100)
-# MoE cascade:       triton > grouped_mm > bmm
 #
 # Usage: bash setup_b200.sh [/path/to/network/volume]
 
@@ -89,9 +88,8 @@ if [ -d "${CODE_DIR}" ]; then
     add_env "PYTHONPATH" "${CODE_DIR}:\$PYTHONPATH"
 fi
 
-# B200 optimal backends
+# B200 optimal backend
 add_env "GENET5_ATTN_BACKEND" "auto"
-add_env "GENET5_MOE_BACKEND"  "auto"
 
 # PyTorch memory
 add_env "PYTORCH_CUDA_ALLOC_CONF" "expandable_segments:True,garbage_collection_threshold:0.8"
@@ -195,10 +193,8 @@ echo "=== Setup complete ==="
 echo ""
 echo "B200 optimal config:"
 echo "  Attention: FA4 (auto-detected) > FA2 > SDPA"
-echo "  MoE:       triton > grouped_mm > bmm"
 echo ""
 echo "  GENET5_ATTN_BACKEND=auto"
-echo "  GENET5_MOE_BACKEND=auto"
 echo ""
 echo "B200 vs H100 differences:"
 echo "  - FA3 is BLOCKED on B200 (sm_100 excluded)"

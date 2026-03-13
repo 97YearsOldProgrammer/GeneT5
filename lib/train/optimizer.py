@@ -132,7 +132,7 @@ class MuonE2E:
                 sched.load_state_dict(saved)
 
     def reset_momentum(self):
-        """Zero momentum buffers — prevents stale momentum from destabilizing MoE routers on resume"""
+        """Zero momentum buffers — prevents stale momentum from destabilizing on resume"""
 
         for buf in self._bufs_2d:
             buf.zero_()

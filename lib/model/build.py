@@ -6,103 +6,62 @@ import gc
 from transformers import AutoConfig
 from pathlib      import Path
 
-from lib.blocks         import Encoder
-from lib.tokenizer.hf   import GeneTokenizer
+from lib.blocks       import Encoder
+from lib.tokenizer.hf import GeneTokenizer
 
 
-UPCYCLE_NOISE_STD  = 0.001   # symmetry-breaking noise on tiled copies
-UPCYCLE_FRESH_STD  = 0.06    # random init for fresh experts
-UPCYCLE_ROUTER_STD = 0.001   # near-zero router init
-NUM_TILES          = 3       # each base chunk tiled 3x (2 chunks × 3 = 6 base experts)
-NUM_FRESH          = 2       # randomly initialized experts
+def _transfer_layer(layer, sd, prefix):
+    """Transfer DNABERT-2 weights into an EncoderBlock"""
+
+    # Self-attention: Q/K/V from fused Wqkv
+    Wqkv            = sd[f"{prefix}.attention.self.Wqkv.weight"]
+    q_w, k_w, v_w   = Wqkv.chunk(3, dim=0)
+    layer.self_attn.q.weight.data.copy_(q_w)
+    layer.self_attn.k.weight.data.copy_(k_w)
+    layer.self_attn.v.weight.data.copy_(v_w)
+
+    # Output projection
+    layer.self_attn.o.weight.data.copy_(sd[f"{prefix}.attention.output.dense.weight"])
+
+    # Post-attention LayerNorm
+    layer.norm1.weight.data.copy_(sd[f"{prefix}.attention.output.LayerNorm.weight"])
+
+    # FFN weights
+    gated        = sd[f"{prefix}.mlp.gated_layers.weight"]
+    gate_w, up_w = gated.chunk(2, dim=0)
+    down_w       = sd[f"{prefix}.mlp.wo.weight"]
+    layer.ff.wi_0.weight.data.copy_(gate_w)
+    layer.ff.wi_1.weight.data.copy_(up_w)
+    layer.ff.wo.weight.data.copy_(down_w)
+
+    # FFN norm
+    layer.norm2.weight.data.copy_(sd[f"{prefix}.mlp.layernorm.weight"])
 
 
-def _upcycle_moe_layer(layer, sd, prefix, ff_dim, num_experts, init_std):
-    """Upcycle dense DNABERT-2 FFN into MoE experts
+def _zero_init_outputs(layer):
+    """Zero output projections so layer acts as identity through residual"""
 
-    Splits dense [3072] FFN into 2 chunks of [1536], tiles each 3x = 6 base experts
-    with symmetry-breaking noise on copies, plus 2 fresh random experts
-    """
+    nn.init.zeros_(layer.self_attn.o.weight)
+    nn.init.zeros_(layer.ff.wo.weight)
 
-    gated        = sd[f"{prefix}.mlp.gated_layers.weight"]   # [6144, 768]
-    gate_w, up_w = gated.chunk(2, dim=0)                     # each [3072, 768]
-    down_w       = sd[f"{prefix}.mlp.wo.weight"]             # [768, 3072]
-
-    dense_ff  = gate_w.shape[0]                              # 3072
-    num_base  = dense_ff // ff_dim                           # 3072 // 1536 = 2
-
-    # Transpose to match MoE layout: MoE does x @ W, so W is [embed_dim, ff_dim]
-    gate_wT = gate_w.T     # [768, 3072]
-    up_wT   = up_w.T       # [768, 3072]
-    down_wT = down_w.T     # [3072, 768]
-
-    # Slice into 2 base chunks
-    base_gate_up = []
-    base_down    = []
-    for i in range(num_base):
-        s  = i * ff_dim
-        e  = s + ff_dim
-        gu = torch.cat([gate_wT[:, s:e], up_wT[:, s:e]], dim=1)   # [768, 2*ff_dim]
-        base_gate_up.append(gu)
-        base_down.append(down_wT[s:e, :].clone())                 # [ff_dim, 768]
-
-    gate_up_all = layer.ff.expert_weights.gate_up_weights.data     # [E, 768, 2*ff_dim]
-    down_all    = layer.ff.expert_weights.down_weights.data        # [E, ff_dim, 768]
-
-    # Tile each base chunk 3x = 6 base experts, noise on copies 2 and 3
-    num_tiled = num_base * NUM_TILES
-    for slot in range(num_tiled):
-        base_idx = slot % num_base
-        tile_num = slot // num_base
-
-        gate_up_all[slot].copy_(base_gate_up[base_idx])
-        down_all[slot].copy_(base_down[base_idx])
-
-        if tile_num > 0:
-            gate_up_all[slot].add_(torch.randn_like(gate_up_all[slot]) * UPCYCLE_NOISE_STD)
-            down_all[slot].add_(torch.randn_like(down_all[slot]) * UPCYCLE_NOISE_STD)
-
-    # Fresh random experts
-    for slot in range(num_tiled, num_experts):
-        nn.init.normal_(gate_up_all[slot], std=UPCYCLE_FRESH_STD)
-        nn.init.normal_(down_all[slot], std=UPCYCLE_FRESH_STD)
-
-    # Router: near-zero so early training approximates dense behavior
-    nn.init.normal_(layer.ff.gate.weight, std=UPCYCLE_ROUTER_STD)
-
-
-DEFAULTS = {
-    "dropout":      0.1,
-    "use_moe":      True,
-    "num_experts":  8,
-    "moe_top_k":    2,
-    "init_std":     0.006,
-}
 
 def build_gt5(
     dnabert_model_name  = "zhihan1996/DNABERT-2-117M",
     save_dir            = "./checkpoints/genet5_init",
-    # Architecture
     num_layers          = None,
     num_heads           = None,
     ff_dim              = None,
-    dropout             = DEFAULTS["dropout"],
-    use_moe             = DEFAULTS["use_moe"],
-    moe_layers          = None,
-    num_experts         = DEFAULTS["num_experts"],
-    moe_top_k           = DEFAULTS["moe_top_k"],
-    # Vocab
+    dropout             = 0.1,
     vocab_size          = None,
     tie_weights         = True,
-    # Init
-    init_std            = DEFAULTS["init_std"],
+    init_std            = 0.006,
+    depth_scaling       = False,
 ):
-    """Build GeneT5 from DNABERT-2 and save clean checkpoint"""
+    """Build GeneT5 from DNABERT-2 with optional G_stack depth upscaling"""
 
     print("=" * 60)
     print("Building GeneT5 from DNABERT-2")
     print("=" * 60)
-    print(f"\nInit std: {init_std}")
 
     # Build tokenizer
     print(f"\n[1] Building tokenizer from DNABERT-2: {dnabert_model_name}")
@@ -115,29 +74,23 @@ def build_gt5(
     # Load DNABERT-2 config
     dna_config = AutoConfig.from_pretrained(dnabert_model_name, trust_remote_code=True)
 
+    dna_num_layers = dna_config.num_hidden_layers
     if num_layers is None:
-        num_layers = dna_config.num_hidden_layers
+        num_layers = dna_num_layers
     if num_heads is None:
         num_heads = dna_config.num_attention_heads
     if ff_dim is None:
         ff_dim = dna_config.intermediate_size
 
-    embed_dim       = dna_config.hidden_size
-    dna_num_layers  = dna_config.num_hidden_layers
-
-    # Determine MoE layer set for display
-    if moe_layers is not None:
-        moe_set = set(moe_layers)
-    elif use_moe:
-        moe_set = set(range(num_layers))
-    else:
-        moe_set = set()
+    embed_dim = dna_config.hidden_size
+    g_stack   = num_layers > dna_num_layers
 
     print(f"\n    DNABERT-2: hidden={embed_dim}, layers={dna_num_layers}, heads={dna_config.num_attention_heads}")
-    if moe_layers is not None:
-        print(f"    GeneT5:    layers={num_layers}, heads={num_heads}, moe_layers={sorted(moe_set)}, experts={num_experts}, ff_dim={ff_dim}")
-    else:
-        print(f"    GeneT5:    layers={num_layers}, heads={num_heads}, moe={use_moe}, experts={num_experts}, ff_dim={ff_dim}")
+    print(f"    GeneT5:    layers={num_layers}, heads={num_heads}, ff_dim={ff_dim}")
+    if g_stack:
+        print(f"    G_stack:   {dna_num_layers} → {num_layers} (duplicate + zero-init outputs)")
+    if depth_scaling:
+        print(f"    LayerNorm Scaling: residual *= 1/sqrt(depth)")
 
     # Load raw state dict
     print(f"\n[2] Loading DNABERT-2 weights")
@@ -148,7 +101,7 @@ def build_gt5(
 
     # Build embedding
     print(f"\n[3] Building Embedding")
-    embed     = nn.Embedding(vocab_size, embed_dim)
+    embed      = nn.Embedding(vocab_size, embed_dim)
     orig_embed = sd["bert.embeddings.word_embeddings.weight"]
     copy_size  = min(orig_embed.shape[0], vocab_size)
     embed.weight.data[:copy_size].copy_(orig_embed[:copy_size])
@@ -157,70 +110,39 @@ def build_gt5(
     print(f"    copied {copy_size}, random init {max(0, vocab_size - copy_size)} new")
 
     # Build encoder stack
-    print(f"\n[4] Building Encoder Stack")
-    # Dense layers keep DNABERT-2's full FFN dim when using selective MoE
-    dense_ff_dim = dna_config.intermediate_size if moe_layers is not None else None
-
+    print(f"\n[4] Building Encoder Stack ({num_layers} layers)")
     encoder = Encoder(
-        num_layers   = num_layers,
-        embed_dim    = embed_dim,
-        num_heads    = num_heads,
-        ff_dim       = ff_dim,
-        dense_ff_dim = dense_ff_dim,
-        dropout      = dropout,
-        attn_dropout = dropout,
-        use_moe      = use_moe,
-        moe_layers   = moe_layers,
-        num_experts  = num_experts,
-        moe_top_k    = moe_top_k,
+        num_layers    = num_layers,
+        embed_dim     = embed_dim,
+        num_heads     = num_heads,
+        ff_dim        = ff_dim,
+        dropout       = dropout,
+        attn_dropout  = dropout,
+        depth_scaling = depth_scaling,
     )
 
-    # Transfer weights from DNABERT-2
-    print(f"\n[5] Transferring DNABERT-2 weights to encoder")
-    num_copy = min(num_layers, dna_num_layers)
-    for idx in range(num_copy):
-        layer  = encoder.layers[idx]
-        prefix = f"bert.encoder.layer.{idx}"
+    # Transfer DNABERT-2 weights
+    print(f"\n[5] Transferring weights")
+    for idx in range(min(num_layers, dna_num_layers)):
+        src_idx = idx
+        prefix  = f"bert.encoder.layer.{src_idx}"
+        _transfer_layer(encoder.layers[idx], sd, prefix)
 
-        # Self-attention: Q/K/V from fused Wqkv
-        Wqkv            = sd[f"{prefix}.attention.self.Wqkv.weight"]
-        q_w, k_w, v_w   = Wqkv.chunk(3, dim=0)
-        layer.self_attn.q.weight.data.copy_(q_w)
-        layer.self_attn.k.weight.data.copy_(k_w)
-        layer.self_attn.v.weight.data.copy_(v_w)
-
-        # Output projection
-        layer.self_attn.o.weight.data.copy_(sd[f"{prefix}.attention.output.dense.weight"])
-
-        # Post-attention LayerNorm
-        layer.norm1.weight.data.copy_(sd[f"{prefix}.attention.output.LayerNorm.weight"])
-
-        # FFN weights: MoE upcycle or dense copy per layer
-        if layer.use_moe:
-            _upcycle_moe_layer(layer, sd, prefix, ff_dim, num_experts, init_std)
-        else:
-            gated        = sd[f"{prefix}.mlp.gated_layers.weight"]
-            gate_w, up_w = gated.chunk(2, dim=0)
-            down_w       = sd[f"{prefix}.mlp.wo.weight"]
-            layer.ff.wi_0.weight.data.copy_(gate_w)
-            layer.ff.wi_1.weight.data.copy_(up_w)
-            layer.ff.wo.weight.data.copy_(down_w)
-
-        # FFN norm
-        layer.norm2.weight.data.copy_(sd[f"{prefix}.mlp.layernorm.weight"])
+    # G_stack: duplicate layers beyond base, zero-init outputs
+    if g_stack:
+        print(f"    Layers 0-{dna_num_layers-1}: direct DNABERT-2 transfer")
+        num_new = 0
+        for idx in range(dna_num_layers, num_layers):
+            src_idx = idx % dna_num_layers
+            prefix  = f"bert.encoder.layer.{src_idx}"
+            _transfer_layer(encoder.layers[idx], sd, prefix)
+            _zero_init_outputs(encoder.layers[idx])
+            num_new += 1
+        print(f"    Layers {dna_num_layers}-{num_layers-1}: duplicated from 0-{dna_num_layers-1}, outputs zeroed ({num_new} new)")
+    else:
+        print(f"    transferred {min(num_layers, dna_num_layers)} layers")
 
     nn.init.ones_(encoder.final_norm.weight)
-    num_moe   = sum(1 for l in encoder.layers if l.use_moe)
-    num_dense = num_layers - num_moe
-    if num_moe > 0:
-        num_base = 3072 // ff_dim
-        print(f"    transferred {num_copy} layers (self-attn + norms from DNABERT-2)")
-        print(f"    {num_moe} MoE layers, {num_dense} dense layers")
-        print(f"    MoE upcycled: {num_base} chunks × {NUM_TILES} tiles = "
-              f"{num_base * NUM_TILES} base experts (noise std={UPCYCLE_NOISE_STD}), "
-              f"{NUM_FRESH} fresh (std={UPCYCLE_FRESH_STD})")
-    else:
-        print(f"    transferred {num_copy} layers (self-attn + FFN + norms from DNABERT-2)")
 
     del sd
     gc.collect()
@@ -242,18 +164,15 @@ def build_gt5(
     save_path.mkdir(parents=True, exist_ok=True)
 
     config = {
-        "embed_dim":    embed_dim,
-        "num_layers":   num_layers,
-        "num_heads":    num_heads,
-        "ff_dim":       ff_dim,
-        "dense_ff_dim": dense_ff_dim,
-        "dropout":      dropout,
-        "use_moe":      use_moe,
-        "moe_layers":   moe_layers,
-        "num_experts":  num_experts,
-        "moe_top_k":    moe_top_k,
-        "vocab_size":   vocab_size,
-        "tie_weights":  tie_weights,
+        "embed_dim":     embed_dim,
+        "num_layers":    num_layers,
+        "num_heads":     num_heads,
+        "ff_dim":        ff_dim,
+        "dropout":       dropout,
+        "vocab_size":    vocab_size,
+        "tie_weights":   tie_weights,
+        "depth_scaling": depth_scaling,
+        "base_layers":   dna_num_layers,
     }
 
     with open(save_path / "config.json", "w") as f:
@@ -274,7 +193,9 @@ def build_gt5(
     total_params += sum(p.numel() for p in lm_head.parameters())
 
     print("\n" + "=" * 60)
-    print(f"GeneT5 Built: {total_params:,} params")
+    print(f"GeneT5 Built: {total_params:,} params ({num_layers}L, {embed_dim}d)")
+    if g_stack:
+        print(f"  G_stack: {dna_num_layers}→{num_layers} layers, new layer outputs zeroed")
     print(f"  Saved to: {save_path}")
     print("=" * 60)
 

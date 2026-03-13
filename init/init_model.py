@@ -5,34 +5,28 @@ from lib.model.build import build_gt5
 
 parser = argparse.ArgumentParser(
     description="Initialize GeneT5 weights from DNABERT-2 and save to disk.")
-parser.add_argument("--save_dir", type=str, default="/workspace/model/GeneT5/init/init_moe8_top2_ff1536",
+parser.add_argument("--save_dir", type=str, default="model/init_dense_24L",
     help="Directory to save the initialized model weights and config.")
 parser.add_argument("--dnabert_path", type=str, default="zhihan1996/DNABERT-2-117M",
     help="HuggingFace model ID or local path to DNABERT-2.")
-parser.add_argument("--layers", type=int, default=None,
-    help="Number of encoder layers. Defaults to matching DNABERT-2.")
+parser.add_argument("--layers", type=int, default=24,
+    help="Number of encoder layers (>12 triggers G_stack from DNABERT-2 12L).")
 parser.add_argument("--heads", type=int, default=None,
     help="Number of attention heads. Defaults to matching DNABERT-2.")
-parser.add_argument("--ff_dim", type=int, default=1536,
-    help="Feed-forward dimension per expert.")
+parser.add_argument("--ff_dim", type=int, default=None,
+    help="Feed-forward dimension. Defaults to matching DNABERT-2.")
 parser.add_argument("--dropout", type=float, default=0.1,
     help="Dropout rate.")
 parser.add_argument("--tie_weights", action="store_true", default=True,
     help="Tie input/output embeddings.")
 parser.add_argument("--no_tie_weights", action="store_false", dest="tie_weights",
     help="Do not tie input/output embeddings.")
-parser.add_argument("--use_moe", action="store_true", default=True,
-    help="Enable Mixture of Experts.")
-parser.add_argument("--no_moe", action="store_false", dest="use_moe",
-    help="Disable Mixture of Experts.")
-parser.add_argument("--moe_layers", type=int, nargs="+", default=None,
-    help="Layer indices for MoE (e.g. 6 7 8 9 10 11). Default: all layers.")
-parser.add_argument("--num_experts", type=int, default=8,
-    help="Number of experts for MoE.")
-parser.add_argument("--moe_top_k", type=int, default=2,
-    help="Top-K routing for MoE.")
+parser.add_argument("--depth_scaling", action="store_true", default=True,
+    help="LayerNorm Scaling: residual *= 1/sqrt(depth) to prevent curse of depth.")
+parser.add_argument("--no_depth_scaling", action="store_false", dest="depth_scaling",
+    help="Disable LayerNorm Scaling.")
 parser.add_argument("--init_std", type=float, default=0.006,
-    help="Standard deviation for all random init (DeepSeek).")
+    help="Standard deviation for random init.")
 
 args = parser.parse_args()
 
@@ -45,12 +39,9 @@ saved_path = build_gt5(
     num_heads           = args.heads,
     ff_dim              = args.ff_dim,
     dropout             = args.dropout,
-    use_moe             = args.use_moe,
-    moe_layers          = args.moe_layers,
-    num_experts         = args.num_experts,
-    moe_top_k           = args.moe_top_k,
     tie_weights         = args.tie_weights,
     init_std            = args.init_std,
+    depth_scaling       = args.depth_scaling,
 )
 
 print(f"\nSUCCESS: Model initialized and saved to:")

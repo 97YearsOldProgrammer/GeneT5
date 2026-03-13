@@ -62,7 +62,7 @@ if [[ -z "$WORKER_IP" ]]; then
     echo "Example:"
     echo "  train/bake.sh --worker 192.168.100.11 \\"
     echo "      ../raw \\"
-    echo "      --tokenizer ../model/GeneT5/init/init_diffusion_moe16 \\"
+    echo "      --tokenizer ../model/GeneT5/init/init_dense_24L \\"
     echo "      --output_dir ../baked/GeneT5/mar06_s51_w20k_p18k \\"
     echo "      --window_size 20000 \\"
     echo "      --packed --pack_seq_len 18432 \\"
@@ -98,7 +98,7 @@ case "$WORKER_STATE" in
         ;;
     *)
         echo "[node 1] No container found, creating fresh (will pip install)..."
-        ${SSH_CMD} "cd /home/cg666/Code && bash start-worker.sh --daemon"
+        ${SSH_CMD} "bash /home/cg666/Code/GeneT5/init/gpu/start-gt5-worker.sh --daemon"
         echo "[node 1] Waiting for pip install..."
         for i in $(seq 1 30); do
             if ${SSH_CMD} "docker exec ${CONTAINER} python -c 'import liger_kernel' 2>/dev/null"; then
@@ -114,7 +114,7 @@ case "$WORKER_STATE" in
 esac
 
 # Detect GeneT5 code path on worker (differs from master mount layout)
-WORKER_CODE_DIR=$(${SSH_CMD} "docker exec ${CONTAINER} bash -c 'for d in /workspace/Code/GeneT5 /workspace/GeneT5; do [ -f \$d/train/bake_data ] && echo \$d && break; done'" 2>/dev/null)
+WORKER_CODE_DIR=$(${SSH_CMD} "docker exec ${CONTAINER} bash -c 'for d in /workspace/code /workspace/Code/GeneT5 /workspace/GeneT5; do [ -f \$d/train/bake_data ] && echo \$d && break; done'" 2>/dev/null)
 if [[ -z "$WORKER_CODE_DIR" ]]; then
     echo "ERROR: Cannot find GeneT5 code directory on worker"
     exit 1
@@ -127,7 +127,7 @@ ${SSH_CMD} "docker exec ${CONTAINER} pip install -q -r ${WORKER_CODE_DIR}/requir
 
 # Auto-detect master code dir
 MASTER_CODE_DIR=""
-for d in /workspace/Code/GeneT5 /workspace/GeneT5; do
+for d in /workspace/code /workspace/Code/GeneT5 /workspace/GeneT5; do
     [ -f "$d/train/bake_data" ] && MASTER_CODE_DIR="$d" && break
 done
 if [[ -z "$MASTER_CODE_DIR" ]]; then

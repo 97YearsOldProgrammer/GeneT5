@@ -224,7 +224,7 @@ def build_parser():
     parser.add_argument('--fused_norm', action='store_true',
         help='use fused residual-add + RMSNorm in encoder')
     parser.add_argument('--freeze_base', action='store_true',
-        help='freeze pretrained base, only train MoE + embed/head')
+        help='freeze pretrained base, only train embed/head')
     return parser
 
 
@@ -269,22 +269,37 @@ def main():
     with open(bake_cfg) as f:
         cfg = json.load(f)
 
-    species_list = cfg.get("train_species", [])
-    total_train  = cfg.get("total_train_samples", 0)
-    shard_urls   = []
-    for sp in species_list:
-        sp_tars = sorted(glob.glob(str(data_dir / sp / "*.tar")))
-        shard_urls.extend(sp_tars)
+    output_format = cfg.get("output_format", "tar")
+    is_ram        = output_format == "ram" or (data_dir / "tokens.bin").exists()
+    species_list  = cfg.get("train_species", [])
+    total_train   = cfg.get("total_train_samples", 0)
 
-    if not shard_urls:
-        if is_main:
-            print(f"\nERROR: No .tar training shards found in {data_dir}")
-        if is_dist:
-            train_util.cleanup_distributed()
-        return
+    if is_ram:
+        meta_path = data_dir / "metadata.json"
+        if meta_path.exists():
+            with open(meta_path) as f:
+                ram_meta    = json.load(f)
+            total_train = ram_meta["num_samples"]
+        shard_urls = []
+    else:
+        shard_urls = []
+        for sp in species_list:
+            sp_tars = sorted(glob.glob(str(data_dir / sp / "*.tar")))
+            shard_urls.extend(sp_tars)
+
+        if not shard_urls:
+            if is_main:
+                print(f"\nERROR: No .tar training shards found in {data_dir}")
+            if is_dist:
+                train_util.cleanup_distributed()
+            return
 
     if is_main:
-        print(f"\n  Training tars:    {len(shard_urls)} shards, {total_train:,} samples")
+        if is_ram:
+            tokens_size = ds.format_size((data_dir / "tokens.bin").stat().st_size)
+            print(f"\n  Training data:    RAM format, {total_train:,} samples ({tokens_size})")
+        else:
+            print(f"\n  Training tars:    {len(shard_urls)} shards, {total_train:,} samples")
 
     has_val = val_bin.exists()
 
@@ -342,9 +357,9 @@ def main():
             _cu[2*_b + 1] = (_b + 1) * pack_seq
             _cu[2*_b + 2] = (_b + 1) * pack_seq
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            _y, _moe = model.encoder(_x, _cu, pack_seq)
+            _y = model.encoder(_x, _cu, pack_seq)
         _y.sum().backward()
-        del _x, _y, _moe, _cu
+        del _x, _y, _cu
         model.zero_grad(set_to_none=True)
         torch.cuda.empty_cache()
         model.to('cpu')
@@ -352,9 +367,14 @@ def main():
             print(f"done ({time.time() - _t0:.0f}s)")
 
     model = train_util.wrap_model_distributed(
-        model, device, find_unused_params=False, static_graph=False,
-        bucket_cap_mb=100,
+        model, device, find_unused_params=False, static_graph=True,
+        bucket_cap_mb=50,
     )
+
+    # BF16 compress hook: halves allreduce volume (lossless for bf16 training)
+    if is_dist:
+        from torch.distributed.algorithms.ddp_comm_hooks import default as ddp_hooks
+        model.register_comm_hook(state=None, hook=ddp_hooks.bf16_compress_hook)
 
     raw_model = train_util.unwrap_model(model)
     stats     = raw_model.get_param_stats()
@@ -374,11 +394,38 @@ def main():
         val_dataset = ds.BinaryTrainDataset(str(val_bin), tokenizer, args.seed)
 
     if is_main:
-        print(f"  Train: {total_train:,} samples ({'packed' if is_packed else 'unpacked'})")
+        fmt_str = "ram" if is_ram else ("packed" if is_packed else "unpacked")
+        print(f"  Train: {total_train:,} samples ({fmt_str})")
         if val_dataset:
             print(f"  Val:   {len(val_dataset):,}")
 
-    if is_packed:
+    if is_ram:
+        # RAM format: RamDataset + TokenBudgetSampler + DiffusionCollator
+        train_dataset = ds.RamDataset(data_dir)
+        collator      = DiffusionCollator(tokenizer.pad_token_id, max_seq_len=ds.DEFAULT_MAX_SEQ)
+        budget        = args.batch_size * ds.BUDGET_SEQ
+
+        sampler = ds.TokenBudgetSampler(
+            train_dataset.get_lengths(), budget,
+            max_batch  = args.batch_size,
+            seed       = args.seed,
+            rank       = int(os.environ.get("RANK", 0)),
+            world_size = world_size,
+        )
+
+        mp_ctx = "forkserver" if args.compile and args.num_workers > 0 else None
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_sampler           = sampler,
+            collate_fn              = collator,
+            num_workers             = args.num_workers,
+            pin_memory              = not args.no_pin_memory,
+            persistent_workers      = persistent,
+            multiprocessing_context = mp_ctx,
+        )
+        batches_per_epoch = len(sampler)
+
+    elif is_packed:
         # Packed pipeline: fixed-length sequences, no token budget batcher
         # warn_and_continue: skip transient I/O errors from FUSE network storage
         train_dataset = (
@@ -489,7 +536,7 @@ def main():
 
         if is_main:
             print(f"  Resumed: epoch={start_epoch}, global_step={global_step}")
-            print(f"  Momentum buffers reset (prevents MoE router destabilization)")
+            print(f"  Momentum buffers reset")
 
     # Save config
     if is_main:
@@ -580,6 +627,8 @@ def main():
             print(f"\nEpoch {epoch + 1}/{args.epochs}")
             print('-' * 40)
 
+        if is_ram:
+            sampler.set_epoch(epoch)
         if val_dist_sampler:
             val_dist_sampler.set_epoch(epoch)
         if val_dataset:
@@ -691,9 +740,6 @@ def main():
                         per_sample_loss = per_token_2d.sum(dim=-1) / counts
                         loss            = (per_sample_loss * weights).mean()
 
-                    if outputs.get('moe_loss') is not None:
-                        loss = loss + outputs['moe_loss']
-
                     loss = loss / args.grad_accum
                     del per_token
 
@@ -714,12 +760,6 @@ def main():
                     batch_per_sec = (step + 1) / elapsed if elapsed > 0 else 0
                     avg_loss      = (total_train_loss / (step + 1)).item()
 
-                    # Collect per-expert token distribution
-                    raw_model   = model.module if hasattr(model, 'module') else model
-                    expert_frac = raw_model.get_expert_frac()
-                    if expert_frac is not None:
-                        expert_frac = expert_frac.tolist()
-
                     train_logger.log_step(
                         epoch         = epoch + 1,
                         global_step   = global_step,
@@ -728,7 +768,6 @@ def main():
                         loss          = avg_loss,
                         lr            = optimizer.get_last_lr()[0],
                         batch_per_sec = batch_per_sec,
-                        expert_frac   = expert_frac,
                     )
 
                 if args.save_steps and global_step % args.save_steps == 0:

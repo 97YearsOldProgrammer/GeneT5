@@ -9,7 +9,7 @@
 # Examples:
 #   bash train/run_b200.sh /workspace/baked/GeneT5/mar06_s51_w20k_p18k \
 #       /workspace/model/GeneT5/mar10_b200_t1 \
-#       /workspace/model/GeneT5/init/init_moe16_topk2_last8 \
+#       /workspace/model/GeneT5/init/init_dense_24L \
 #       --epochs 3 --batch_size 8 --grad_accum 32 --lr 1e-4 --compile --fused_ce
 #
 #   tmux attach -t sft         # reattach to running session
@@ -36,7 +36,7 @@ EXTRA_ARGS="$*"
 
 # Auto-detect code directory
 CODE_DIR=""
-for d in /workspace/GeneT5 /workspace/Code/GeneT5; do
+for d in /workspace/code /workspace/GeneT5 /workspace/Code/GeneT5; do
     [ -f "$d/train/diffusion_finet" ] && CODE_DIR="$d" && break
 done
 if [ -z "$CODE_DIR" ]; then
@@ -70,7 +70,7 @@ fi
 mkdir -p "$OUTPUT_DIR"
 
 # Log file
-LOG_DIR="/workspace/logs/GeneT5/sft"
+LOG_DIR="/workspace/data/logs/sft"
 mkdir -p "$LOG_DIR"
 LOG_FILE="${LOG_DIR}/$(date +%Y%m%d_%H%M%S)_b200.log"
 
@@ -81,7 +81,6 @@ export PYTHONUNBUFFERED=1
 export PYTORCH_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.9,max_split_size_mb:512
 export CUDA_MODULE_LOADING=LAZY
 export GENET5_ATTN_BACKEND=auto
-export GENET5_MOE_BACKEND=auto
 export TRITON_CACHE_DIR=/workspace/.cache/triton
 export TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
 export TORCHINDUCTOR_FX_GRAPH_CACHE=1
