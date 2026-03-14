@@ -3,6 +3,7 @@
 import argparse
 import glob
 import json
+import math
 import os
 import signal
 import sys
@@ -24,6 +25,7 @@ import lib.util         as util
 import lib.train        as train_util
 import lib.diffusion    as diffusion
 from lib.train.optimizer import create_optimizer
+from lib.train.debug      import check_nan, check_rank_health, grad_stats, format_debug_line
 from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
 from liger_kernel.transformers.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
 
@@ -225,6 +227,8 @@ def build_parser():
         help='use fused residual-add + RMSNorm in encoder')
     parser.add_argument('--freeze_base', action='store_true',
         help='freeze pretrained base, only train embed/head')
+    parser.add_argument('--debug', action='store_true',
+        help='enable debug mode: NaN checks, grad stats, batch dump on crash')
     return parser
 
 
@@ -249,6 +253,7 @@ def main():
         print(f"Distributed: {dist_info['world_size']} nodes, rank {dist_info['rank']}")
 
     device = train_util.get_device()
+
     if is_main:
         print(f"Device: {device}")
 
@@ -367,7 +372,7 @@ def main():
             print(f"done ({time.time() - _t0:.0f}s)")
 
     model = train_util.wrap_model_distributed(
-        model, device, find_unused_params=False, static_graph=True,
+        model, device, find_unused_params=False, static_graph=False,
         bucket_cap_mb=50,
     )
 
@@ -564,6 +569,16 @@ def main():
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT,  _signal_handler)
 
+    # Debug mode setup
+    if args.debug:
+        os.environ['NCCL_ASYNC_ERROR_HANDLING'] = '1'
+        if is_main:
+            print(f"\n  DEBUG MODE ENABLED")
+            print(f"    NaN checks: every step (always on)")
+            print(f"    Grad stats: every {args.log_every_steps} steps")
+            print(f"    Batch dump on crash: {output_dir}")
+            print(f"    NCCL async error handling: ON")
+
     # Training loop
     if is_main:
         print(f"\n{'=' * 60}")
@@ -744,28 +759,72 @@ def main():
                     del per_token
 
                 loss.backward()
-                loss_val = loss.detach()
+                loss_val   = loss.detach()
+                loss_float = loss_val.item() * args.grad_accum
 
-            del outputs, loss, batch, masked_ids, labels, weights
+            # NaN check — always on, ~0 overhead (one .item() already done)
+            _cur_batch_ref = batch
+            if check_nan(loss_float, step, epoch, rank_id,
+                         flight_file, _cur_batch_ref, output_dir):
+                if is_dist:
+                    check_rank_health(loss_float, device, step, rank_id)
+                print(f"[rank {rank_id}] ABORTING — NaN at epoch {epoch+1} step {step}",
+                      flush=True)
+                if is_dist:
+                    train_util.cleanup_distributed()
+                sys.exit(1)
+
+            del outputs, loss, _cur_batch_ref, masked_ids, labels, weights
 
             if (step + 1) % args.grad_accum == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                gnorm_val = gnorm.item() if torch.is_tensor(gnorm) else gnorm
+
+                # Grad NaN check
+                if math.isnan(gnorm_val) or math.isinf(gnorm_val):
+                    ginfo = grad_stats(raw_model)
+                    print(f"\n[rank {rank_id}] GRAD NaN at step {step}! "
+                          f"nan_params={ginfo['nan_params'][:5]}", flush=True)
+                    if flight_file:
+                        flight_file.write(f'{{"CRASH":"grad_nan","s":{step},'
+                                          f'"gnorm":{gnorm_val},'
+                                          f'"nan_params":{json.dumps(ginfo["nan_params"][:5])}}}\n')
+                        flight_file.flush()
+                    if is_dist:
+                        train_util.cleanup_distributed()
+                    sys.exit(1)
+
+                # Capture detailed grad stats BEFORE optimizer zeroes them
+                _debug_ginfo = None
+                if args.debug and is_main and (global_step + 1) % args.log_every_steps == 0:
+                    _debug_ginfo = grad_stats(raw_model)
+
                 optimizer.step()
                 optimizer.step_schedulers()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
+                # Flight recorder: loss + grad norm per optimizer step
+                if flight_file and global_step % 10 == 0:
+                    flight_file.write(f'{{"opt":{global_step},"t":{int(time.time())},'
+                                      f'"loss":{loss_float:.6f},"gnorm":{gnorm_val:.4f}}}\n')
+                    flight_file.flush()
+
+                # Debug mode: detailed stats every log interval
+                if _debug_ginfo is not None:
+                    print(f"  [debug] {format_debug_line(global_step, loss_float, _debug_ginfo['grad_norm'], _debug_ginfo['grad_max'], _debug_ginfo['nan_params'])}",
+                          flush=True)
+
                 if train_logger and global_step % args.log_every_steps == 0 and global_step > 0:
                     elapsed       = time.time() - epoch_start_time
                     batch_per_sec = (step + 1) / elapsed if elapsed > 0 else 0
-                    avg_loss      = (total_train_loss / (step + 1)).item()
 
                     train_logger.log_step(
                         epoch         = epoch + 1,
                         global_step   = global_step,
                         batch         = step + 1,
                         num_batches   = num_batches,
-                        loss          = avg_loss,
+                        loss          = loss_float,
                         lr            = optimizer.get_last_lr()[0],
                         batch_per_sec = batch_per_sec,
                     )
@@ -783,6 +842,7 @@ def main():
                 if args.empty_cache_steps and global_step % args.empty_cache_steps == 0:
                     torch.cuda.empty_cache()
 
+            del batch
             total_train_loss += loss_val
 
         train_loss = (total_train_loss / max(num_batches, 1)).item()

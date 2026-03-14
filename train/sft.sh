@@ -184,7 +184,8 @@ export PYTHONUNBUFFERED=1
 export TRITON_PTXAS_PATH="/usr/local/cuda/bin/ptxas"
 export TRITON_CACHE_DIR="/workspace/.cache/triton"
 export TORCHINDUCTOR_CACHE_DIR="/workspace/.cache/torchinductor"
-export TORCHINDUCTOR_FX_GRAPH_CACHE=1
+export TORCHINDUCTOR_FX_GRAPH_CACHE=0
+export TORCHDYNAMO_DISABLE=1
 # Auto-detect master code dir (same logic as worker detection)
 MASTER_CODE_DIR=""
 for d in /workspace/code /workspace/Code/GeneT5 /workspace/GeneT5; do
@@ -330,7 +331,8 @@ if [[ -n "$WORKER_IP" ]]; then
     ENV_STR+="export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas; "
     ENV_STR+="export TRITON_CACHE_DIR=/workspace/.cache/triton; "
     ENV_STR+="export TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor; "
-    ENV_STR+="export TORCHINDUCTOR_FX_GRAPH_CACHE=1; "
+    ENV_STR+="export TORCHINDUCTOR_FX_GRAPH_CACHE=0; "
+    ENV_STR+="export TORCHDYNAMO_DISABLE=1; "
     ENV_STR+="export PYTHONUNBUFFERED=1; "
     ENV_STR+="export PYTHONPATH=${WORKER_CODE_DIR}; "
     # Worker CX7 — hardcoded (detection loop breaks in SSH+docker bash -c quoting)

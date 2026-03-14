@@ -32,3 +32,4 @@ from lib.train.optimizer import (
 from lib.train.logger   import TrainLogger, create_train_logger
 from lib.train.memwatch import MemoryWatcher, create_memory_watcher
 from lib.train.eval_hook import CheckpointEvaluator, EvalLogger
+from lib.train.debug    import check_nan, check_rank_health, grad_stats

@@ -157,9 +157,7 @@ class TrainLogger:
         print(f"  step {global_step:<6d} Ep {epoch}/{self.total_epochs} {pct:5.1f}% "
               f"\u2502 loss {loss:.4f} "
               f"\u2502 {speed:.1f} b/s "
-              f"\u2502 ETA {_fmt_eta(remaining)}", end="")
-
-        print()
+              f"\u2502 ETA {_fmt_eta(remaining)}")
 
 
     def log_epoch(self, epoch, train_loss, val_loss, lr):
